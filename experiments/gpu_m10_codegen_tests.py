@@ -29,7 +29,12 @@ import traceback
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Import the packages whether this file sits next to them (the original flat layout)
+# or inside experiments/ (the layout of the published repository).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.dirname(_HERE), _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import neptune_codegen as CG  # noqa: E402
 

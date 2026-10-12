@@ -1,6 +1,6 @@
 # Milestone 12 / 13 — 真·代码生成，以及把生成的内核装进 AOTI 产物
 
-GPU 机器：一台 GPU 机器，torch 2.11.0+cu128，triton 3.6.0，RTX 5090 D v2。
+测试环境：单卡 GPU，torch 2.11.0+cu128，triton 3.6.0，RTX 5090 D v2。
 模块：`neptune_codegen/`（本地与远端 md5 一致：`__init__.py` = `c394ba98…`）。
 
 ---

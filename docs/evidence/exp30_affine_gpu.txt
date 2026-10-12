@@ -1,0 +1,167 @@
+# Raw GPU log for experiments/gpu_m16_affine.py
+# RTX 5090 D v2, torch 2.11.0+cu128, triton 3.6.0
+# algebra.py=8a5ce3f567b4da9718893ab39aef8498  emitters.py=520e7c95d2dee83f833cded9fb79282c
+# template.py=38dcac9993bef46629e2197d662f5888
+# produced by: python experiments/gpu_m16_affine.py
+
+====================================================================================================
+affine-repair GPU validation
+torch 2.11.0+cu128  cuda 12.8  NVIDIA GeForce RTX 5090 D v2
+====================================================================================================
+
+--- derivation
+  [PASS] affine_plus/slope is 1  -- a = 1
+  [PASS] affine_plus/bias is s'-s  -- b = -s + s2
+  [PASS] affine_shift/slope is 1  -- a = 1
+  [PASS] affine_shift/bias is s-s'  -- b = s - s2
+  [PASS] affine_plus/bias statement emitted
+  [PASS] affine_plus/producer is unfloored
+  [PASS] affine_plus/registered + supported
+
+--- correctness
+  [PASS] affine_plus k=2.0 (1, 1) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (1, 1) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (1, 1) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (1, 1) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (1, 1) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (1, 7) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (1, 7) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (1, 7) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (1, 7) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (1, 7) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (8, 33) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (8, 33) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (8, 33) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (8, 33) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (8, 33) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (5, 128) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (5, 128) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (5, 128) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (5, 128) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (5, 128) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (4, 1024) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (4, 1024) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (4, 1024) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (4, 1024) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (4, 1024) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (16, 4096) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (16, 4096) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (16, 4096) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (16, 4096) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (16, 4096) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (3, 1000) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (3, 1000) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (3, 1000) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=2.0 (3, 1000) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 1) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 1) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 1) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 1) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 1) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 7) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 7) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 7) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 7) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (1, 7) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (8, 33) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (8, 33) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (8, 33) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (8, 33) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (8, 33) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (5, 128) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (5, 128) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (5, 128) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (5, 128) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (5, 128) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (4, 1024) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (4, 1024) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (4, 1024) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (4, 1024) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (4, 1024) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (16, 4096) normal  -- rel_err=9.018e-08
+  [PASS] affine_plus k=-0.5 (16, 4096) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (16, 4096) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (16, 4096) outlier  -- rel_err=9.095e-10
+  [PASS] affine_plus k=-0.5 (16, 4096) huge  -- rel_err=7.344e-08
+  [PASS] affine_plus k=-0.5 (3, 1000) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (3, 1000) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (3, 1000) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-0.5 (3, 1000) huge  -- rel_err=7.385e-08
+  [PASS] affine_plus k=-3.0 (1, 1) normal  -- rel_err=6.274e-08
+  [PASS] affine_plus k=-3.0 (1, 1) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (1, 1) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (1, 1) outlier  -- rel_err=2.274e-10
+  [PASS] affine_plus k=-3.0 (1, 1) huge  -- rel_err=6.147e-08
+  [PASS] affine_plus k=-3.0 (1, 7) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (1, 7) all_negative  -- rel_err=1.333e-07
+  [PASS] affine_plus k=-3.0 (1, 7) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (1, 7) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (1, 7) huge  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (8, 33) normal  -- rel_err=9.323e-08
+  [PASS] affine_plus k=-3.0 (8, 33) all_negative  -- rel_err=1.235e-07
+  [PASS] affine_plus k=-3.0 (8, 33) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (8, 33) outlier  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (8, 33) huge  -- rel_err=1.113e-07
+  [PASS] affine_plus k=-3.0 (5, 128) normal  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (5, 128) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (5, 128) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (5, 128) outlier  -- rel_err=9.095e-10
+  [PASS] affine_plus k=-3.0 (5, 128) huge  -- rel_err=1.177e-07
+  [PASS] affine_plus k=-3.0 (4, 1024) normal  -- rel_err=7.468e-08
+  [PASS] affine_plus k=-3.0 (4, 1024) all_negative  -- rel_err=5.973e-08
+  [PASS] affine_plus k=-3.0 (4, 1024) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (4, 1024) outlier  -- rel_err=9.095e-10
+  [PASS] affine_plus k=-3.0 (4, 1024) huge  -- rel_err=6.206e-08
+  [PASS] affine_plus k=-3.0 (16, 4096) normal  -- rel_err=7.767e-08
+  [PASS] affine_plus k=-3.0 (16, 4096) all_negative  -- rel_err=1.192e-07
+  [PASS] affine_plus k=-3.0 (16, 4096) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (16, 4096) outlier  -- rel_err=9.095e-10
+  [PASS] affine_plus k=-3.0 (16, 4096) huge  -- rel_err=1.100e-07
+  [PASS] affine_plus k=-3.0 (3, 1000) normal  -- rel_err=7.888e-08
+  [PASS] affine_plus k=-3.0 (3, 1000) all_negative  -- rel_err=1.193e-07
+  [PASS] affine_plus k=-3.0 (3, 1000) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_plus k=-3.0 (3, 1000) huge  -- rel_err=6.218e-08
+  [PASS] affine_shift k=None (1, 1) normal  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (1, 1) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (1, 1) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (1, 1) outlier  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (1, 1) huge  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (1, 7) normal  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (1, 7) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (1, 7) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (1, 7) outlier  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (1, 7) huge  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (8, 33) normal  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (8, 33) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (8, 33) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (8, 33) outlier  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (8, 33) huge  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (5, 128) normal  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (5, 128) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (5, 128) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (5, 128) outlier  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (5, 128) huge  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (4, 1024) normal  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (4, 1024) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (4, 1024) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (4, 1024) outlier  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (4, 1024) huge  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (16, 4096) normal  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (16, 4096) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (16, 4096) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (16, 4096) outlier  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (16, 4096) huge  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (3, 1000) normal  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (3, 1000) all_negative  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (3, 1000) all_zero  -- rel_err=0.000e+00
+  [PASS] affine_shift k=None (3, 1000) huge  -- rel_err=0.000e+00
+
+--- first-block identity
+  [PASS] one-element rows avoid the bias  -- err=0.000e+00 got=[9.0, -7.5, 0.0]
+
+--- negative control
+  [PASS] wrong reference is detected  -- good=0.000e+00 bad=6.084e+00
+
+====================================================================================================
+TOTAL: 145 passed, 0 failed, 145 checks
+====================================================================================================

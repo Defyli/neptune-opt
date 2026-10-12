@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import os
+import functools
 import random
 import sys
 import tempfile
@@ -38,6 +39,11 @@ def _simplify(e: sp.Expr) -> sp.Expr:
     return sp.simplify(sp.simplify(rewritten))
 
 
+# The derivation is pure and its inputs are hashable sympy expressions, so it is memoized.
+# The authors' own `HExprSolver` does the same, and their comment gives the reason: the derivation
+# "may be called thousands of times due to the autotuner replaying traces". The expensive part is
+# the `simplify` calls, which is exactly what this avoids repeating.
+@functools.lru_cache(maxsize=None)
 def repair_factor(sk: Skeleton) -> sp.Expr:
     """R(s, s') such that  acc_new = acc_old * R + term.
 
@@ -151,6 +157,7 @@ def _marked(R: sp.Expr) -> sp.Expr:
     return _as_quotient_power(R)
 
 
+@functools.lru_cache(maxsize=None)
 def term_expr(sk: Skeleton) -> sp.Expr:
     """The consumer term, evaluated at the current producer value: g(s', c).
 

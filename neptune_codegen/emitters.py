@@ -4,6 +4,7 @@ Every piece of Triton text the generator writes, derived not templated.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib.util
 import os
 import random
@@ -60,6 +61,7 @@ def check_supported(sk: Skeleton) -> None:
     term_expr(sk)
 
 
+@functools.lru_cache(maxsize=None)
 def derived_producer_expr(sk: Skeleton) -> sp.Expr | None:
     """The expression whose row-maximum IS the producer value, derived where possible.
 

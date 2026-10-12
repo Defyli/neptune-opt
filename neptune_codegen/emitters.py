@@ -13,7 +13,7 @@ import tempfile
 
 import sympy as sp
 
-from neptune_codegen.algebra import _marked, repair_factor, term_expr
+from neptune_codegen.algebra import _marked, repair_bias, repair_factor, term_expr
 from neptune_codegen.skeleton import Skeleton
 from neptune_codegen.symbols import *  # noqa: F401,F403
 from neptune_codegen.sym_to_triton import TranslationError, to_triton
@@ -58,6 +58,7 @@ def check_supported(sk: Skeleton) -> None:
             "(exp(v - m) <= 1); max|v| collapses rows whose values are all negative"
         )
     repair_factor(sk)          # raises if the algebra is not translatable
+    repair_bias(sk)            # ... including a bias only a max consumer may use
     term_expr(sk)
 
 
@@ -129,15 +130,50 @@ def guard_value(sk: Skeleton) -> str:
     return producer_init(sk)
 
 
+def _producer_in_denominator(expr) -> bool:
+    """Does `expr` divide by the fresh producer value s' (the kernel's `den`)?
+
+    A floor is only needed where the generated source divides, and this asks exactly that
+    of the ALGEBRA rather than guessing from a flag: `fraction(together(e))[1]` is the
+    denominator sympy would put the expression over, and the probe is whether s' survives
+    in it. For g = c/s the term is c/den (yes), for g = c + s it is c + den (no), and for
+    g = c/sqrt(s+eps) the denominator is sqrt(den+eps) (yes).
+    """
+    try:
+        _num, den = sp.fraction(sp.together(expr))
+    except Exception:  # noqa: BLE001 -- an expression sympy cannot normalise
+        return True    # keep the floor: the conservative direction
+    return bool(den.has(s2_sym))
+
+
+@functools.lru_cache(maxsize=None)
+def _needs_denominator_floor(sk: Skeleton) -> bool:
+    """Should the fresh producer value be floored to avoid 0/0?
+
+    Driven by whether any emitted quantity actually divides by it. `is_log` was the proxy
+    for this and it is right for all eight registered skeletons, but it is the wrong test
+    in general: an additive fold like g = c - s never divides, and flooring its producer
+    is not a ~1e-30 rounding nicety but a real error. Measured on the (degenerate) additive
+    shift family with c = [-5, -1, -3]: the floored producer is 1e-30, so the term becomes
+    v - 1e-30 and the kernel returns -1 where the operator is identically 0.
+    """
+    # Memoized on the (frozen, hashable) skeleton: `sp.together` is not free, and this is
+    # called from every emit, which the autotuner replays.
+    return any(_producer_in_denominator(e) for e in
+               (term_expr(sk), repair_factor(sk), repair_bias(sk)))
+
+
 def denominator_expr(sk: Skeleton) -> str:
     """Triton expression for the fresh producer value used in the repair and the term.
 
-    Term/repair divide by it for power semantics (L2 and friends), so those need a floor
-    to avoid 0/0 on an all-zero row. An exponential fold never divides, so it must keep
-    the raw value -- flooring there would map a negative max to ~0 and shift every
-    exponent.
+    Term/repair divide by it for power semantics (L2 and friends), so those need a floor to
+    avoid 0/0 on an all-zero row. A fold that never divides must keep the RAW value:
+    flooring there would map a negative producer to ~0 and shift every term -- harmless for
+    an exponent (where the value is merely mis-scaled) but wrong for a shift (where the
+    value is used as an offset). The floor is therefore decided per skeleton, by inspecting
+    the derived expressions, not by the `is_log` flag.
     """
-    return "m_new" if sk.is_log else "tl.maximum(m_new, 1e-30)"
+    return "tl.maximum(m_new, 1e-30)" if _needs_denominator_floor(sk) else "m_new"
 
 
 def _bindings(sk: Skeleton, values: dict | None = None) -> dict:
@@ -209,21 +245,55 @@ def consumer_update(sk: Skeleton, values: dict | None = None) -> str:
     """Source for the consumer fold over one block.
 
     Both reducers keep the same shape, `fold(repair(acc), block_reduce(term))`; only the two
-    functions change. For a MAX consumer the repaired accumulator must not win spuriously,
-    which needs the repair to be a positive factor -- true for every repair the generator
-    derives with a max consumer (a ratio of positive normalisers), and the reason a max
-    consumer is only accepted together with such a repair.
+    functions change. The repair is affine, `a*acc + b`, and the bias `b` is emitted ONLY
+    when it is nonzero, so every purely multiplicative skeleton keeps the exact fold it had
+    before biases existed (and with it the existing GPU evidence).
+
+    A bias is admissible only for a MAX consumer -- `repair_pair` refuses it otherwise,
+    because an additive reducer needs b = 0 for condition (4) to hold. For a max consumer
+    `h(t) = a*t + b` is a max-morphism for any b as long as a > 0, so the repaired
+    accumulator cannot win spuriously; every factor the generator derives for a max
+    consumer is positive (a ratio of positive normalisers), which is why one is never
+    accepted without such a repair. The initial accumulator is -inf and a finite bias maps
+    it to -inf, so the first block is still the identity even before the guard.
     """
+    bias = repair_bias(sk)
+    shift = " + bias" if bias != 0 else ""
     if sk.consumer_reducer == "max":
         term = term_source(sk, values, fill='-float("inf")')
-        return f'acc = tl.maximum(acc * scale, tl.max({term}, axis=0))'
+        return f'acc = tl.maximum(acc * scale{shift}, tl.max({term}, axis=0))'
     term = term_source(sk, values, fill="0.0")
-    return f'acc = acc * scale + tl.sum({term}, axis=0)'
+    return f'acc = acc * scale{shift} + tl.sum({term}, axis=0)'
+
+
+def bias_line(sk: Skeleton, values: dict | None = None) -> str:
+    """The `bias = ...` source line, or "" when the repair has no bias.
+
+    Guarded by the same neutral producer value as `scale`, so the FIRST block's repair is
+    still exactly the identity: with the guard true the emitted fold is
+    `fold(acc*1 + 0, term)`, which is what "nothing to repair yet" means.
+
+    Fully rendered here rather than left as `{...}` fields: the template is formatted in a
+    single pass, so placeholders introduced by a substituted value would survive verbatim
+    into the generated source.
+    """
+    if repair_bias(sk) == 0:
+        return ""
+    return ("\n            # The affine half of the repair: a max consumer admits a shift\n"
+            "            # (max-morphism), an additive one does not, so this line exists only\n"
+            "            # for a max consumer and is zero on the first block.\n"
+            f"            bias = tl.where(m == {guard_value(sk)}, 0.0, "
+            f"{bias_source(sk, values)})")
 
 
 def scale_source(sk: Skeleton, values: dict | None = None) -> str:
-    """Triton source for the repair factor R(m, safe_m)."""
+    """Triton source for the repair factor a(m, safe_m)."""
     return to_triton(_marked(repair_factor(sk)), _bindings(sk, values))
+
+
+def bias_source(sk: Skeleton, values: dict | None = None) -> str:
+    """Triton source for the repair bias b(m, safe_m)."""
+    return to_triton(_marked(repair_bias(sk)), _bindings(sk, values))
 
 
 def term_source(sk: Skeleton, values: dict | None = None, fill: str = "0.0") -> str:

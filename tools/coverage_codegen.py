@@ -51,16 +51,17 @@ W = 108
 def classify_failure(err: Exception) -> str:
     """Name the actual blocker. 'unsupported' alone is not actionable."""
     msg = str(err)
-    if "not invertible" in msg:
-        return "not-invertible"
-    if "mentions the FRESH producer" in msg or "inversion variable" in msg:
+    if "mentions the FRESH producer" in msg or "mentions the term value" in msg:
         return "g-depends-on-fresh-value"
-    if "does not factor as u * R" in msg:
+    if "does not depend on the producer" in msg:
+        # separation succeeds trivially (R=1) but the operator is not a fold
+        return "g-ignores-producer"
+    if "does not separate" in msg:
         return "repair-not-multiplicative"
-    if "does not satisfy" in msg:
-        # the derivation found an R but the checker could not CONFIRM it; with a
-        # symbolic exponent this is sp.simplify giving up, not a false repair
-        return "proof-failed(simplifier)"
+    if "separating g changed its value" in msg:
+        return "separation-changed-value"
+    if "is negative, so it does not distribute" in msg:
+        return "repair-does-not-distribute"
     if isinstance(err, TranslationError):
         if "no Triton binding" in msg:
             return "needs-scalar-param-plumbing"
@@ -102,10 +103,14 @@ def probe(f, g):
                 # generation path an integration would actually call
                 vals = {arg: 1.0 for _sym, arg in params}   # literals; value irrelevant
                 r_src, t_src = CG.scale_source(sk, vals), CG.term_source(sk, vals)
+                # The fold itself, not just its two halves: an affine repair's bias lives
+                # only in this line, so reporting scale/term alone would hide it and let a
+                # bias-bearing kernel look like a bare rescale.
+                fold = CG.consumer_update(sk, vals)
             except (NotImplementedError, TranslationError) as e:
                 last = e
                 continue
-            return True, f"{pr}/{cr}", f"scale={r_src}  term={t_src}"
+            return True, f"{pr}/{cr}", f"{fold}\n      scale={r_src}\n      term={t_src}"
     if last is None:
         return False, "f-not-foldable", ""
     return False, classify_failure(last), ""

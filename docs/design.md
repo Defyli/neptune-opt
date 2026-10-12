@@ -73,6 +73,41 @@ both were hardcoded — which made the paper's own **RMSNorm + max** example ine
 reason that had nothing to do with the algebra. Its producer `mean(x^2)` is additive while its
 consumer is a maximum.
 
+### How the repair is derived
+
+The paper writes the repair as `h(t, r, r') = g(r', g_c^{-1}(r, t))` (Eq. 5) — a formula that
+reads as "invert the term producer in `c`, then re-apply it at the new producer value". The first
+implementation took that literally and used `sympy.solve` for the inversion.
+
+The authors' own implementation does something different and better, and it was worth borrowing:
+it never inverts. It **separates the variables** — asking whether `g(s', c) / g(s, c)` is
+independent of the data `c` — and then *proves* that the resulting `h` distributes over the
+reducer. The two agree on every operator here (pinned as a golden table in
+`tests/test_neptune_opt.py`), and the separation form is strictly more general, because it also
+exposes the case where the ratio still depends on `c` but a *shift* absorbs it:
+
+```
+h(t) = a(s, s') * t + b(s, s')
+a = g'_c(s', c) / g'_c(s, c)          # match the c-derivatives of the two sides
+b = g(s', c) - a * g(s, c)            # accepted when b is free of c
+```
+
+Condition (4) then decides which repairs are legal, and it is not the same answer for both
+reducers: for `f = x + y` the bias must be **zero** (`a(x+y)+b ≠ (ax+b)+(ay+b)`), while for
+`f = max` any bias is fine, because `t ↦ a·t + b` is a max-morphism for `a > 0`. So an additive
+repair is admissible exactly on a max consumer — which is where the two "shift" families live.
+Adding this took the generator from 17 to **19 of 28** families, i.e. from 89% to 100% of what the
+algebra admits.
+
+Writing the derivation this way also exposed a latent bug: the fresh producer value was floored
+(`tl.maximum(m_new, 1e-30)`) for every non-exponential fold, because the flag used as a proxy
+(`is_log`) happened to give the right answer for all eight registered skeletons. The floor is a
+*division* guard, and an additive fold never divides — flooring its producer is not a rounding
+nicety but a real error, since the value is used as an offset. The guard is now decided by
+inspecting the derived expressions (`_needs_denominator_floor`), and the emitted **code** for all
+eight registered kernels is unchanged (verified by comparing the generated source with comments
+stripped, before and after).
+
 ### The one thing the generator cannot derive
 
 `finalize` — what the operator *means* — has to be declared. `g` decides whether the fusion is
@@ -131,9 +166,9 @@ are all pure graph and algebra work, so the tests that matter most do not need a
 ## Scope, honestly
 
 Recall from [paper.md](paper.md) that the paper's classification admits an operator only if
-condition (4) holds. Across 28 operator families, **19 are `EXACT`** and the generator emits
-**17** of them (89% of what the algebra allows). The gap is enumerated with reasons in
-`tools/coverage_codegen.py`, and the two structural limits are:
+condition (4) holds. Across 28 operator families, **19 are `EXACT`** and the generator emits **all
+19** of them. The remaining 9 are enumerated with reasons in `tools/coverage_codegen.py`, and the
+structural limits are:
 
 * `NEEDS_STATE` families (the variance / Welford group) need state carried across iterations,
   which the accumulator-repair frame does not express;
@@ -149,6 +184,9 @@ a useful thing for a reader to know.
 | recognition of every registered skeleton | `tests/test_recognize.py` (CPU) |
 | region extraction, gates, operator library | `tests/test_neptune_opt.py` (CPU) |
 | dynamic shapes (symbolic row length) | `tests/test_neptune_opt.py` (CPU + GPU) |
+| the derived repair, for every registered skeleton | `tests/test_neptune_opt.py` (CPU, golden table) |
+| the affine repair, derived and replayed numerically | `tests/test_neptune_opt.py` (CPU) |
+| the affine kernel compiles and is exact on hardware | `experiments/gpu_m16_affine.py` (GPU) |
 | the generated kernel inside the `.pt2` | `experiments/gpu_m15_integration.py` (GPU) |
 | one kernel serving several widths | `experiments/gpu_m15_integration.py` §E (GPU) |
 | generator correctness across skeletons | `experiments/gpu_m10_codegen_tests.py` (GPU) |

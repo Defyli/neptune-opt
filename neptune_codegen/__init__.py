@@ -62,8 +62,8 @@ from __future__ import annotations
 
 from neptune_codegen.symbols import u_sym, s_sym, s2_sym, c_sym, _FINAL_ACC, _FINAL_M, _PARAM_TINY, _PARAM_N, _PARAM_EPS, _PARAM_ALPHA, _PARAM_BETA  # noqa: F401
 from neptune_codegen.skeleton import NEGATIVE_CONTROLS, Skeleton, SKELETONS, register, supported, all_registered, unsupported_reason, param_defaults  # noqa: F401
-from neptune_codegen.algebra import _BRANCH_CUT, _simplify, repair_factor, vanishes, _numerically_zero, _marked, term_expr, _as_quotient_power  # noqa: F401
-from neptune_codegen.emitters import check_supported, derived_producer_expr, producer_nonneg, producer_init, consumer_init, producer_operand, guard_value, denominator_expr, _bindings, param_bindings, producer_update, consumer_update, scale_source, term_source, finalize_source  # noqa: F401
+from neptune_codegen.algebra import _BRANCH_CUT, _simplify, repair_factor, repair_bias, repair_pair, vanishes, _numerically_zero, _marked, term_expr, _as_quotient_power  # noqa: F401
+from neptune_codegen.emitters import check_supported, derived_producer_expr, producer_nonneg, producer_init, consumer_init, producer_operand, guard_value, denominator_expr, _bindings, param_bindings, producer_update, consumer_update, scale_source, bias_source, bias_line, term_source, finalize_source  # noqa: F401
 from neptune_codegen.template import _GEN_DIR, _CACHE, _TEMPLATE, emit_kernel_source, generated_path, compile_skeleton, run  # noqa: F401
 from neptune_codegen.torch_op import _TRITON_OPS, as_triton_op, op_handle, triton_op_name  # noqa: F401
 from neptune_codegen.references import reference, graph_reference  # noqa: F401
@@ -124,10 +124,14 @@ __all__ = [
     "reference",
     "register",
     "repair_factor",
+    "repair_bias",
+    "repair_pair",
     "run",
     "s2_sym",
     "s_sym",
     "scale_source",
+    "bias_source",
+    "bias_line",
     "supported",
     "term_expr",
     "term_source",

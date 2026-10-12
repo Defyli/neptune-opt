@@ -57,7 +57,7 @@ are in [docs/evidence/](docs/evidence/).
 | | |
 |---|---|
 | operator families classified (algebra) | 28 → 19 `EXACT`, 1 `AFFINE`, 6 `NEEDS_STATE`, 2 `NOT_INVERT` |
-| families the generator emits | **17 / 28** (89% of what the algebra allows) |
+| families the generator emits | **19 / 28** — every family the algebra admits |
 | registered skeletons recognised from a graph | **8 / 8**, with no per-operator pattern rows |
 | scalar parameters inferred from the graph | yes (`beta`, `alpha`, `N`, `eps`, …) |
 | dynamic shapes | supported; one kernel serves every width |
@@ -173,10 +173,13 @@ docs/                paper summary, design notes, evidence logs
 
 ```bash
 pytest tests/ -v                       # recognition + gates, CPU
+# the same tests without pytest installed:
+python tests/test_neptune_opt.py
+python tests/test_recognize.py
 python tools/coverage_codegen.py       # how much of the algebra the generator covers, CPU
-python tests/test_recognize.py         # recognition over the whole registry, CPU
 # on a CUDA machine:
 python experiments/gpu_m10_codegen_tests.py   # generator correctness across skeletons
+python experiments/gpu_m16_affine.py          # the affine repair, compiled and checked
 python experiments/gpu_m15_integration.py     # the .pt2 evidence, end to end
 ```
 

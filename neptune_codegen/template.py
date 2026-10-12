@@ -12,8 +12,8 @@ import tempfile
 
 import sympy as sp
 
-from neptune_codegen.emitters import (check_supported, consumer_init, consumer_update,
-    denominator_expr, guard_value, producer_init, producer_operand,
+from neptune_codegen.emitters import (bias_line, check_supported, consumer_init,
+    consumer_update, denominator_expr, guard_value, producer_init, producer_operand,
     producer_update, scale_source, term_source, finalize_source)
 from neptune_codegen.skeleton import SKELETONS
 from neptune_codegen.symbols import *  # noqa: F401,F403
@@ -52,13 +52,14 @@ def {name}(x_ptr, out_ptr, rows, ncols, stride_row,
             {abs_line}# Out-of-range lanes load as 0.0 and must not enter the producer
             # update; the fill is the reducer's identity, so masked lanes always lose.
             {prod_update}
-            # h(t, s, s') = t * R(s, s'): `m` is the PREVIOUS producer value, so on the
+            # h(t, s, s') = a*t + b: `m` is the PREVIOUS producer value, so on the
             # first block the repair is the identity (nothing to rescale yet).
             # `den` is the fresh producer value as the repair and the term should see it:
-            # the raw value for an exponential fold, a floored one wherever a division
-            # happens (an all-zero row would otherwise compute 0/0 = nan).
+            # floored wherever the generated source divides by it (an all-zero row would
+            # otherwise compute 0/0 = nan), and raw wherever it does not -- a shift must
+            # not be offset by the floor, and an exponent must not be rescaled by it.
             den = {den_src}
-            scale = tl.where(m == {guard}, 1.0, {scale_src})
+            scale = tl.where(m == {guard}, 1.0, {scale_src}){bias_line}
             {acc_update}
             m = m_new
         tl.store(out_ptr + row, {finalize})
@@ -81,6 +82,7 @@ def emit_kernel_source(sk: Skeleton, values: dict | None = None) -> str:
         den_src=denominator_expr(sk),
         guard=guard_value(sk),
         scale_src=scale_source(sk, values),
+        bias_line=bias_line(sk, values),
         term_src=term_source(sk, values),
         finalize=finalize_source(sk, values),
     )

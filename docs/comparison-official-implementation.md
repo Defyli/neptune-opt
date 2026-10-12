@@ -65,11 +65,30 @@ condition explicitly** before using the repair.
 of everything else: `g(u…, x…) = gcomb(gu(u…), gx(x…))`, and then a *pair* of producers is
 handled by a single inverse because only the `x` part has to be inverted.
 
-This repository does not do that. `repairlib` marks the two-producer row `"two producers, one
-term"` as `NOT_INVERT`, with a note saying a `MultiProducerRepair` would be needed. **Their
-implementation is that missing piece**, and it is not a large idea: separate, then invert only the
-dependent factor. Adopting it would put the two-producer cases — RMSNorm + max where the maximum
-is over a different quantity than the sum of squares — back in reach.
+This repository did not do that: it inverted `g` in `c` with `sympy.solve` and read the repair off
+Eq. 5. **Adopted** — the derivation is now the separation `g(s', c) / g(s, c)`, accepted only when
+`c` cancels, with a golden table in `tests/test_neptune_opt.py` pinning that every registered
+skeleton derives the identical repair it did before. See
+[design.md](design.md#how-the-repair-is-derived).
+
+Two corrections to what this document predicted, both worth recording:
+
+* **Separation did not unlock the two-producer row.** That family is still refused, and the
+  measurement says why: its placeholder declares `g = c · s'`, which mentions the *fresh* producer
+  value, so it is not a `(producer, term)` pair at all (`g-depends-on-fresh-value`). Separation
+  could not have helped; the declared family was malformed. A real two-producer operator — the
+  RMSNorm + max case, where the maximum is over a different quantity than the sum of squares — is
+  already expressible through `producer_expr` + `producer_reducer`, which is the axis that
+  actually mattered.
+* **What separation *did* unlock is the affine repair.** Writing the condition as a ratio rather
+  than as an inversion makes it obvious when the residual is a *shift* rather than a factor:
+  `h(t) = a·t + b`, with `a` from matching the `c`-derivatives and `b = g(s',c) - a·g(s,c)`
+  accepted when free of `c`. Condition (4) then splits by reducer — a bias is illegal for an
+  additive consumer and legal for a max consumer, because `t ↦ a·t + b` is a max-morphism. That
+  took the generator from 17 to **19 of 28** families, i.e. to 100% of what the algebra admits.
+
+So the borrowed idea paid off on a different axis than predicted: the separation *formulation* is
+worth more than the inversion it replaces, even where the two give identical answers.
 
 ### 2. A fallback when the foldability condition fails
 
@@ -84,12 +103,13 @@ Welford group). The algebra is not wrong — the classification is right — but
 into a scan" is a way to serve those operators without inventing a repair, and it is the honest
 route to the coverage this repository currently calls out of reach.
 
-### 3. Memoize the derivation by printed expression
+### 3. Memoize the derivation by printed expression  ✅ adopted
 
 `HExprSolver` caches on `SExprPrinter::Print(g_expr)`, with the reason spelled out: *"this function
-may be called thousands of times due to the autotuner replaying traces"*. This repository caches
-compiled kernels but recomputes `repair_factor` and its `simplify` calls on every invocation, which
-is the expensive part. Cheap to fix, and the same pressure will appear here.
+may be called thousands of times due to the autotuner replaying traces"*. This repository cached
+compiled kernels but recomputed `repair_factor` and its `simplify` calls on every invocation,
+which is the expensive part. **Adopted**: `repair_pair` (and `term_expr`,
+`derived_producer_expr`) are `functools.lru_cache`d. Same pressure, same fix, and free.
 
 ### 4. The mask belongs to the program, not to the compiler
 
@@ -142,8 +162,15 @@ delivers it through TVM. Coverage inside the reduction is comparable; coverage a
 
 ## Suggested order of work, if this is taken further
 
-1. **Variable separation** (item 1) — smallest change, unblocks a class of operators the algebra
-   already describes.
-2. **Memoization** (item 3) — trivial, and it will bite as soon as anything replays.
-3. **Scan fallback** (item 2) — larger, but it is the only route to the `NEEDS_STATE` families.
+1. ~~**Variable separation** (item 1)~~ — **done**, and the payoff was the affine repair rather
+   than the two-producer case this document expected.
+2. ~~**Memoization** (item 3)~~ — **done**.
+3. **Scan fallback** (item 2) — the largest remaining item, and now the *only* route to the six
+   `NEEDS_STATE` families. It is also the last thing standing between this repository and full
+   coverage of its own 28-family study: `ReduceToScan` combines partial results without needing
+   the repair to distribute over the reducer at all, which is exactly the property the
+   variance / Welford group lacks.
 4. Only then consider anything loop-nest-level, which would be a different architecture.
+
+The current state is reproducible with `python tools/coverage_codegen.py`: 19 of 28 families emit,
+and the 9 refusals are labelled by cause, so the remaining work is a list rather than a feeling.

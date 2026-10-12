@@ -184,6 +184,8 @@ def test_every_public_emitter_is_callable():
         v = CG.param_defaults(name)
         CG.check_supported(sk)
         CG.repair_factor(sk)
+        CG.repair_bias(sk)
+        CG.repair_pair(sk)
         CG.term_expr(sk)
         CG.producer_operand(sk, v)
         CG.producer_init(sk)
@@ -193,6 +195,8 @@ def test_every_public_emitter_is_callable():
         CG.producer_update(sk, v)
         CG.consumer_update(sk, v)
         CG.scale_source(sk, v)
+        CG.bias_source(sk, v)
+        CG.bias_line(sk, v)
         CG.term_source(sk, v)
         CG.finalize_source(sk, v)
         assert "def " + name + "(" in CG.emit_kernel_source(sk, v)
@@ -298,6 +302,196 @@ def test_backend_refuses_unless_experimental():
         assert "experimental" in str(e), e
         return
     raise AssertionError("neptune_opt.backend must refuse by default")
+
+
+def test_multiplicative_repairs_are_unchanged_by_the_affine_generalisation():
+    """The affine repair must not disturb a single registered skeleton.
+
+    Pinned as a golden table of the DERIVED slope, because the entire justification for
+    replacing the `sp.solve` derivation was "same answers, wider reach". A refactor that
+    silently changed a repair would change a kernel, and every GPU result recorded for this
+    project is evidence about the kernels these expressions produce -- so a rewritten
+    derivation has to be checked against what it replaced.
+    """
+    import neptune_codegen as CG
+
+    golden = {
+        "decay_renorm": "(N + s)/(N + s2)",
+        "linear_attn": "s/s2",
+        "logsumexp": "exp(s - s2)",
+        "lse_biased": "exp(s - s2)",
+        "rmsnorm_max": "sqrt(eps + s)/sqrt(eps + s2)",
+        "softcap_lse": "exp(s - s2)",
+        "stable_l2": "s**2/s2**2",
+        "sumsq_div": "s/s2",
+    }
+    for name, want in golden.items():
+        sk = CG.SKELETONS[name]
+        got = str(CG.repair_factor(sk))
+        assert got == want, f"{name}: repair slope changed from {want!r} to {got!r}"
+        assert CG.repair_bias(sk) == 0, (
+            f"{name}: gained a repair bias {CG.repair_bias(sk)}"
+        )
+        # A purely multiplicative repair must not emit the affine line at all, so no kernel
+        # with existing GPU evidence gains a statement it was never measured with.
+        src = CG.emit_kernel_source(sk, CG.param_defaults(name))
+        # NB: test the emitted CODE, not the substring "bias" -- the lse_biased docstring
+        # ("ALiBi-biased logsumexp") is copied into the generated header.
+        assert "bias = tl.where" not in src, f"{name}: emitted an unexpected bias line"
+        assert "+ bias" not in src, f"{name}: emitted an unexpected bias term"
+        assert "acc * scale +" in src or "acc * scale," in src
+
+    # Pin the exact fold of the paper's own operator. The affine generalisation must have
+    # added an OPTION to the emitted statement, not changed the statement itself -- the
+    # max-consumer shape and the guarded scale are both load-bearing.
+    src = CG.emit_kernel_source(CG.SKELETONS["rmsnorm_max"], {"eps": 1e-6})
+    assert "scale = tl.where(m == 0.0, 1.0, " in src, src
+    assert "acc = tl.maximum(acc * scale, tl.max(" in src, src
+
+
+def test_affine_repair_is_derived_for_a_max_consumer():
+    """`g = c + s` needs a repair that a pure rescale cannot express.
+
+    The ratio (c+s')/(c+s) keeps the data, so multiplicative separation fails; matching the
+    c-derivatives of the two sides of condition (3) gives a = 1 and b = s' - s, and a max
+    consumer admits an affine repair because h(t) = t + b is a max-morphism.
+    """
+    import neptune_codegen as CG
+    from neptune_codegen.symbols import c_sym, s_sym, s2_sym  # noqa: F401
+
+    sk = CG.Skeleton(name="affine_plus", g=c_sym + s_sym, finalize=CG._FINAL_ACC,
+                     producer="signed", producer_reducer="max", consumer_reducer="max")
+    a, b = CG.repair_pair(sk)
+    assert a == 1, f"slope should be 1, got {a}"
+    assert CG._simplify(b - (s2_sym - s_sym)) == 0, f"bias should be s'-s, got {b}"
+    assert "+ bias" in CG.consumer_update(sk, {}), CG.consumer_update(sk, {})
+    assert CG.bias_line(sk, {}) != "", "bias must be emitted for an affine repair"
+    # and the bias must be zeroed on the first block, or the identity is broken there
+    assert "tl.where(m == " in CG.bias_line(sk, {})
+
+
+def test_bias_is_refused_for_an_additive_consumer():
+    """Condition (4) is the reason a bias needs a max consumer, and it must be enforced.
+
+    For f = x+y, `a*(x+y) + b == (a*x + b) + (a*y + b)` only holds when b == 0. Refusing
+    here is what stops the generator from emitting a fold that does not compute f.
+    """
+    import neptune_codegen as CG
+    from neptune_codegen.symbols import c_sym, s_sym, s2_sym  # noqa: F401
+
+    sk = CG.Skeleton(name="affine_plus_sum", g=c_sym + s_sym, finalize=CG._FINAL_ACC,
+                     producer="signed", producer_reducer="max", consumer_reducer="sum")
+    try:
+        CG.repair_pair(sk)
+    except NotImplementedError as e:
+        assert "condition 4" in str(e), e
+        assert "b = 0" in str(e), e
+        return
+    raise AssertionError("a nonzero bias must be refused for an additive consumer")
+
+
+def test_affine_fold_matches_the_reference_numerically():
+    """Replay the emitted recurrence and compare with the row-wise reference.
+
+    The generated kernel cannot run here (no Triton), so this validates the ALGEBRA the
+    kernel is generated FROM: the recurrence below is transcribed from the template's
+    `acc = fold(acc*scale + bias, block_reduce(term))`, with scale/bias/term taken from the
+    real emitters. `g = c + s` with a max producer makes the reference exactly 2*max(c),
+    which is non-degenerate -- unlike the additive-shift control family, whose value is
+    identically zero and would pass a broken fold as easily as a correct one.
+    """
+    import numpy as np
+    import sympy as sp
+    import neptune_codegen as CG
+    from neptune_codegen.symbols import c_sym, s_sym, s2_sym  # noqa: F401
+
+    from neptune_codegen.symbols import _PARAM_N
+
+    sk = CG.Skeleton(name="affine_plus", g=_PARAM_N * c_sym + s_sym,
+                     finalize=CG._FINAL_ACC, producer="signed",
+                     producer_reducer="max", consumer_reducer="max",
+                     params=((_PARAM_N, "k"),))
+    a, b = CG.repair_pair(sk)
+    a_f = sp.lambdify((s_sym, s2_sym), a, "numpy")
+    b_f = sp.lambdify((s_sym, s2_sym), b, "numpy")
+
+    def replay(x, block, k):
+        rows, ncols = x.shape
+        out = np.empty(rows)
+        for r in range(rows):
+            m, acc = -np.inf, -np.inf
+            for off in range(0, ncols, block):
+                blk = x[r, off:off + block]
+                m_new = max(m, blk.max())
+                den = m_new                     # raw: nothing divides by the producer
+                scale = 1.0 if m == -np.inf else float(a_f(m, den))
+                bias = 0.0 if m == -np.inf else float(b_f(m, den))
+                acc = max(acc * scale + bias, (k * blk + den).max())
+                m = m_new
+            out[r] = acc
+        return out
+
+    rng = np.random.default_rng(0)
+    # The reference is `max_j(k*c_j) + max c`, and it must be written that way: the shorter
+    # `(1+k)*max c` is correct only for k > 0, because max_j(k*c_j) selects the MAXIMUM of c
+    # for positive k and the MINIMUM for negative k. Both signs are replayed here, since a
+    # reference that is right for the sign one happens to test is the failure mode this
+    # project keeps running into (a full GPU run was spent on exactly this).
+    for k in (1.0, 2.0, -0.5, -3.0):
+        for shape, block in (((5, 7), 3), ((4, 10), 4), ((3, 8), 8), ((6, 9), 2)):
+            x = rng.normal(size=shape)
+            got = replay(x, block, k)
+            want = (k * x).max(axis=1) + x.max(axis=1)
+            err = np.max(np.abs(got - want) / np.maximum(np.abs(want), 1e-12))
+            assert err < 1e-12, (
+                f"k={k} shape={shape} block={block}: max rel err {err:.3e}"
+            )
+
+
+def test_producer_floor_is_applied_only_where_the_source_divides():
+    """The floor on the fresh producer value is a division guard, not a convention.
+
+    It used to be keyed off `is_log`, which happens to be right for all eight registered
+    skeletons but is the wrong test: an additive fold never divides, and flooring its
+    producer is not a 1e-30 nicety -- for `g = c - s` on the all-negative row [-5, -1, -3]
+    the floored producer is 1e-30, so the emitted term becomes `v - 1e-30` and the kernel
+    returns -1 where the operator is identically 0.
+    """
+    import numpy as np
+    import neptune_codegen as CG
+    from neptune_codegen.symbols import c_sym, s_sym, s2_sym  # noqa: F401
+
+    # divides by the producer -> floored
+    assert CG.denominator_expr(CG.SKELETONS["rmsnorm_max"]) == "tl.maximum(m_new, 1e-30)"
+    assert CG.denominator_expr(CG.SKELETONS["linear_attn"]) == "tl.maximum(m_new, 1e-30)"
+    # no division by the producer -> raw (the exponential folds, and now the affine ones)
+    assert CG.denominator_expr(CG.SKELETONS["logsumexp"]) == "m_new"
+    shift = CG.Skeleton(name="shift", g=c_sym - s_sym, finalize=CG._FINAL_ACC,
+                        producer="signed", producer_reducer="max", consumer_reducer="max")
+    assert CG.denominator_expr(shift) == "m_new"
+
+    # The error the floor would introduce, replayed over the emitted recurrence.
+    x = np.array([-5.0, -1.0, -3.0])
+    a, b = CG.repair_pair(shift)
+
+    def fold(floor):
+        m, acc = -np.inf, -np.inf
+        for c in x:
+            m_new = max(m, c)
+            den = max(m_new, 1e-30) if floor else m_new
+            scale = 1.0 if m == -np.inf else float(a)
+            bias = 0.0 if m == -np.inf else float(b.subs({s_sym: m, s2_sym: den}))
+            acc = max(acc * scale + bias, c - den)
+            m = m_new
+        return acc
+
+    assert abs(fold(floor=False)) < 1e-12, "the raw producer must reproduce the reference"
+    # Measured -2.0 against a reference of exactly 0.0: an error of the order of the row's
+    # own magnitude, which is what makes this a correctness bug rather than a rounding one.
+    assert abs(fold(floor=True) - (-2.0)) < 1e-9, (
+        "the floor is expected to break this family by ~|max|; if this changed, the "
+        "justification for the per-skeleton predicate needs revisiting"
+    )
 
 
 def main() -> int:

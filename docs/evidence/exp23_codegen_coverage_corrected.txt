@@ -1,0 +1,87 @@
+============================================================================================================
+CODEGEN COVERAGE -- can the GENERATOR emit a kernel, given that the algebra admits one?
+============================================================================================================
+family                       group      verdict     emit    detail
+------------------------------------------------------------------------------------------------------------
+  -- softmax -----------------------------------------------------------------------------------------------
+softmax                      softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+softmax+causal mask          softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+softmax+ALiBi bias           softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+softmax+softcap              softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+log-softmax                  softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+  -- loss --------------------------------------------------------------------------------------------------
+cross-entropy (logsumexp)    loss       EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+  -- variance ----------------------------------------------------------------------------------------------
+one-pass variance            variance   NEEDS_STATE no      repair-not-multiplicative
+two-pass variance            variance   NEEDS_STATE no      repair-not-multiplicative
+Welford reduce               variance   NEEDS_STATE no      repair-not-multiplicative
+batch-norm stats             variance   NEEDS_STATE no      repair-not-multiplicative
+  -- norm --------------------------------------------------------------------------------------------------
+stable L2 norm               norm       EXACT       YES     scale=(m / den) * (m / den)  term=tl.where(m
+RMSNorm numerator            norm       EXACT       YES     scale=(m / den) * (m / den)  term=tl.where(m
+RMSNorm + row max            norm       EXACT       no      f-not-additive
+L2-normalise rows            norm       EXACT       YES     scale=(m / den) * (m / den)  term=tl.where(m
+p-norm (p=3)                 norm       NEEDS_STATE no      translator-unsupported
+standard deviation           norm       NEEDS_STATE no      repair-not-multiplicative
+  -- reduction ---------------------------------------------------------------------------------------------
+max + sum of exp             reduction  EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+prod + ratio                 reduction  AFFINE      no      f-not-additive
+max + additive shift         reduction  EXACT       no      f-not-additive
+max + scaled shift           reduction  EXACT       no      f-not-additive
+entropy                      reduction  EXACT       YES     scale=((tl.log(den)) / (tl.log(m)))  term=tl
+max-abs + sum of squares     reduction  EXACT       YES     scale=(m / den) * (m / den)  term=tl.where(m
+  -- attention ---------------------------------------------------------------------------------------------
+FlashAttention prefill       attention  EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+FlashDecoding split-K        attention  EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+linear attention             attention  EXACT       YES     scale=(m / den)  term=tl.where(mask, (v / de
+  -- outside -----------------------------------------------------------------------------------------------
+non-invertible producer      outside    NOT_INVERT  no      repair-not-multiplicative
+two producers, one term      outside    NOT_INVERT  no      g-depends-on-fresh-value
+duration/decay renormalisation outside    EXACT       YES     scale=((m + 1.0) / (den + 1.0))  term=tl.whe
+============================================================================================================
+total declared families          : 28
+  ALGEBRA admits a fold (EXACT)  :  19
+  CODEGEN emits a kernel         :  16  (57.1%)
+  refused                        :  12
+
+refusals by cause:
+  repair-not-multiplicative      6
+  f-not-additive                 4
+  translator-unsupported         1
+  g-depends-on-fresh-value       1
+
+emitted, by verdict:
+  EXACT                         16
+
+refused, by (verdict, cause) -- this is the work list:
+  NEEDS_STATE  repair-not-multiplicative      5  one-pass variance, two-pass variance, Welford reduce ...
+  EXACT        f-not-additive                 3  RMSNorm + row max, max + additive shift, max + scaled shift
+  NEEDS_STATE  translator-unsupported         1  p-norm (p=3)
+  AFFINE       f-not-additive                 1  prod + ratio
+  NOT_INVERT   repair-not-multiplicative      1  non-invertible producer
+  NOT_INVERT   g-depends-on-fresh-value       1  two producers, one term
+============================================================================================================
+
+============================================================================================================
+本轮新增：softcap_lse（Gemma-2 attention soft-capping）—— 第 4 个端到端算子
+============================================================================================================
+g = exp(tanh(beta*c) - s),  producer = signed,  is_log = True
+  推导出的修复        R = exp(s - s2)
+  推导出的项          T = exp(tanh(beta*c) - s2)
+  推导出的生产端操作数  = (2.0 * tl.sigmoid(2.0 * v * 0.5) - 1.0)     <- 不声明，推导而来
+
+AOTI 产物证据（4 个算子一致）：
+  baseline      : cubins=1  artifact mentions '<op>'  0x  in_ptr0=7~8
+  selected+gen  : cubins=1  artifact mentions '<op>' 41x  in_ptr0=0
+
+数值（float32，eager 自定义算子 vs 分解式参考）：
+  softcap_lse (64, 4096)     rel_err=1.137e-07
+  softcap_lse (1024, 16384)  rel_err=1.947e-07
+  softcap_lse (8, 1000)      rel_err=6.817e-08
+
+回归：gpu_m10_codegen_tests.py 101 passed, 0 failed
+
+Triton 报错（修复前，记录下来因为它精确定位了问题）：
+  AssertionError('Loop-carried variable m has initial type fp32 but is re-assigned to
+  fp64 in loop! Please make sure that the type stays consistent.')
+  -> 标量参数以运行时参数传入时是 fp64；改为写进源码当字面量

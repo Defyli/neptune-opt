@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neptune-opt"
+version = "0.1.0"
+description = "Break-and-repair reduction fusion for PyTorch AOTInductor, generated from algebra"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Defyli" }]
+keywords = ["pytorch", "aoti", "torchinductor", "triton", "compiler", "fusion", "reduction"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["torch>=2.4", "sympy>=1.12"]
+
+[project.optional-dependencies]
+gpu = ["triton>=3.0"]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/Defyli/neptune-opt"
+Paper = "https://arxiv.org/abs/2510.08726"
+
+[tool.setuptools]
+packages = ["neptune_opt", "neptune_codegen", "neptune_recognize", "repairlib"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

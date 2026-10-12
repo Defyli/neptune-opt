@@ -1,0 +1,40 @@
+============================================================================================================
+GENERAL REPAIR CLASSIFIER — which (f, g) pairs admit SAFE fusion?
+============================================================================================================
+operator                 verdict     h(t, s, s2)                                    note
+------------------------------------------------------------------------------------------------------------
+online_softmax           EXACT       u*exp(s - s2)                                  Eq.5; apply:accumulator
+logsumexp                EXACT       u*exp(s - s2)                                  Eq.5; apply:accumulator
+stable_l2                EXACT       s**2*u/s2**2                                   Eq.5; apply:accumulator
+rmsnorm_max              AFFINE      u*sqrt(eps + s)/sqrt(eps + s2)                 Eq.5; (4) fails -> needs extra carried state; 
+variance_shift           NEEDS_STATE (-s + s2 + sqrt(u))**2                         Eq.5; (3) needs c -> carry extra state (Welfor
+prod_ratio               AFFINE      s*u/s2                                         Eq.5; (4) fails -> needs extra carried state; 
+noninvertible            NOT_INVERT  —                                              g_c^{-1} independent of the producer value; ap
+max_shift                AFFINE      s - s2 + u                                     Eq.5; (4) fails -> needs extra carried state; 
+------------------------------------------------------------------------------------------------------------
+3/8 pairs are EXACT (safe to fold into an accumulator)
+
+Reading:
+  EXACT      repair (4) holds -> h corrects an ACCUMULATOR, which is what fusion needs.
+  AFFINE     (3) holds, (4) fails -> a per-term correction exists but cannot be
+             propagated through the fold without carrying extra state.
+  NEEDS_STATE (3) itself needs c -> no repair of the form h(t,s,s') can work; extra
+             state must be carried across iterations (Welford carries the mean).
+  NO_REPAIR  (3) fails and is c-free -> this construction cannot repair g at all.
+  NOT_INVERT Eq.5 cannot be instantiated at all.
+
+The shipped PyTorch implementation covers exactly ONE of these rows.
+============================================================================================================
+device = cpu   torch = 2.14.1
+================================================================================================
+online_softmax       EXACT        h=u*exp(s - s2)                    vs sum(exp(x-amax)) max_err=7.105e-15 PASS
+logsumexp            EXACT        h=u*exp(s - s2)                    vs sum(exp(x-amax)) max_err=7.105e-15 PASS
+stable_l2            EXACT        h=s**2*u/s2**2                     vs sum(x^2)         max_err=4.470e-08 PASS
+rmsnorm_max          AFFINE       h=u*sqrt(eps + s)/sqrt(eps + s2)   not-foldable: Eq.5; (4) fails -> needs extra carried state
+variance_shift       NEEDS_STATE  (no executable spec)
+prod_ratio           AFFINE       (no executable spec)
+noninvertible        NOT_INVERT   (no executable spec)
+max_shift            AFFINE       (no executable spec)
+================================================================================================
+Numeric agreement between the CLASSIFIER-DERIVED repair and a naive multi-pass reference.
+A hand-written kernel and its symbolic derivation can drift; this harness keeps one source of truth.

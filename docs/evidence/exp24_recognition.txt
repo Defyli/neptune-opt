@@ -1,0 +1,127 @@
+====================================================================================================
+RECOGNITION FROM THE ALGEBRA -- no per-operator pattern rows
+registry: decay_renorm, linear_attn, logsumexp, lse_biased, softcap_lse, stable_l2, sumsq_div
+====================================================================================================
+  [PASS] d_logsumexp      -> logsumexp
+  [PASS] d_stable_l2      -> stable_l2
+  [PASS] d_softcap        -> softcap_lse  inferred beta=0.5
+  [PASS] d_sumsq_div      -> sumsq_div
+  [PASS] d_linear_attn    -> linear_attn
+  [PASS] d_decay_renorm   -> decay_renorm  inferred N=2
+  [PASS] d_lse_biased     -> lse_biased  inferred alpha=1.5
+  [PASS] variance (two-producer)  -> refused (graph is not a (max-like, sum-like) reduction pair)
+====================================================================================================
+TOTAL: 8 passed, 0 failed
+Reading:
+  * every row here is matched by COMPARING EXPRESSIONS against the generator's registry.
+    There is no `if 'tanh' in chain` anywhere -- adding a skeleton to the registry extends
+    recognition automatically, and recognition cannot drift from what can be generated.
+  * parameters are INFERRED: nothing above tells the recogniser that the soft-cap uses
+    beta=0.5, that the decay offset is 2.0, or that the ALiBi bias is 1.5.
+====================================================================================================
+
+============================================================================================================
+GPU 端（gpu_m14_recognition.py，torch 2.11.0+cu128 / triton 3.6.0）
+============================================================================================================
+[A] 识别（registry 驱动，零条模式规则）：7/7 operators, 0 pattern rows
+    logsumexp / stable_l2 / sumsq_div / linear_attn  -> 精确命中
+    softcap_lse  -> 推断 beta=0.5
+    decay_renorm -> 推断 N=2
+    lse_biased   -> 推断 alpha=1.5
+    负例：两生产端 variance 被拒绝
+
+[B] AOTI 产物（决定性的放置位置测量）
+    算子             baseline   rewrite@export后   rewrite@export前   cubins
+    linear_attn         0x            0x               41x              1
+    decay_renorm        0x            0x               41x              1
+    lse_biased          0x            0x               41x              1
+
+    在 export 之后插入算子：图里确实有 neptune.<op>，但 ExportedProgram 从未登记它的
+    Triton kernel，产物里 0 次出现（gpu_diag_paths.py 用 A/B 直接量了）。
+    重新 export 那个 GraphModule 也没用（同样 0）。只有"trace 期间就在图里"才给 41x。
+    => pass 必须作用在 export 之前的 FX 图上。
+
+[C] 数值（用**推断出来的**参数构造 eager 自定义算子）
+    算子           shape          rel_err      err/sum|terms|
+    linear_attn    (64, 4096)     4.244e-05    1.124e-08
+    linear_attn    (1024, 3000)   7.368e-05    1.447e-08
+    decay_renorm   (64, 4096)     5.834e-06    5.740e-09
+    decay_renorm   (1024, 3000)   5.973e-05    7.309e-09
+    lse_biased     (64, 4096)     9.260e-08    9.730e-10
+    lse_biased     (1024, 3000)   9.579e-08    1.171e-09
+    softcap_lse    (64, 4096)     1.136e-07    9.520e-10
+    softcap_lse    (1024, 3000)   1.182e-07    1.197e-09
+
+    注：linear_attn / decay_renorm 是**带符号求和**，3000 列时结果只有各项绝对值之和的
+    约 0.3%，相对误差被这个抵消因子放大（~150x），所以对"结果"的相对误差说明不了内核质量。
+    按 err/sum|terms| 看，全部在 1e-8 量级。两个指标都报出来了。
+
+============================================================================================================
+最终回归（扩展识别之后）
+============================================================================================================
+gpu_m10_codegen_tests.py   : 346 passed, 0 failed   (注册表从 2 个骨架扩到 7 个)
+gpu_m12_generality.py      : VERDICT all auto-derived operators correct
+gpu_m13_aoti_codegen.py    : 4 个算子，mentions 0x -> 41x，cubins=1，数值 <=1.95e-07
+gpu_m14_recognition.py     : 识别 7/7，3 个新算子 mentions 0x -> 41x，数值全过
+
+文件名变化：
+  neptune_recognize.py       由代数推导的识别（registry 驱动，无模式行）
+  recognize_tests.py         纯 CPU 的识别测试（8/8）
+  gpu_diag_reexport.py       诊断：为什么导出后改图不产生 HOP
+  gpu_diag_paths.py          A/B：三条入口路径的产物差异（0x / 0x / 41x）
+  gpu_m14_recognition.py     识别里程碑的 GPU 端到端
+
+一个贯穿始终的教训（本轮又验证一次）：
+  "能编译、能跑、算的是另一个函数"比"明确拒绝"危险得多。本轮又抓到两个：
+  - 导出后插入算子：图里看着完全正确，产物里却一次都没有生成的内核
+  - 带符号求和的相对误差：3.6e-3 看起来像 bug，其实是抵消因子放大，err/sum|terms| 是 1e-8
+
+============================================================================================================
+第二轮：两个 reducer 是独立轴 —— RMSNorm+max（论文自己的例子）
+============================================================================================================
+上一轮我把缺口叫"多生产端"，**这个说法是错的**。重推一遍：
+
+  RMSNorm+max:  producer = mean(x^2)   <- 加法归约
+                consumer = max         <- 取最大
+                h(t,r,r') = t*sqrt(eps+r)/sqrt(eps+r')      （只是生产端对的纯量比值）
+
+它只有**一个**生产端，只是这个生产端由**另一个 reducer** 产生。
+生成器之前把 (producer=max, consumer=sum) 写死了，所以论文的旗舰例子根本表达不出来，
+而原因和代数毫无关系。
+
+改动：`producer_reducer` / `consumer_reducer` 变成两个独立字段，
+模板统一成 `fold(repair(acc), block_reduce(term))`，只有那两个函数换。
+`check_supported` 拒绝 "指数折叠 + max 消费者"（那不是同一个算子）。
+
+生成出来的内核：
+    m = 0.0                                      # 运行中的 mean(x^2)
+    acc = -float('inf')                          # 运行中的 max
+    m_new = m + tl.sum(tl.where(mask, (v*v)*(1.0/64.0), 0.0), axis=0)
+    den = tl.maximum(m_new, 1e-30)
+    scale = tl.where(m == 0.0, 1.0, tl.sqrt(m + 1e-06) * (1.0/tl.sqrt(den + 1e-06)))
+    acc = tl.maximum(acc * scale, tl.max(tl.where(mask, v*(1.0/tl.sqrt(den+1e-06)), -float("inf")), axis=0))
+    m = m_new
+    tl.store(out_ptr + row, acc)
+
+识别（写成人最容易写的形式 `(t*t).mean(-1)`）：
+    d_rmsnorm_max -> rmsnorm_max   inferred N=4096, eps=1e-06
+    * N 来自输入最后一维（所以解释器要读形状；.mean() 把行长度藏进了 op 里）
+    * eps 来自项里解出来的
+    * 生产端/消费者的判定按**依赖关系**（谁的结果出现在谁的操作数里），不是按图的先后顺序
+      —— 之前假设"max 先出现"，在这个算子上会直接把两者标反
+
+AOTI：mentions 0x -> 41x，cubins=1
+数值：(64,4096) rel_err=2.622e-07 / (1024,3000) rel_err=2.883e-07
+
+顺带修掉的：
+  * `x**(-1/2)` 之前被正底数守卫拒绝。1/sqrt(x) 不需要正性假设（负数是 nan，正是定义）。
+  * sp.solve 一次解多个未知数会掉进 `_solve_undetermined` 返回 None 然后崩；
+    改成一次解一个（N 由生产端钉住，eps 由项钉住，本来就该分开解）。
+  * 形状耦合的参数必须**按形状特化**。实测：用 N=4096 的算子去算 3000 列，
+    rel_err=1.685e-01，正好是 sqrt(4096/3000)-1=0.168。这不是内核 bug，是测试用错了 N。
+    （AOTI 的产物本来就是形状特化的。）
+
+最终回归：
+  gpu_m10_codegen_tests.py : 395 passed, 0 failed
+  gpu_m14_recognition.py   : 识别 8/8，0 模式行；4 个算子 mentions 0x -> 41x；数值全过
+  coverage_codegen.py      : 17/28 = 60.7%（占 EXACT 的 17/19 = 89.5%）

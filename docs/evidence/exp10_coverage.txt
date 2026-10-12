@@ -1,0 +1,68 @@
+======================================================================================================================
+COVERAGE: which operator families admit a FOLDABLE repair?
+======================================================================================================================
+family                     group      verdict     h(t, s, s')                              note
+----------------------------------------------------------------------------------------------------------------------
+  -- softmax ---------------------------------------------------------------------------------------------------------
+softmax                    softmax    EXACT       u*exp(s - s2)                            shipped by PyTorch (only this one)
+softmax+causal mask        softmax    EXACT       u*exp(s - s2)                            mask folded into the term
+softmax+ALiBi bias         softmax    EXACT       u*exp(s - s2)                            bias is non-reduction input
+softmax+softcap            softmax    NEEDS_STATE exp(-s2 + tanh(log(-sqrt(-(s + log(u) +  NOT_INVERT: c sits inside tanh, so
+log-softmax                softmax    EXACT       u*exp(s - s2)                            same fold; log applied once at the
+  -- loss ------------------------------------------------------------------------------------------------------------
+cross-entropy (logsumexp)  loss       EXACT       u*exp(s - s2)                            same as log-softmax
+  -- variance --------------------------------------------------------------------------------------------------------
+one-pass variance          variance   NEEDS_STATE (-s + s2 + sqrt(u))**2                   consumer's rm depends on the runni
+two-pass variance          variance   NEEDS_STATE (-s + s2 + sqrt(u))**2                   g cannot reference the FRESH produ
+Welford reduce             variance   NEEDS_STATE (-s + s2 + sqrt(u))**2                   needs the running count alongside 
+batch-norm stats           variance   NEEDS_STATE (-s + s2 + sqrt(u))**2                   same skeleton as variance
+  -- norm ------------------------------------------------------------------------------------------------------------
+stable L2 norm             norm       EXACT       s**2*u/s2**2                             EXACT: no PyTorch equivalent
+RMSNorm numerator          norm       EXACT       s**2*u/s2**2                             same as stable L2
+RMSNorm + row max          norm       AFFINE      u*sqrt(eps + s)/sqrt(eps + s2)           max reducer
+L2-normalise rows          norm       EXACT       s**2*u/s2**2                             same as stable L2
+p-norm (p=3)               norm       NEEDS_STATE u*(s/s2)**p                              p is a compile-time constant
+standard deviation         norm       NEEDS_STATE (-s + s2 + sqrt(u))**2                   variance skeleton
+  -- reduction -------------------------------------------------------------------------------------------------------
+max + sum of exp           reduction  EXACT       u*exp(s - s2)                            the core softmax fold
+prod + ratio               reduction  AFFINE      s*u/s2                                   multiplicative reducer
+max + additive shift       reduction  AFFINE      s - s2 + u                               log-space max-plus
+max + scaled shift         reduction  AFFINE      (N*u + s - s2)/N                         scale is non-reduction input
+entropy                    reduction  EXACT       u*log(s2)/log(s)                         log producer, sum reducer
+max-abs + sum of squares   reduction  EXACT       s**2*u/s2**2                             same as stable L2
+  -- attention -------------------------------------------------------------------------------------------------------
+FlashAttention prefill     attention  EXACT       u*exp(s - s2)                            row-wise max/sum fold
+FlashDecoding split-K      attention  EXACT       u*exp(s - s2)                            same fold, split over K; combinati
+linear attention           attention  EXACT       s*u/s2                                   ratio producer, sum reducer
+  -- outside ---------------------------------------------------------------------------------------------------------
+non-invertible producer    outside    NOT_INVERT  —                                        Eq.5 cannot be instantiated
+two producers, one term    outside    NOT_INVERT  —                                        placeholder: real case needs Multi
+duration/decay renormalisation outside    EXACT       u*(N + s)/(N + s2)                       additive denominator offset
+======================================================================================================================
+total declared families: 28
+  EXACT         15  ( 53.6%)
+  AFFINE         4  ( 14.3%)
+  NEEDS_STATE    7  ( 25.0%)
+  NOT_INVERT     2  (  7.1%)
+
+by group:
+  softmax        5 families,   4 EXACT
+  loss           1 families,   1 EXACT
+  variance       4 families,   0 EXACT
+  norm           6 families,   3 EXACT
+  reduction      6 families,   3 EXACT
+  attention      3 families,   3 EXACT
+  outside        3 families,   1 EXACT
+
+What this means for a general module
+------------------------------------
+* The EXACT rows are the module's *reach*: each one is a fold that a general
+  implementation could emit. PyTorch ships exactly ONE of them (softmax).
+* Crucially, whole FAMILIES collapse to the same algebra: every softmax variant
+  (causal mask, ALiBi, softcap, log-softmax, cross-entropy) shares one (f, g) and
+  therefore one repair. That is the argument for a general module rather than more
+  special cases -- N surface variants cost ONE new skeleton.
+* The non-EXACT rows are just as useful: they say precisely what the module must NOT
+  try to fold, and why (needs carried state vs. not expressible at all).
+
+======================================================================================================================

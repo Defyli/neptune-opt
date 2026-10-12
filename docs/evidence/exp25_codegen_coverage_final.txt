@@ -1,0 +1,63 @@
+============================================================================================================
+CODEGEN COVERAGE -- can the GENERATOR emit a kernel, given that the algebra admits one?
+============================================================================================================
+family                       group      verdict     emit    detail
+------------------------------------------------------------------------------------------------------------
+  -- softmax -----------------------------------------------------------------------------------------------
+softmax                      softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+softmax+causal mask          softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+softmax+ALiBi bias           softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+softmax+softcap              softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+log-softmax                  softmax    EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+  -- loss --------------------------------------------------------------------------------------------------
+cross-entropy (logsumexp)    loss       EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+  -- variance ----------------------------------------------------------------------------------------------
+one-pass variance            variance   NEEDS_STATE no      repair-not-multiplicative
+two-pass variance            variance   NEEDS_STATE no      repair-not-multiplicative
+Welford reduce               variance   NEEDS_STATE no      repair-not-multiplicative
+batch-norm stats             variance   NEEDS_STATE no      repair-not-multiplicative
+  -- norm --------------------------------------------------------------------------------------------------
+stable L2 norm               norm       EXACT       YES     scale=(m / den) * (m / den)  term=tl.where(m
+RMSNorm numerator            norm       EXACT       YES     scale=(m / den) * (m / den)  term=tl.where(m
+RMSNorm + row max            norm       EXACT       YES     scale=(tl.sqrt(m + 1.0)) * ((1.0 / tl.sqrt(d
+L2-normalise rows            norm       EXACT       YES     scale=(m / den) * (m / den)  term=tl.where(m
+p-norm (p=3)                 norm       NEEDS_STATE no      translator-unsupported
+standard deviation           norm       NEEDS_STATE no      repair-not-multiplicative
+  -- reduction ---------------------------------------------------------------------------------------------
+max + sum of exp             reduction  EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+prod + ratio                 reduction  AFFINE      no      f-needs-carried-state
+max + additive shift         reduction  EXACT       no      repair-not-multiplicative
+max + scaled shift           reduction  EXACT       no      repair-not-multiplicative
+entropy                      reduction  EXACT       YES     scale=((tl.log(den)) / (tl.log(m)))  term=tl
+max-abs + sum of squares     reduction  EXACT       YES     scale=(m / den) * (m / den)  term=tl.where(m
+  -- attention ---------------------------------------------------------------------------------------------
+FlashAttention prefill       attention  EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+FlashDecoding split-K        attention  EXACT       YES     scale=tl.exp(tl.maximum(tl.minimum(m - den, 
+linear attention             attention  EXACT       YES     scale=(m / den)  term=tl.where(mask, (v / de
+  -- outside -----------------------------------------------------------------------------------------------
+non-invertible producer      outside    NOT_INVERT  no      repair-not-multiplicative
+two producers, one term      outside    NOT_INVERT  no      g-depends-on-fresh-value
+duration/decay renormalisation outside    EXACT       YES     scale=((m + 1.0) / (den + 1.0))  term=tl.whe
+============================================================================================================
+total declared families          : 28
+  ALGEBRA admits a fold (EXACT)  :  19
+  CODEGEN emits a kernel         :  17  (60.7%)
+  refused                        :  11
+
+refusals by cause:
+  repair-not-multiplicative      8
+  translator-unsupported         1
+  f-needs-carried-state          1
+  g-depends-on-fresh-value       1
+
+emitted, by verdict:
+  EXACT                         17
+
+refused, by (verdict, cause) -- this is the work list:
+  NEEDS_STATE  repair-not-multiplicative      5  one-pass variance, two-pass variance, Welford reduce ...
+  EXACT        repair-not-multiplicative      2  max + additive shift, max + scaled shift
+  NEEDS_STATE  translator-unsupported         1  p-norm (p=3)
+  AFFINE       f-needs-carried-state          1  prod + ratio
+  NOT_INVERT   repair-not-multiplicative      1  non-invertible producer
+  NOT_INVERT   g-depends-on-fresh-value       1  two producers, one term
+============================================================================================================

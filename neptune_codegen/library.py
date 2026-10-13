@@ -168,6 +168,10 @@ register(Skeleton(
     producer="signed",
     is_log=True,
     params=((_PARAM_T, "T"), (_PARAM_TINY, "tiny")),
-    defaults=((_PARAM_TINY, 0.0),),
+    # T MUST be declared here. `param_defaults` falls back to 1.0 for anything undeclared, and
+    # T=1 makes this skeleton the PLAIN log-sum-exp -- so the whole GPU sweep of `lse_scaled`
+    # was exercising a degenerate case (it even matched the `logsumexp` skeleton in the
+    # recognition tests, which is how this was noticed). 2.0 is arbitrary but not degenerate.
+    defaults=((_PARAM_T, 2.0), (_PARAM_TINY, 0.0)),
     doc="logsumexp(x / T): the softmax denominator for temperature-scaled logits",
 ))

@@ -1,0 +1,51 @@
+name: ci
+
+# The CPU half of the verification. The GPU half cannot run here: it needs a CUDA device, and the
+# scripts that produce it (experiments/gpu_*.py) are meant to be run on a machine with one. What
+# this job guarantees is that nothing lands on main without the CPU evidence intact -- recognition,
+# the safety gates, the coverage floor, and that the package installs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The lowest version `pyproject.toml` claims to support, and the current one. Testing the
+        # floor is the point: `torch.library.triton_op` and `torch.export` both moved during this
+        # range, and a claim of ">=2.4" that has never been run on 2.4 is not a claim.
+        torch: ["2.4.1", "2.6.0", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.torch }}" = "latest" ]; then
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          else
+            python -m pip install "torch==${{ matrix.torch }}" \
+              --index-url https://download.pytorch.org/whl/cpu
+          fi
+          python -m pip install sympy pytest
+      - name: Recognition and the safety gates
+        run: python -m pytest tests/ -q
+      - name: The generator still covers what it claims
+        run: python tools/coverage_codegen.py --check
+      - name: Every script in the repository compiles
+        run: python -m compileall -q neptune_codegen neptune_recognize neptune_opt repairlib tests tools examples
+      - name: The package installs and imports
+        run: |
+          python -m pip install -e .
+          python -c "import neptune_opt, neptune_codegen, neptune_recognize, repairlib; \
+                     print('import ok:', len(neptune_codegen.supported()), 'skeletons')"
+      - name: The README's quickstart runs
+        run: python examples/01_quickstart.py

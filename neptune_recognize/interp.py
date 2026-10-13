@@ -77,7 +77,12 @@ _CONST_FILL = ("full_like", "full", "scalar_tensor", "zeros_like", "ones_like")
 # Tracing wrappers that ExportedProgram inserts around a module's parameter handling. They carry
 # no data path -- nothing in the reduction pattern consumes their result -- so they are skipped
 # rather than reported as an "unfamiliar op".
-_WRAPPERS = ("wrap_with_set_grad_enabled",)
+_WRAPPERS = (
+    "wrap_with_set_grad_enabled",
+    # A pure assertion about metadata, inserted by export. It computes nothing and its result is
+    # consumed by nobody, so it is skipped rather than reported as an unfamiliar op.
+    "_assert_tensor_metadata",
+)
 
 
 def _is_zero(x) -> bool:
@@ -162,6 +167,35 @@ def _var_is_biased(node) -> bool:
         return node.kwargs["unbiased"] is False
     # positional: (self, dim, unbiased[, keepdim])
     return len(node.args) > 2 and node.args[2] is False
+
+
+def _is_row_flatten(node, env, rank) -> bool:
+    """Is this `view`/`reshape` a no-op for a 2-D row-reduction?
+
+    `x.reshape(x.shape[0], -1)` is how a lot of real code normalises a batch into rows before a
+    row-wise reduction, and it appears in the project's own reference helpers. On a 2-D input it
+    is the identity, so the interpreter can pass through it.
+
+    The rule is deliberately narrow, because a reshape in general is NOT harmless: viewing
+    `(B, T, C)` as `(B, T*C)` turns a per-position reduction into a per-sequence one, and treating
+    that as the identity would silently compute a different operator. Accepted only when the input
+    is 2-D and the target's first entry is the SAME integer as the input's first dimension with
+    `-1` for the rest.
+    """
+    if rank != 2 or not node.args or len(node.args) < 2:
+        return False
+    if not isinstance(node.args[1], (list, tuple)) or len(node.args[1]) != 2:
+        return False
+    first, second = node.args[1]
+    if second != -1 or not isinstance(first, int):
+        return False
+    src = node.args[0]
+    shape = None
+    value = src.meta.get("val") if hasattr(src, "meta") else None
+    shape = getattr(value, "shape", None)
+    if shape is None or len(shape) != 2:
+        return False
+    return int(shape[0]) == first
 
 
 def _reduces_last_dim_only(node, rank):
@@ -312,6 +346,21 @@ def interpret(gm, why: list | None = None):
 
         if name in _ALLOC or name in _WRAPPERS:
             continue                       # a buffer / a tracing wrapper; no data path
+
+        if name in ("view", "reshape"):
+            if not _is_row_flatten(node, env, rank):
+                if why is not None:
+                    why.append(
+                        f"a {name} that changes the row structure: only a 2-D "
+                        f"`x.reshape(x.shape[0], -1)` can be treated as the identity, because "
+                        f"any other reshape changes which elements share a row"
+                    )
+                return None
+            v, is_val = _as_expr(node.args[0], env)
+            if not is_val or v is None:
+                return None
+            env[node] = v
+            continue
 
         if name in _CONST_FILL:
             # `full_like(x, v)` (and friends) is the constant v. `zeros_like`/`ones_like` fill

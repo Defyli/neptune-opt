@@ -338,7 +338,7 @@ observation turns into.
 |---|---|
 | recognition of every registered skeleton | `tests/test_recognize.py` (CPU) |
 | region extraction, gates, operator library | `tests/test_neptune_opt.py` (CPU) |
-| dynamic shapes (symbolic row length) | `tests/test_neptune_opt.py` (CPU + GPU) |
+| dynamic shapes (symbolic row length) | `tests/test_neptune_opt.py` (CPU), `experiments/gpu_m18_dynamic_shapes.py` (GPU, every skeleton) |
 | the derived repair, for every registered skeleton | `tests/test_neptune_opt.py` (CPU, golden table) |
 | the affine repair, derived and replayed numerically | `tests/test_neptune_opt.py` (CPU) |
 | the affine kernel compiles and is exact on hardware | `experiments/gpu_m16_affine.py` (GPU) |
@@ -346,7 +346,8 @@ observation turns into.
 | the generated kernel inside the `.pt2` | `experiments/gpu_m15_integration.py` (GPU) |
 | one kernel serving several widths | `experiments/gpu_m15_integration.py` §E (GPU) |
 | generator correctness across skeletons | `experiments/gpu_m10_codegen_tests.py` (GPU) |
-| how much of the algebra is covered | `tools/coverage_codegen.py` (CPU) |
+| how much of the algebra is covered | `tools/coverage_codegen.py --check` (CPU + CI) |
+| that nothing lands without the CPU half | `.github/workflows/ci.yml` |
 
 Raw logs for these are under [evidence/](evidence/).
 

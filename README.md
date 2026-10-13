@@ -215,12 +215,14 @@ pytest tests/ -v                       # recognition + gates, CPU
 # the same tests without pytest installed:
 python tests/test_neptune_opt.py
 python tests/test_recognize.py
-python tools/coverage_codegen.py       # how much of the algebra the generator covers, CPU
+python tools/coverage_codegen.py --check   # coverage, and FAILS if it regresses (CI runs this)
+python -m pytest tests/ -q              # recognition + gates, CPU
 # on a CUDA machine:
 python experiments/gpu_m10_codegen_tests.py   # generator correctness across skeletons
 python experiments/gpu_m16_affine.py          # the affine repair, compiled and checked
 python experiments/gpu_m17_two_pass.py        # the two-pass plan, correctness and speed
 python experiments/real_modules.py            # what real torch.nn modules do, and why they don't
+python experiments/gpu_m18_dynamic_shapes.py  # symbolic row length, every in-frame skeleton
 python experiments/gpu_m15_integration.py     # the .pt2 evidence, end to end
 ```
 

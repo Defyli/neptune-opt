@@ -186,12 +186,13 @@ class M(torch.nn.Module):
         return self.fn(t)
 
 
-def main() -> None:
-    print("=" * 100)
-    print("RECOGNITION FROM THE ALGEBRA -- no per-operator pattern rows")
-    print(f"registry: {', '.join(__import__('neptune_codegen').supported())}")
-    print("=" * 100)
-    passed = failed = 0
+def _run_cases():
+    """Run every case once. Returns [(label, expected, got, ok, detail)].
+
+    Shared by the pytest entry point and the printed report so the two cannot drift: the report
+    a human reads and the assertion CI runs are the same computation.
+    """
+    out = []
     for want, fn in CASES:
         # The CORE-ATEN DECOMPOSITIONS, because that is what the pipeline sees: real modules
         # export as one high-level aten op (`aten.logsumexp`, `aten.var`), and the frame needs
@@ -199,26 +200,46 @@ def main() -> None:
         # step, so a case that passes here is a case the pipeline can serve.
         ep = export(M(fn).eval(), (X,)).run_decompositions()
         match, reason = NR.recognize(ep.graph_module)
-        got = match.skeleton if match else reason
-        ok = got == want
-        passed, failed = (passed + 1, failed) if ok else (passed, failed + 1)
+        got = match.skeleton if match else str(reason)
         detail = ""
         if match and match.inferred:
-            detail = "  inferred " + ", ".join(
+            detail = "inferred " + ", ".join(
                 f"{k}={v:g}" for k, v in sorted(match.params.items()))
-        print(f"  [{'PASS' if ok else 'FAIL'}] {fn.__name__:16s} -> {got}{detail}")
-        if not ok:
-            print(f"         expected {want}")
+        out.append((fn.__name__, want, got, got == want, detail))
     for label, fn in NEGATIVE:
-        # The CORE-ATEN DECOMPOSITIONS, because that is what the pipeline sees: real modules
-        # export as one high-level aten op (`aten.logsumexp`, `aten.var`), and the frame needs
-        # the producer/consumer pair. `neptune_opt.export(..., decompose=True)` is the same
-        # step, so a case that passes here is a case the pipeline can serve.
         ep = export(M(fn).eval(), (X,)).run_decompositions()
         match, got = NR.recognize(ep.graph_module)
-        ok = match is None
+        out.append((label, "refused",
+                    f"matched {match.skeleton}" if match is not None else "refused",
+                    match is None, str(got)[:60]))
+    return out
+
+
+def test_recognition_cases():
+    """Every case matches the skeleton the registry says implements it.
+
+    The pytest entry point. It runs the SAME `_run_cases()` as `main()`, because the previous
+    version kept the whole suite inside a `main()` and pytest therefore collected ZERO tests from
+    this file -- so `pytest tests/` (what CI runs, and what the README tells a user to run) would
+    have silently skipped every recognition case.
+    """
+    failed = [f"{label}: expected {want}, got {got}  ({detail})"
+              for label, want, got, ok, detail in _run_cases() if not ok]
+    assert not failed, "recognition failures:\n  " + "\n  ".join(failed)
+
+
+def main() -> None:
+    print("=" * 100)
+    print("RECOGNITION FROM THE ALGEBRA -- no per-operator pattern rows")
+    print(f"registry: {', '.join(__import__('neptune_codegen').supported())}")
+    print("=" * 100)
+    passed = failed = 0
+    for label, want, got, ok, detail in _run_cases():
         passed, failed = (passed + 1, failed) if ok else (passed, failed + 1)
-        print(f"  [{'PASS' if ok else 'FAIL'}] {label:24s} -> refused ({got[:58]})")
+        shown = f"{got}" + (f"  {detail}" if detail and ok else "")
+        print(f"  [{'PASS' if ok else 'FAIL'}] {label:32s} -> {shown}")
+        if not ok:
+            print(f"         expected {want}")
     print("=" * 100)
     print(f"TOTAL: {passed} passed, {failed} failed")
     print("""Reading:
@@ -226,8 +247,12 @@ def main() -> None:
     There is no `if 'tanh' in chain` anywhere -- adding a skeleton to the registry extends
     recognition automatically, and recognition cannot drift from what can be generated.
   * parameters are INFERRED: nothing above tells the recogniser that the soft-cap uses
-    beta=0.5, that the decay offset is 2.0, or that the ALiBi bias is 1.5.""")
+    beta=0.5, that the decay offset is 2.0, the ALiBi bias 1.5, or the attention temperature 8.
+  * the NEGATIVE rows must stay refused, and the two most important are `x.var(-1)` and
+    `x.std(-1)`: their DEFAULT is the /(N-1) form while the kernel computes /N, so fusing them
+    would silently change the numbers.""")
     print("=" * 100)
+    raise SystemExit(1 if failed else 0)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,64 @@
+# Raw GPU log for iteration I1: experiments/gpu_m18_dynamic_shapes.py
+# RTX 5090 D v2, torch 2.11.0+cu128, triton 3.6.0
+# produced by: python experiments/gpu_m18_dynamic_shapes.py   (exit 0)
+# REDACTED: 0 line(s) carrying an absolute path or host name.
+
+ITERATION I1 -- symbolic row length for every in-frame skeleton
+torch 2.11.0+cu128  NVIDIA GeForce RTX 5090 D v2
+====================================================================================================
+
+--- symbolic row length, per skeleton
+    skeleton       fused          mentions      w1024       w999       w333         w7
+    decay_renorm   decay_renorm         41   1.56e-07   1.81e-07   1.53e-07   3.26e-07
+  [PASS] decay_renorm/symbolic fusion  -- decay_renorm
+  [PASS] decay_renorm/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] decay_renorm/same kernel for every width  -- worst rel 3.26e-07 over (1024, 999, 333, 7)
+    linear_attn    linear_attn          41   1.54e-07   1.39e-07   1.86e-07   1.45e-06
+  [PASS] linear_attn/symbolic fusion  -- linear_attn
+  [PASS] linear_attn/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] linear_attn/same kernel for every width  -- worst rel 1.45e-06 over (1024, 999, 333, 7)
+    logsumexp      logsumexp            41   7.89e-08   8.04e-08   9.28e-08   0.00e+00
+  [PASS] logsumexp/symbolic fusion  -- logsumexp
+  [PASS] logsumexp/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] logsumexp/same kernel for every width  -- worst rel 9.28e-08 over (1024, 999, 333, 7)
+    lse_biased     lse_biased           41   6.97e-08   7.45e-08   8.20e-08   6.32e-08
+  [PASS] lse_biased/symbolic fusion  -- lse_biased
+  [PASS] lse_biased/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] lse_biased/same kernel for every width  -- worst rel 8.20e-08 over (1024, 999, 333, 7)
+    lse_scaled     lse_scaled           41   1.14e-07   1.11e-07   6.58e-08   1.16e-07
+  [PASS] lse_scaled/symbolic fusion  -- lse_scaled
+  [PASS] lse_scaled/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] lse_scaled/same kernel for every width  -- worst rel 1.16e-07 over (1024, 999, 333, 7)
+    rmsnorm_max    rmsnorm_max          41   1.18e-07   1.31e-07   1.66e-07   2.00e-07
+  [PASS] rmsnorm_max/symbolic fusion  -- rmsnorm_max
+  [PASS] rmsnorm_max/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] rmsnorm_max/same kernel for every width  -- worst rel 2.00e-07 over (1024, 999, 333, 7)
+    softcap_lse    softcap_lse          41   6.41e-08   6.45e-08   7.54e-08   1.19e-07
+  [PASS] softcap_lse/symbolic fusion  -- softcap_lse
+  [PASS] softcap_lse/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] softcap_lse/same kernel for every width  -- worst rel 1.19e-07 over (1024, 999, 333, 7)
+    stable_l2      stable_l2            41   1.56e-07   1.57e-07   1.38e-07   1.64e-07
+  [PASS] stable_l2/symbolic fusion  -- stable_l2
+  [PASS] stable_l2/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] stable_l2/same kernel for every width  -- worst rel 1.64e-07 over (1024, 999, 333, 7)
+    std            std                 121   1.53e-07   1.56e-07   1.53e-07   2.14e-07
+  [PASS] std/symbolic fusion  -- std
+  [PASS] std/kernel in the .pt2  -- 121x, cubins=1
+  [PASS] std/same kernel for every width  -- worst rel 2.14e-07 over (1024, 999, 333, 7)
+    sumsq_div      sumsq_div            41   1.38e-07   1.34e-07   1.76e-07   1.47e-07
+  [PASS] sumsq_div/symbolic fusion  -- sumsq_div
+  [PASS] sumsq_div/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] sumsq_div/same kernel for every width  -- worst rel 1.76e-07 over (1024, 999, 333, 7)
+    variance       variance             41   2.06e-07   2.18e-07   2.17e-07   2.22e-07
+  [PASS] variance/symbolic fusion  -- variance
+  [PASS] variance/kernel in the .pt2  -- 41x, cubins=1
+  [PASS] variance/same kernel for every width  -- worst rel 2.22e-07 over (1024, 999, 333, 7)
+
+--- shape-coupled parameters are emitted as the kernel's `ncols`
+  [PASS] rmsnorm_max/emits ncols  -- N->ncols
+  [PASS] std/emits ncols  -- N->ncols
+  [PASS] variance/emits ncols  -- N->ncols
+
+====================================================================================================
+TOTAL: 36 passed, 0 failed, 36 checks
+====================================================================================================

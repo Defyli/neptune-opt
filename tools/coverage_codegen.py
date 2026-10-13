@@ -199,6 +199,27 @@ def main() -> None:
               + (" ..." if len(names) > 3 else ""))
     print("=" * W)
 
+    # `--check` turns the numbers above into an assertion, so CI can notice a coverage
+    # REGRESSION. Without it the tool reports and exits 0, which means the headline claim
+    # ("26 of 28 families") is only ever verified by someone reading the output -- the same
+    # silent-success shape as the GPU scripts that printed verdicts and exited 0.
+    if "--check" in sys.argv:
+        floor_emitted = 26
+        floor_exact = 20
+        n_exact = sum(1 for _n, _g, f, gg, _no in rows
+                      if derive_repair(f, gg).verdict is Verdict.EXACT)
+        bad = []
+        if len(emitted) < floor_emitted:
+            bad.append(f"emits {len(emitted)} families, expected at least {floor_emitted}")
+        if n_exact < floor_exact:
+            bad.append(f"{n_exact} EXACT families, expected at least {floor_exact}")
+        if bad:
+            print("COVERAGE CHECK FAILED: " + "; ".join(bad))
+            return 1
+        print(f"coverage check OK: {len(emitted)} emitted (>= {floor_emitted}), "
+              f"{n_exact} EXACT (>= {floor_exact})")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -190,6 +190,14 @@ def test_op_registration_uses_the_shared_key():
 
     import neptune_codegen.torch_op as TO
 
+    if not hasattr(torch.library, "triton_op"):
+        # torch 2.4.1 has no `triton_op`, so op REGISTRATION is unavailable there -- not just this
+        # test. Verified by CI: the module-level `from torch.library import triton_op` is what fails,
+        # which is exactly why the README's portability limit says the integration is verified on
+        # one stack while the CPU suite runs on three.
+        print("      (skipped: torch %s has no torch.library.triton_op)" % torch.__version__)
+        return
+
     registered = {}
     real_triton_op = torch.library.triton_op
     real_compile = TO.compile_skeleton

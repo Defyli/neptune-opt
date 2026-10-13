@@ -123,30 +123,29 @@ def probe(f, g):
     # Tried only after every one-pass declaration has failed, because a single pass that works
     # is strictly better (one read of the row, not two) -- this is a fallback, not an option.
     #
-    # The probe cannot know which producer finalization a family wants, so it tries the ones
-    # this study's families need: a raw reduction, and a mean (a reduction divided by the row
-    # length). That is the same kind of search the loop above already performs over the
-    # reducers rather than assuming one -- it asks "does ANY declaration of this family emit",
-    # which is the coverage question. The real declaration lives in the registry
-    # (`variance`/`std` in neptune_codegen/library.py), not here.
+    # The probe cannot know which producer operand a family wants, so it tries the ones this
+    # study's families need: the raw value, and a mean (the value divided by the row length,
+    # which is how a graph spells `.mean()`). That is the same kind of search the loop above
+    # already performs over the reducers rather than assuming one -- it asks "does ANY
+    # declaration of this family emit", which is the coverage question. The real declaration
+    # lives in the registry (`variance`/`std` in neptune_codegen/library.py), not here.
     for cr in cons_reducers:
-        for label, fin in (("mean", CG._FINAL_M / CG._PARAM_N), ("raw", CG._FINAL_M)):
+        for label, pexpr in (("mean", CG.c_sym / CG._PARAM_N), ("raw", CG.c_sym)):
             sk = CG.Skeleton(name="probe", g=g2, finalize=CG._FINAL_ACC,
                              producer="signed", is_log=False, params=params,
                              producer_reducer="sum", consumer_reducer=cr,
-                             two_pass=True, producer_finalize=fin,
+                             two_pass=True, producer_expr=pexpr,
                              intrinsic_params=((CG._PARAM_N, "ncols"),))
             try:
                 vals = {arg: 1.0 for _sym, arg in params}
                 CG.check_supported(sk)
                 fold = CG.consumer_fold_no_repair(sk, vals)
-                fin_src = CG.producer_finalize_source(sk, vals)
                 t_src = CG.term_source(sk, vals)
             except (NotImplementedError, TranslationError) as e:
                 last = e
                 continue
             return True, f"two-pass sum/{cr}", (
-                f"{fold}\n      producer_finalize={fin_src} ({label})\n      term={t_src}")
+                f"{fold}\n      producer_expr={pexpr} ({label})\n      term={t_src}")
     if last is None:
         return False, "f-not-foldable", ""
     return False, classify_failure(last), ""

@@ -51,6 +51,28 @@ table:
 The interpreter is strict on purpose: an unknown op, a reduction over anything but the last
 dimension, or more than one independent producer/consumer pair is a refusal, not a guess.
 
+### Single ops that ARE a reduction pair
+
+`x.var(-1, unbiased=False)` does not export as a producer/consumer pair — it is one `aten.var.dim`
+node — so the interpreter *expands* it into the pair the algebra needs (`mean(c)`, then
+`mean((c - mean)^2)`), producing exactly the symbols a decomposed graph would. That matters because
+real models call `.var()` and `.std()` rather than writing out the mean and the centering. Same for
+`aten.std.dim`, and for the `correction=0` spelling.
+
+The flag is **read, never assumed**, and this is a correctness boundary rather than a nicety:
+
+| graph | fused? |
+|---|---|
+| `x.var(-1, unbiased=False)` | yes — `/N` |
+| `x.var(-1, correction=0)` | yes — `/N` |
+| `x.var(-1)` (the DEFAULT) | **refused** — `/(N-1)` |
+| `x.std(-1)` (the DEFAULT) | **refused** — `/(N-1)` |
+
+The two forms differ by a factor of `N/(N-1)`, so treating an absent flag as "biased" would
+silently change the numbers of the most common way anyone writes a variance. Both refusals are
+pinned in `tests/test_recognize.py`, which is also where the fused positive cases live
+(19 cases, including variance as an *intermediate* of a batch-norm-like computation).
+
 ## (2) Code generation is derived, not templated
 
 A skeleton declares only:
@@ -126,11 +148,11 @@ The answer is not more algebra. It is a second traversal, and declaring it is th
 ```python
 register(Skeleton(
     name="variance",
-    g=(c_sym - s_sym) ** 2,          # the term reads the FINAL producer
-    finalize=_FINAL_ACC / N,         # variance = mean of squared deviations
+    g=(c_sym - s_sym) ** 2 / N,   # what torch.mean() of the centered squares sums
+    finalize=_FINAL_ACC,          # identity: the accumulator IS the operator's value
     producer_reducer="sum",
     two_pass=True,
-    producer_finalize=_FINAL_M / N,  # raw sum -> the mean
+    producer_expr=c_sym / N,      # the mean, as the graph spells it
     intrinsic_params=((N, "ncols"),),
 ))
 ```
@@ -138,20 +160,28 @@ register(Skeleton(
 which emits
 
 ```
-# pass 1
+# pass 1: the producer, whose 1/N is already in the OPERAND
 m = 0.0
 for off in range(0, ncols, BLOCK):
-    ...  m = m + tl.sum(v)
-m = m * (1.0 / ncols)          # <- the producer is FINAL here
+    ...  m = m + tl.sum(v * (1.0 / ncols))
 # pass 2: the producer is constant, so there is NO repair to apply
 acc = 0.0
 for off in range(0, ncols, BLOCK):
-    ...  acc = acc + tl.sum((v - m) * (v - m))
+    ...  acc = acc + tl.sum((1.0 / ncols) * (v - m) * (v - m))
 ```
 
 The producer never moves during pass 2, so the repair is the identity **by construction** — which is
-why `repair_pair` is never consulted and `check_supported` asks a different question
-(`producer_finalize` must exist and be a function of the raw producer). For a max-abs producer
+why `repair_pair` is never consulted and `check_supported` asks a different question instead: the
+producer must be *declared* (operand and reducer) and the **term must read it**, or pass 1 is dead
+work.
+
+**Where every `1/N` is written is not cosmetic.** A first version of this skeleton applied the 1/N
+afterwards — a `producer_finalize` step plus `finalize=acc/N` — which is algebraically identical and
+*unrecognisable*: `torch.mean` is a sum over `ncols`, so the recogniser sees a mean as the operand
+`c / N` and compares that against `producer_expr`. The field it needed therefore did not exist, and
+the operator could never be matched from a graph — which defeats the purpose of the plan, since its
+whole point is to serve operators that appear in real models. `rmsnorm_max` had been describing a
+mean of squares this way all along (`producer_expr=c**2/N`). For a max-abs producer
 declared with `two_pass` and an integer shape value under a root, the intrinsic is bound as a float;
 see `_intrinsics_needing_float`.
 
@@ -257,7 +287,9 @@ The 2 refusals are enumerated with reasons in `tools/coverage_codegen.py`:
 
 * a `mul` consumer (`prod + ratio`) needs a carried count, which neither plan provides;
 * `g = exp(c - |c|)` is a deliberate out-of-framework control: its term ignores the producer, so
-  pass 1 would be dead work and there is no fold at all.
+  pass 1 would be dead work and there is no fold at all. (That guard was lost once during a
+  refactor of this very plan, and the coverage probe reported the control as *covered* on the next
+  run — which is what the probe is for.)
 
 The distinction that survives from the original framing: the algebra's condition (4) decides
 whether a **one-pass** fold exists, and the coverage study's `NEEDS_STATE` verdict is exactly

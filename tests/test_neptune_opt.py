@@ -186,8 +186,7 @@ def test_every_public_emitter_is_callable():
         if sk.two_pass:
             # No repair EXISTS for these -- that is what puts them in this plan -- so asking
             # for one is not a check that can pass, it is the wrong question. The plan's own
-            # emitters are what has to be callable.
-            CG.producer_finalize_source(sk, v)
+            # fold is what has to be callable.
             CG.consumer_fold_no_repair(sk, v)
         else:
             CG.repair_factor(sk)
@@ -527,13 +526,15 @@ def test_two_pass_plan_emits_two_loops_and_no_repair():
         # "unbiased=False", so a bare `"bias" not in src` fails on prose.
         assert "scale = tl.where" not in src, "a two-pass kernel must not carry a repair"
         assert "bias = tl.where" not in src and "+ bias" not in src, src
-        # The producer is finalized before pass 2 and never moves again. Checked by position
-        # rather than by an exact literal: `std` takes a root of N, so its N is bound as a
-        # float and the same statement reads `(1.0 / (1.0 * ncols))` (see
-        # test_intrinsics_under_a_root_are_read_as_floats).
-        fin = [i for i, l in enumerate(src.splitlines()) if l.strip().startswith("m = m * (")]
-        den = [i for i, l in enumerate(src.splitlines()) if l.strip() == "den = m"]
-        assert fin and den and fin[0] < den[0], src
+        # The producer is complete before pass 2 starts and never moves again. The mean's
+        # 1/N is inside pass 1's OPERAND (v * (1/ncols)) rather than applied afterwards,
+        # because that is how the graph spells a mean and `producer_expr` is what the
+        # recogniser compares against -- see the declaration in neptune_codegen/library.py.
+        lines = src.splitlines()
+        pass1 = next(i for i, l in enumerate(lines) if "pass 1" in l)
+        den = next(i for i, l in enumerate(lines) if l.strip() == "den = m")
+        assert "v * ((1.0 / (ncols)))" in src, src
+        assert pass1 < den, src
         assert "den = m_new" not in src, src
         # No floor: a finalized producer is not a running one (see _needs_denominator_floor).
         assert "tl.maximum(m_new" not in src, src
@@ -553,43 +554,89 @@ def test_two_pass_matches_torch_variance_numerically():
     import neptune_codegen as CG
 
     rng = np.random.default_rng(0)
-    for name, readout in (("variance", lambda a, n: a / n), ("std", lambda a, n: np.sqrt(a / n))):
+    # variance's readout is the identity; std's is the square root
+    for name, readout in (("variance", lambda a, n: a), ("std", lambda a, n: np.sqrt(a))):
         for shape, block in (((5, 7), 3), ((4, 10), 4), ((3, 8), 8), ((6, 9), 2), ((2, 33), 16)):
             x = rng.normal(size=shape) * 3.0 + 1.0
             rows, ncols = shape
             got = np.empty(rows)
             for r in range(rows):
-                # pass 1: the producer, then its finalization
+                # pass 1: the producer. The 1/N is INSIDE the operand, mirroring the emitted
+                # source (`v * (1.0 / ncols)`) -- not applied afterwards -- because that is the
+                # form the recogniser compares against a graph.
                 m = 0.0
                 for off in range(0, ncols, block):
                     blk = x[r, off:off + block]
-                    m = m + blk.sum()
-                m = m / ncols
-                # pass 2: the consumer, with the producer constant
+                    m = m + (blk / ncols).sum()
+                # pass 2: the consumer, with the producer constant and the same 1/N in the term
                 acc = 0.0
                 for off in range(0, ncols, block):
                     blk = x[r, off:off + block]
-                    acc = acc + ((blk - m) ** 2).sum()
+                    acc = acc + (((blk - m) ** 2) / ncols).sum()
+                # `finalize` is the IDENTITY for both skeletons; `std`'s readout is the root
                 got[r] = readout(acc, ncols)
             want = CG.reference(name, torch.tensor(x, dtype=torch.float32)).numpy()
             err = np.max(np.abs(got - want) / np.maximum(np.abs(want), 1e-6))
             assert err < 1e-6, f"{name} shape={shape} block={block}: rel err {err:.3e}"
 
 
-def test_two_pass_requires_a_producer_finalize():
-    """A two-pass skeleton without `producer_finalize` is refused, not silently mis-emitted."""
-    import neptune_codegen as CG
-    from neptune_codegen.symbols import c_sym, s_sym
+def test_two_pass_refuses_a_term_that_ignores_the_producer():
+    """Pass 1 must not be dead work, or the kernel reduces a producer nothing reads.
 
-    sk = CG.Skeleton(name="broken_two_pass", g=(c_sym - s_sym) ** 2,
-                     finalize=CG._FINAL_ACC, producer="signed",
-                     producer_reducer="sum", two_pass=True)
+    `g = exp(c - |c|)` is the coverage study's out-of-framework control, and in the two-pass
+    plan it separates TRIVIALLY (the term simply does not mention the producer), so nothing
+    else stops it. This guard was silently dropped once, while the enclosing block was rewritten
+    to remove a redundant field; the coverage probe caught it, and this pins it in the test suite
+    so the next time does not depend on running that probe.
+    """
+    import sympy as sp
+    import neptune_codegen as CG
+    from neptune_codegen.symbols import _PARAM_N, c_sym, s_sym
+
+    dead = CG.Skeleton(name="dead_pass", g=sp.exp(c_sym - sp.Abs(c_sym)),
+                       finalize=CG._FINAL_ACC, producer="signed", producer_reducer="sum",
+                       two_pass=True, producer_expr=c_sym / _PARAM_N,
+                       intrinsic_params=((_PARAM_N, "ncols"),))
     try:
-        CG.check_supported(sk)
+        CG.check_supported(dead)
     except NotImplementedError as e:
-        assert "producer_finalize" in str(e), e
-        return
-    raise AssertionError("two_pass without producer_finalize must be refused")
+        assert "dead work" in str(e), e
+    else:
+        raise AssertionError("a two-pass term that ignores its producer must be refused")
+
+    # ...and the same expression is refused in the one-pass frame, for its own reason
+    try:
+        CG.repair_pair(dead)
+    except NotImplementedError as e:
+        assert "producer s" in str(e), e
+    else:
+        raise AssertionError("g ignoring the producer must be refused in the one-pass frame too")
+
+
+def test_two_pass_declares_the_mean_the_way_the_graph_spells_it():
+    """The declaration IS the recogniser's input, so a private spelling makes it unmatched.
+
+    `torch.mean` is a sum over ncols, so the recogniser sees a mean as the OPERAND `c / N`.
+    A skeleton may express the same operator with the 1/N applied afterwards instead --
+    algebraically identical, and it was the first version -- but then `producer_expr` no
+    longer equals what the graph reduces, and recognition silently fails. This pins the
+    convention for both two-pass skeletons.
+    """
+    import neptune_codegen as CG
+    from neptune_codegen.symbols import _PARAM_N, c_sym
+
+    for name in ("variance", "std"):
+        sk = CG.SKELETONS[name]
+        assert sk.two_pass, f"{name} should be two_pass"
+        assert sk.producer_expr == c_sym / _PARAM_N, (
+            f"{name}: the producer operand must be the mean as the graph spells it "
+            f"(c / N), got {sk.producer_expr}"
+        )
+        assert sk.finalize in (CG._FINAL_ACC, __import__("sympy").sqrt(CG._FINAL_ACC)), (
+            f"{name}: the 1/N belongs in the term, not the readout; got {sk.finalize}"
+        )
+        # no producer_finalize step exists any more: it was redundant AND unrecognisable
+        assert not hasattr(sk, "producer_finalize")
 
 
 def test_all_registered_skeletons_have_a_usable_reference():
@@ -620,10 +667,25 @@ def test_intrinsics_under_a_root_are_read_as_floats():
     "'math.sqrt' op operand #0 must be floating-point-like, but got 'i32'". The offender is not
     visible in the declaration, which is why this is checked on the emitted source.
     """
+    import sympy as sp
     import neptune_codegen as CG
+    from neptune_codegen.symbols import _FINAL_ACC, _PARAM_N, c_sym, s_sym
 
+    # A skeleton whose READOUT takes a root of the row length. `std` used to look like this and
+    # then stopped: writing every 1/N where the graph puts it (so the operator stays
+    # recognisable) moved the division into the operand, leaving `sqrt(acc)`. The guard is
+    # still needed -- it was found by exactly this shape -- so it is pinned with a synthetic
+    # skeleton rather than left to whichever real operator happens to take a root of a shape.
+    rooted = CG.Skeleton(name="rooted", g=(c_sym - s_sym) ** 2,
+                         finalize=_FINAL_ACC / sp.sqrt(_PARAM_N),
+                         producer="signed", producer_reducer="sum", two_pass=True,
+                         producer_expr=c_sym, intrinsic_params=((_PARAM_N, "ncols"),))
+    rooted_src = CG.emit_kernel_source(rooted, {})
+    assert "tl.sqrt((1.0 * ncols))" in rooted_src, rooted_src
+    assert "tl.sqrt(ncols)" not in rooted_src, rooted_src
+    # `std` no longer takes a root of ncols at all, and must not gain a stray cast.
     std_src = CG.emit_kernel_source(CG.SKELETONS["std"], {})
-    assert "tl.sqrt((1.0 * ncols))" in std_src, std_src
+    assert "1.0 * ncols" not in std_src, std_src
     assert "tl.sqrt(ncols)" not in std_src, std_src
     # A plain division needs no cast (Triton promotes it), so it must not silently gain one:
     # the cast is a targeted fix, not a blanket rule.

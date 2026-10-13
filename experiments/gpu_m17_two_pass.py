@@ -54,14 +54,15 @@ def test_plan_shape() -> None:
         record(f"{name}/declared two_pass", sk.two_pass, "")
         record(f"{name}/two loops", src.count("for off in range(0, ncols, BLOCK):") == 2, "")
         record(f"{name}/no repair statement", "scale = tl.where" not in src, "")
-        # Positional, not literal: `std` takes a root of N, so its N is bound as a float and
-        # the same statement reads `(1.0 / (1.0 * ncols))`. See
-        # `_intrinsics_needing_float` in neptune_codegen/emitters.py.
+        # The producer is complete before pass 2 opens, and its scale is in pass 1's OPERAND
+        # (`v * (1/ncols)`) rather than applied afterwards -- that is how the graph spells a
+        # mean, and `producer_expr` is what the recogniser compares against. Checked by
+        # position so it does not pin a literal that a legitimate re-declaration would change.
         lines = src.splitlines()
-        fin = [i for i, l in enumerate(lines) if l.strip().startswith("m = m * (")]
+        p1 = [i for i, l in enumerate(lines) if "pass 1" in l]
         den = [i for i, l in enumerate(lines) if l.strip() == "den = m"]
-        record(f"{name}/producer finalized before pass 2",
-               bool(fin) and bool(den) and fin[0] < den[0], "")
+        record(f"{name}/producer complete before pass 2",
+               bool(p1) and bool(den) and p1[0] < den[0] and "den = m_new" not in src, "")
         record(f"{name}/no floor on the finalized producer",
                "tl.maximum(m_new" not in src, "")
 
@@ -159,6 +160,66 @@ def test_explicit_op() -> None:
                NO.op_parameters(name) == (), f"{NO.op_parameters(name)}")
 
 
+def test_end_to_end_from_a_var_graph() -> None:
+    """The whole point: a model that calls `x.var()` must fuse WITHOUT being rewritten by hand.
+
+    Recognition is what makes the two-pass plan usable at all -- without it the plan is
+    reachable only through the explicit operator library -- so this drives the real path:
+    export a module that computes a variance, `neptune_opt.apply(ep)`, package it with AOTI, and
+    check that the GENERATED kernel's name is inside the artifact (the baseline never contains
+    it) and that the numbers are unchanged.
+    """
+    print("\n--- end to end from a plain `.var()` / `.std()` module")
+    import zipfile
+    import neptune_opt as NO
+
+    class Mod(torch.nn.Module):
+        def __init__(self, kind):
+            super().__init__()
+            self.kind = kind
+
+        def forward(self, t):
+            if self.kind == "var":
+                return t.var(dim=-1, unbiased=False)
+            if self.kind == "std":
+                return t.std(dim=-1, unbiased=False)
+            if self.kind == "decomposed":
+                m = t.mean(dim=-1, keepdim=True)
+                return ((t - m) ** 2).mean(dim=-1)
+            # variance as an INTERMEDIATE, not the graph output: the region gate must fuse it
+            # and leave the normalisation around it alone
+            m = t.mean(dim=-1, keepdim=True)
+            v = ((t - m) ** 2).mean(dim=-1, keepdim=True)
+            return (t - m) / (v + 1e-5).sqrt()
+
+    x = torch.randn(64, 4096, device="cuda")
+    for kind in ("var", "std", "decomposed", "batchnorm_like"):
+        mod = Mod(kind).eval()
+        ep = torch.export.export(mod, (x,))
+        report = NO.apply(ep, verify_with=(mod, (x,)))
+        if not report.fusions:
+            print(f"    {kind:14s} NOT FUSED: {report.summary().strip()[:64]}")
+            record(f"{kind}/recognised and fused", False, "no fusion")
+            continue
+        sk = report.fusions[0].skeleton
+        pkg = os.path.join(tempfile.mkdtemp(prefix=f"m17_{kind}_"), "m.pt2")
+        torch._inductor.aoti_compile_and_package(ep, package_path=pkg)
+        z = zipfile.ZipFile(pkg)
+        raw = b"".join(z.read(n) for n in z.namelist())
+        cubins = sum(1 for n in z.namelist() if n.endswith(".cubin"))
+        got = ep.module()(x)
+        got = got[0] if isinstance(got, (tuple, list)) else got
+        with torch.no_grad():
+            ref = mod(x)
+        err = (got - ref).abs().max().item()
+        mentions = raw.count(sk.encode())
+        print(f"    {kind:14s} fused={sk:9s} mentions={mentions:3d}x cubins={cubins} "
+              f"abs_err={err:.3e} verified={report.verified}")
+        record(f"{kind}/recognised and fused", True, sk)
+        record(f"{kind}/generated kernel in the .pt2", mentions >= 1, f"{mentions}x")
+        record(f"{kind}/numerically unchanged", err < 1e-3, f"abs_err={err:.3e}")
+
+
 def test_performance() -> None:
     """One kernel with no intermediate vs the decomposed form torch.compile is handed.
 
@@ -244,6 +305,7 @@ def main() -> int:
         test_ill_conditioned()
         test_vs_welford_reference()
         test_explicit_op()
+        test_end_to_end_from_a_var_graph()
         test_performance()
     except Exception:  # noqa: BLE001
         traceback.print_exc()

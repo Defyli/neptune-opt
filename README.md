@@ -58,7 +58,7 @@ are in [docs/evidence/](docs/evidence/).
 |---|---|
 | operator families classified (algebra) | 28 → 20 `EXACT`, 1 `AFFINE`, 5 `NEEDS_STATE`, 2 `NOT_INVERT` |
 | families the generator emits | **26 / 28**, via two plans (see `docs/design.md`) |
-| registered skeletons recognised from a graph | **8 / 8**, with no per-operator pattern rows |
+| registered skeletons recognised from a graph | **10 / 10**, with no per-operator pattern rows |
 | scalar parameters inferred from the graph | yes (`beta`, `alpha`, `N`, `eps`, …) |
 | dynamic shapes | supported; one kernel serves every width |
 | generated kernel present in the `.pt2` | verified (41 kernel occurrences, `cubins ≥ 1`) |

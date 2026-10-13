@@ -70,6 +70,47 @@ def d_rmsnorm_max(t):
     return (t / torch.sqrt(r + 1e-6)).amax(dim=-1)
 
 
+def d_variance(t):
+    m = t.mean(dim=-1, keepdim=True)
+    return ((t - m) ** 2).mean(dim=-1)
+
+
+def d_std(t):
+    m = t.mean(dim=-1, keepdim=True)
+    return (((t - m) ** 2).mean(dim=-1)).sqrt()
+
+
+def d_variance_keepdim(t):
+    m = t.mean(dim=-1, keepdim=True)
+    return ((t - m) ** 2).mean(dim=-1, keepdim=True)
+
+
+def d_var_op(t):
+    """`x.var(-1, unbiased=False)` -- a SINGLE aten op, not a decomposed pair."""
+    return t.var(dim=-1, unbiased=False)
+
+
+def d_std_op(t):
+    return t.std(dim=-1, unbiased=False)
+
+
+def d_var_correction0(t):
+    """The same operator spelled with the newer `correction` argument."""
+    return torch.var(t, dim=-1, correction=0)
+
+
+def d_batchnorm_like(t):
+    """Variance as an INTERMEDIATE of a larger computation, not as the graph output.
+
+    The region gate must still find and replace the variance sub-region while leaving the
+    normalisation around it alone. This is the case that would silently corrupt a model if
+    the gate were sloppy.
+    """
+    m = t.mean(dim=-1, keepdim=True)
+    v = ((t - m) ** 2).mean(dim=-1, keepdim=True)
+    return (t - m) / (v + 1e-5).sqrt()
+
+
 CASES = [
     ("logsumexp", d_logsumexp),
     ("stable_l2", d_stable_l2),
@@ -79,16 +120,51 @@ CASES = [
     ("decay_renorm", d_decay_renorm),
     ("lse_biased", d_lse_biased),
     ("rmsnorm_max", d_rmsnorm_max),
+    # The two-pass families. These were a NEGATIVE control until the two-pass plan existed
+    # ("variance needs two accumulators and has no single-producer (f, g, h) form at all") --
+    # which is still true of the ONE-PASS frame, and is exactly why the plan exists.
+    ("variance", d_variance),
+    ("std", d_std),
+    ("variance", d_variance_keepdim),
+    ("variance", d_batchnorm_like),
+    ("variance", d_var_op),
+    ("std", d_std_op),
+    ("variance", d_var_correction0),
 ]
 
-# What should NOT be recognised: a genuine two-pass variance needs two accumulators and
-# has no single-producer (f, g, h) form at all.
-def d_variance(t):
-    m = t.mean(dim=-1, keepdim=True)
-    return ((t - m) ** 2).mean(dim=-1)
+
+def d_prod(t):
+    """A PRODUCT consumer. Refused on purpose: `prod + ratio` needs a carried count, and it is
+    the one family in the coverage study that neither plan serves."""
+    m = t.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
+    return (t / m).prod(dim=-1)
 
 
-NEGATIVE = [("variance (two-producer)", d_variance)]
+def d_reduce_first_dim(t):
+    """Reduces the wrong axis: the frame emits one program per ROW."""
+    return t.sum(dim=0)
+
+
+def d_var_unbiased(t):
+    """`x.var(-1)` -- the DEFAULT, which is the /(N-1) operator.
+
+    Refused on purpose, and this is the most important negative in the file: the two forms
+    differ by a factor of N/(N-1), so fusing this one into the biased kernel would silently
+    change the model's numbers for the most common way anyone writes a variance.
+    """
+    return t.var(dim=-1)
+
+
+def d_std_unbiased(t):
+    return t.std(dim=-1)
+
+
+NEGATIVE = [
+    ("product consumer (needs a count)", d_prod),
+    ("reduction over dim 0", d_reduce_first_dim),
+    ("x.var(-1): unbiased by DEFAULT", d_var_unbiased),
+    ("x.std(-1): unbiased by DEFAULT", d_std_unbiased),
+]
 
 
 class M(torch.nn.Module):

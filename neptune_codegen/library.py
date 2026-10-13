@@ -118,16 +118,22 @@ register(Skeleton(
     # from a running sum((c - s)^2) needs the running COUNT as well, which is the paper's
     # NEEDS_STATE case and 5 of the 28 families in the coverage study.
     #
-    # There is no algebra to invent here -- just a second traversal. Pass 1 sums c, the
-    # producer is finalized into the mean, and pass 2 sums the centered squares with the mean
-    # held constant. `g` therefore reads the FINALIZED producer, which is why `producer_finalize`
-    # exists and why `repair_pair` is never consulted.
-    g=(c_sym - s_sym) ** 2,
-    finalize=_FINAL_ACC / _PARAM_N,        # the VARIANCE = mean of squared deviations
+    # There is no algebra to invent here -- just a second traversal. Pass 1 reduces the
+    # producer, pass 2 reduces the term with the producer held constant, and `repair_pair` is
+    # never consulted.
+    #
+    # EVERY 1/N IS WRITTEN WHERE THE GRAPH HAS IT, and that is not cosmetic. `torch.mean` is a
+    # sum over ncols, so the recogniser sees the mean as the OPERAND `c / N`, and it compares
+    # that operand against `producer_expr`. Declaring the mean any other way (e.g. as a
+    # separate finalization step) makes the operator UNRECOGNISABLE, however equal the two
+    # forms are in algebra. `rmsnorm_max` had been describing a mean of squares this way all
+    # along -- `producer_expr=c**2/N` -- and this is the same convention.
+    g=(c_sym - s_sym) ** 2 / _PARAM_N,     # what torch.mean() of the centered squares sums
+    finalize=_FINAL_ACC,                   # identity: the accumulator IS the operator's value
     producer="signed",
     producer_reducer="sum",
     two_pass=True,
-    producer_finalize=_FINAL_M / _PARAM_N,  # raw sum -> the mean
+    producer_expr=c_sym / _PARAM_N,        # the mean, as the graph spells it
     # N is the row length, which the kernel already receives as `ncols`. Baking it instead
     # would make the artifact shape-specific, so it is declared intrinsic (see rmsnorm_max).
     intrinsic_params=((_PARAM_N, "ncols"),),
@@ -136,14 +142,14 @@ register(Skeleton(
 
 register(Skeleton(
     name="std",
-    # Same plan as `variance`; only the readout differs. Square root is safe here because
-    # `finalize` runs on the final nonnegative accumulator.
-    g=(c_sym - s_sym) ** 2,
-    finalize=sp.sqrt(_FINAL_ACC / _PARAM_N),
+    # Same plan and the same spelling convention as `variance`; only the readout differs.
+    # Square root is safe here because `finalize` runs on the final nonnegative accumulator.
+    g=(c_sym - s_sym) ** 2 / _PARAM_N,
+    finalize=sp.sqrt(_FINAL_ACC),
     producer="signed",
     producer_reducer="sum",
     two_pass=True,
-    producer_finalize=_FINAL_M / _PARAM_N,
+    producer_expr=c_sym / _PARAM_N,
     intrinsic_params=((_PARAM_N, "ncols"),),
     doc="torch.std(x, unbiased=False): sqrt(mean((x - mean(x))^2))",
 ))

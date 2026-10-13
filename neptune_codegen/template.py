@@ -13,7 +13,7 @@ import tempfile
 import sympy as sp
 
 from neptune_codegen.emitters import (bias_line, check_supported, consumer_fold_no_repair,
-    consumer_init, consumer_update, denominator_expr, guard_value, producer_finalize_source,
+    consumer_init, consumer_update, denominator_expr, guard_value,
     producer_init, producer_operand, producer_update, scale_source, term_source,
     finalize_source)
 from neptune_codegen.skeleton import SKELETONS
@@ -101,8 +101,9 @@ def {name}(x_ptr, out_ptr, rows, ncols, stride_row,
             # update; the fill is the reducer's identity, so masked lanes always lose.
             {prod_update}
             m = m_new
-        # ---- the producer is FINAL here; this is the value the term reads
-        m = {prodfin_src}
+        # ---- the producer is FINAL here: pass 1 reduced `producer_expr`, whose scale (the
+        # 1/N of a mean, declared as `c / N`) is already in the operand. This is the value the
+        # term reads, and it does not move again.
         # ---- pass 2: the consumer reduction, with the producer constant
         acc = {acc_init}
         for off in range(0, ncols, BLOCK):
@@ -127,7 +128,6 @@ def emit_kernel_source(sk: Skeleton, values: dict | None = None) -> str:
             prod_update=producer_update(sk, values),
             acc_update=consumer_fold_no_repair(sk, values),
             abs_line="a = tl.abs(v)\n            " if producer_operand(sk, values) == "a" else "",
-            prodfin_src=producer_finalize_source(sk, values),
             den_src=denominator_expr(sk),
             finalize=finalize_source(sk, values),
         )

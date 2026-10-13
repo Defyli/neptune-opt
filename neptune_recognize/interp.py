@@ -53,6 +53,10 @@ _REDUCTIONS = ("amax", "sum", "max", "min")
 
 _MEANS = ("mean",)
 
+# `torch.var`/`torch.std` arrive as a SINGLE aten op, not as a producer/consumer pair, so the
+# interpreter expands them here. They are mean((x - mean(x))^2) only for the BIASED form.
+_VAR_STD = ("var", "std")
+
 
 _IGNORED = ("clamp_min", "clamp", "squeeze", "unsqueeze", "getitem", "detach", "alias")
 
@@ -64,6 +68,22 @@ def _rank_of(node):
         value = node.meta.get("example_value")
     shape = getattr(value, "shape", None)
     return None if shape is None else len(shape)
+
+
+def _var_is_biased(node) -> bool:
+    """Is this a `/N` variance, i.e. `unbiased=False` (or `correction=0`)?
+
+    Read, never assumed, because `torch.var`'s DEFAULT is `unbiased=True` -- the `/(N-1)`
+    operator, which this registry does not implement. Treating an absent flag as "biased"
+    would silently fuse the most common spelling (`x.var(-1)`) into a kernel computing a
+    different number, which is precisely the failure this project refuses rather than ships.
+    """
+    if "correction" in node.kwargs:
+        return float(node.kwargs["correction"]) == 0.0
+    if "unbiased" in node.kwargs:
+        return node.kwargs["unbiased"] is False
+    # positional: (self, dim, unbiased[, keepdim])
+    return len(node.args) > 2 and node.args[2] is False
 
 
 def _reduces_last_dim_only(node, rank):
@@ -222,6 +242,23 @@ def interpret(gm):
             # work for static and symbolic shapes alike.
             reductions.append(("sum", v / NCOLS_SYM, sym, node))
             env[node] = sym
+            continue
+
+        if name in _VAR_STD:
+            # Expanded into the pair the algebra needs: a mean of c, then a mean of the
+            # CENTERED squares. Both are `sum(operand)` with the mean's 1/ncols in the operand,
+            # so the symbols this produces are exactly the ones a decomposed graph yields --
+            # which is why recognition needs no special case beyond this expansion.
+            v, is_val = _as_expr(node.args[0], env) if node.args else (None, False)
+            if not is_val or v is None or not _reduces_last_dim_only(node, rank):
+                return None
+            if not _var_is_biased(node):
+                return None                # /(N-1): a different operator, refuse
+            prod_sym = sp.Symbol(f"$r{len(reductions)}", real=True)
+            reductions.append(("sum", v / NCOLS_SYM, prod_sym, node))
+            cons_sym = sp.Symbol(f"$r{len(reductions)}", real=True)
+            reductions.append(("sum", (v - prod_sym) ** 2 / NCOLS_SYM, cons_sym, node))
+            env[node] = sp.sqrt(cons_sym) if name == "std" else cons_sym
             continue
 
         if name in _REDUCTIONS:

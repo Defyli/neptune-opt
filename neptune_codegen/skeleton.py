@@ -86,18 +86,23 @@ class Skeleton:
     # sum produces it (this is the paper's NEEDS_STATE group: five families in the coverage
     # study). The frame then re-reads the row instead of repairing it:
     #
-    #     pass 1  reduce the producer                  m = sum(c)
-    #             finalize it (producer_finalize)      m = m / ncols
-    #     pass 2  reduce the consumer term             acc = sum((c - m)^2)
+    #     pass 1  reduce the producer       m = sum(c / ncols)     # the mean, as a graph
+    #                                                               # spells it (see below)
+    #     pass 2  reduce the consumer term  acc = sum((c - m)^2 / ncols)
     #
     # The producer is CONSTANT during pass 2, so there is nothing to repair and the whole
     # `repair_pair` derivation is skipped. The cost is a second read of the row; the gain is
     # that a two-kernel decomposed form becomes one kernel with no materialised intermediate.
+    # What `check_supported` requires instead is that the term READS the producer (or pass 1
+    # is dead work) and that `producer_expr` says what the graph reduces.
     two_pass: bool = False
-    # Maps the RAW producer reduction (the kernel's `m`, i.e. `_FINAL_M`) to the value `g`
-    # reads, e.g. `m / ncols` for a mean. Written over `_FINAL_M` and whatever
-    # `params`/`intrinsic_params` supply, exactly like `finalize`.
-    producer_finalize: sp.Expr | None = None
+    # NB: there is deliberately no `producer_finalize`. A first version had one, to turn the
+    # raw reduction into the value the term reads (e.g. a mean). That was redundant, and worse,
+    # it made the operator UNRECOGNISABLE: `producer_expr` is already the per-element operand
+    # the graph reduces, so the mean belongs there, as `c / N` -- which is how `rmsnorm_max`
+    # had been describing a mean of squares all along. The recogniser compares that operand
+    # against the graph, so expressing the mean any other way cannot match. What cannot go in
+    # `producer_expr` goes in `g`, which may use `s` however it likes (a root, a shift, ...).
 
 
 SKELETONS: dict[str, Skeleton] = {}

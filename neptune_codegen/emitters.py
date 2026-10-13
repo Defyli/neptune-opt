@@ -59,46 +59,39 @@ def check_supported(sk: Skeleton) -> None:
         )
     if sk.two_pass:
         # No repair exists for these operators -- that is what puts them in this plan -- so
-        # deriving one is not a check that can pass; it is the wrong question. What must hold
-        # instead is that the producer can be FINALIZED into the value the term reads, and
-        # that the term itself is translatable.
-        if sk.producer_finalize is None:
-            raise NotImplementedError(
-                f"skeleton {sk.name!r}: two_pass=True needs producer_finalize (the raw "
-                "producer reduction is not what the term reads, e.g. a mean before centering)"
-            )
-        if sk.producer_finalize.has(s2_sym) or sk.producer_finalize.has(c_sym):
-            raise NotImplementedError(
-                f"skeleton {sk.name!r}: producer_finalize must be a function of the raw "
-                f"producer only; got {sk.producer_finalize}"
-            )
-        # Pass 1 must not be dead work: the whole point of the plan is that the TERM reads
-        # the finalized producer. `term_expr` substitutes the fresh producer symbol in for
-        # `g`'s producer symbol, so this asks the question of the expression that is actually
-        # emitted. Without it, `g = exp(c - |c|)` (the coverage study's out-of-framework
-        # control) and the `c * s'` placeholder both pass -- they separate trivially in this
-        # plan -- and the kernel reduces a producer that nothing then reads.
+        # deriving one is not a check that can pass; it is the wrong question. What has to hold
+        # instead is that the producer is DECLARED (operand and reducer) and that the term reads
+        # it, so pass 2 has a constant to work with.
+        names = {c_sym: "v", s_sym: "m", s2_sym: "den", u_sym: "acc",
+                 _FINAL_ACC: "acc", _FINAL_M: "m"}
+        names.update({sym: name for sym, name in sk.params})
+        names.update(intrinsic_bindings(sk))
+        if sk.producer_expr is not None:
+            to_triton(sk.producer_expr, names)
+        # Pass 1 must not be dead work: the whole point of the plan is that the TERM reads the
+        # producer. `term_expr` substitutes the fresh producer symbol into `g`, so this asks the
+        # question of the expression that is actually emitted. Without it `g = exp(c - |c|)`
+        # (the coverage study's out-of-framework control) passes -- it separates trivially in
+        # this plan -- and the kernel reduces a producer that nothing then reads.
         #
         # This is the frame-independent half of the guard in `repair_pair`: that one says the
         # term may not read a *running* producer, this one says it must read the FINAL one.
         #
-        # Note the deliberate ASYMMETRY with the one-pass frame. There, a `g` that mentions
-        # the fresh producer symbol is refused outright (`repair_pair`'s first guard), because
-        # "the fresh producer" there is a RUNNING value -- the value s takes after this element
-        # is consumed -- so a term depending on it is order-dependent and meaningless. Here the
-        # fresh producer is the single FINAL value, so a term depending on it is the normal
-        # case (it is what the plan exists for). Same symbol, two frames, opposite verdicts,
-        # and both are correct.
+        # Note the deliberate ASYMMETRY with the one-pass frame. There, a `g` mentioning the
+        # fresh producer symbol is refused outright, because "fresh" is a RUNNING value -- what
+        # s becomes after this element is consumed -- so a term depending on it is
+        # order-dependent and meaningless. Here the fresh producer is the single FINAL value, so
+        # depending on it is the normal case. Same symbol, two frames, opposite verdicts, and
+        # both are correct.
+        #
+        # (This guard was silently lost once, while this block was rewritten to drop a redundant
+        # field. The coverage probe caught it immediately: the control family above reported as
+        # covered. tests/test_neptune_opt.py pins it now.)
         if not term_expr(sk).has(s2_sym):
             raise NotImplementedError(
                 f"skeleton {sk.name!r}: the term {term_expr(sk)} does not depend on the "
                 "producer at all, so the first pass would be dead work. This is not a fold."
             )
-        names = {c_sym: "v", s_sym: "m", s2_sym: "den", u_sym: "acc",
-                 _FINAL_ACC: "acc", _FINAL_M: "m"}
-        names.update({sym: name for sym, name in sk.params})
-        names.update(intrinsic_bindings(sk))
-        to_triton(sk.producer_finalize, names)
         term_expr(sk)
         return
     repair_factor(sk)          # raises if the algebra is not translatable
@@ -280,7 +273,7 @@ def _intrinsics_needing_float(sk: Skeleton) -> frozenset:
     if not names:
         return frozenset()
     out: set = set()
-    exprs = (sk.g, sk.finalize, sk.producer_finalize, sk.producer_expr, term_expr(sk))
+    exprs = (sk.g, sk.finalize, sk.producer_expr, term_expr(sk))
     for e in exprs:
         if e is None:
             continue
@@ -412,17 +405,6 @@ def finalize_source(sk: Skeleton, values: dict | None = None) -> str:
 
 
 # ---------------------------------------------------------------- two-pass plan
-def producer_finalize_source(sk: Skeleton, values: dict | None = None) -> str:
-    """Triton source turning the RAW producer reduction into the value `g` reads.
-
-    e.g. `m / ncols` for a mean. Emitted once, between the two passes, and it is the reason
-    pass 2 needs no repair: after this line the producer never changes again.
-    """
-    if sk.producer_finalize is None:
-        raise NotImplementedError(f"skeleton {sk.name!r}: no producer_finalize declared")
-    return to_triton(sk.producer_finalize, _bindings(sk, values))
-
-
 def consumer_fold_no_repair(sk: Skeleton, values: dict | None = None) -> str:
     """Pass 2's accumulator update, with the producer held constant.
 

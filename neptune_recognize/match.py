@@ -157,9 +157,17 @@ def _match_candidate(gm, input_node, cand, values, env):
         # side actually mentions the parameter (`N` in g = c/(N+s) never appears in the
         # producer), and handing sp.solve the whole coupled system makes it return [] even
         # when the first equation alone pins the parameter down.
+        # Initialized OUTSIDE the branch. It used to be bound only inside `if unknown:`, so a
+        # skeleton with no non-intrinsic scalar parameters -- `std` and `variance` are exactly
+        # that -- reached `_find_region_root(..., solved, ...)` with the name unbound and raised
+        # UnboundLocalError. The bug was dormant only because no param-free sum/sum skeleton
+        # matched a graph yet; it fires the moment one does. Declaring it here also removes a
+        # second hazard: on the old code path a dict solved for an EARLIER skeleton could
+        # survive into the next loop iteration, so the tail check could see another operator's
+        # parameter values.
+        solved: dict = {}
         if unknown:
             remaining = list(unknown)
-            solved: dict = {}
             for target, graph_side in ((phi_pat, phi), (psi_pat, psi)):
                 d = sp.simplify(target.subs(solved) - graph_side)
                 progress = True

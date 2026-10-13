@@ -51,6 +51,41 @@ table:
 The interpreter is strict on purpose: an unknown op, a reduction over anything but the last
 dimension, or more than one independent producer/consumer pair is a refusal, not a guess.
 
+### The frame needs TWO reductions, and real modules need decomposing
+
+Measured against real `torch.nn` modules (`experiments/real_modules.py`), which is a much harsher
+test than the family study because that study is a list *this project* wrote:
+
+| module | as exported | after core decompositions |
+|---|---|---|
+| `torch.logsumexp` | `aten.logsumexp.default` | **`logsumexp`** |
+| `t - logsumexp(t, -1, keepdim=True)` | `aten.logsumexp.default` | **`logsumexp`** |
+| `logsumexp(t / 8)` | `aten.logsumexp.default` | **`lse_scaled`** (`T` inferred = 8) |
+| `nn.RMSNorm` | `aten.rms_norm.default` | one reduction — **out of frame** |
+| `nn.LayerNorm` | `aten.layer_norm.default` | `native_layer_norm` — needs its own expansion |
+| `nn.Softmax` | `aten.softmax.int` | `aten._softmax.default` — not decomposed by core |
+| RMSNorm + row max | `rmsnorm_max` | `rmsnorm_max` |
+
+Two things follow, and the second is the more important one.
+
+**1. Real models must be decomposed first.** A module exports as ONE high-level aten op, not as a
+producer/consumer pair, so the frame cannot see it. `neptune_opt.export(..., decompose=True)` (the
+default) applies the core-aten decompositions via `ExportedProgram.run_decompositions()`; on an
+already-exported program, `ep = ep.run_decompositions()` first. This is not a detour — the
+decomposed form is what AOTAutograd hands Inductor anyway. When `apply` refuses and decomposition
+would have helped, the report says so by name.
+
+**2. Some operators are out of frame structurally, not for want of algebra.** RMSNorm, LayerNorm
+and softmax's normalisation have a **single** reduction with elementwise work around it. This frame
+fuses a producer reduction *with a consumer reduction*; a lone reduction feeding elementwise
+arithmetic cannot be served by adding more algebra, however much of it is added. That is worth
+knowing before investing in coverage: the right response is to say so (the interpreter reports
+"only 1 reduction(s) found ... outside it") rather than to keep counting families.
+
+**Where the frame does win** is the overlap: two dependent reductions over the same row, which is
+what `rmsnorm_max`, `stable_l2`, `decay_renorm` and the log-sum-exp fold are — and Inductor
+compiles each of those into *two* kernels, because it cannot fuse two dependent reductions.
+
 ### Single ops that ARE a reduction pair
 
 `x.var(-1, unbiased=False)` does not export as a producer/consumer pair — it is one `aten.var.dim`

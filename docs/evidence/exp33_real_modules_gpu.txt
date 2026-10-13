@@ -1,0 +1,47 @@
+# Raw GPU log for experiments/real_modules.py -- what real torch.nn modules do
+# RTX 5090 D v2, torch 2.11.0+cu128, triton 3.6.0
+# produced by: python experiments/real_modules.py   (exit 0)
+# REDACTED: 0 line(s) carrying an absolute path or host name.
+
+RECOGNITION ON REAL MODULES   (64 x 4096, torch 2.11.0+cu128)
+================================================================================================================
+    module                   as exported                  after core decompositions         
+    ----------------------------------------------------------------------------------------------------------
+    nn.LayerNorm             needs decomposition: layer_norm needs decomposition: native_layer_norm
+    nn.RMSNorm               needs decomposition: rms_norm ONE reduction -- out of frame     
+    F.layer_norm             needs decomposition: layer_norm needs decomposition: native_layer_norm
+    nn.Softmax               needs decomposition: softmax needs decomposition: _softmax     
+    nn.LogSoftmax            needs decomposition: log_softmax needs decomposition: _log_softmax 
+    torch.logsumexp          needs decomposition: logsumexp logsumexp                         
+    log_softmax by hand      needs decomposition: logsumexp logsumexp                         
+    attention lse (t/8)      needs decomposition: logsumexp lse_scaled                        
+    RMSNorm + row max        rmsnorm_max                  rmsnorm_max                       
+    stable L2 norm           stable_l2                    stable_l2                         
+
+    The second column is the point: real modules export as ONE high-level aten op, so
+    the frame needs the CORE-ATEN DECOMPOSITIONS to see a producer/consumer pair.
+
+================================================================================================================
+END TO END: package both ways, load, compare numbers and latency
+================================================================================================================
+    module                   fused as   mentions  base    rel_err  plain ms  fused ms      x
+    'mentions'/'base' = occurrences of the generated kernel's name in each .pt2
+    latency on (256, 16384), launches pipelined (see _batch_ms)
+    torch.logsumexp          logsumexp         41        0   9.35e-08    0.0281    0.0183    1.54x
+      [PASS] numbers unchanged; [PASS] generated kernel in the fused .pt2; [PASS] absent from the baseline
+    log_softmax by hand      logsumexp         41        0   2.38e-07    0.0311    0.0261    1.19x
+      [PASS] numbers unchanged; [PASS] generated kernel in the fused .pt2; [PASS] absent from the baseline
+    attention lse (t/8)      lse_scaled        41        0   9.82e-08    0.0286    0.0194    1.47x
+      [PASS] numbers unchanged; [PASS] generated kernel in the fused .pt2; [PASS] absent from the baseline
+    RMSNorm + row max        rmsnorm_max        41        0   4.45e-07    0.0277    0.0182    1.52x
+      [PASS] numbers unchanged; [PASS] generated kernel in the fused .pt2; [PASS] absent from the baseline
+    stable L2 norm           stable_l2         41        0   9.48e-07    0.0288    0.0184    1.57x
+      [PASS] numbers unchanged; [PASS] generated kernel in the fused .pt2; [PASS] absent from the baseline
+
+================================================================================================================
+READING: 'after core decompositions' is not a detail -- it is the difference between
+one op and a producer/consumer pair. 'ONE reduction -- out of frame' is a STRUCTURAL
+verdict, not a missing pattern: this frame fuses two dependent reductions, so an
+operator whose consumer is elementwise (RMSNorm, LayerNorm, softmax's normalisation)
+cannot be served by adding algebra.
+================================================================================================================

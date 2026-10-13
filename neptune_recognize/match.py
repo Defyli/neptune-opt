@@ -232,9 +232,10 @@ def recognize(gm, values=None):
     a soft-cap beta is discovered rather than configured.
     """
     values = values or {}
-    info = interpret(gm)
+    why: list = []
+    info = interpret(gm, why=why)
     if info is None:
-        return None, "graph is not a producer/consumer reduction pair"
+        return None, why[0] if why else "graph is not a producer/consumer reduction pair"
     input_node, candidates, env = info
 
     for cand in candidates:

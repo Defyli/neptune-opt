@@ -153,3 +153,21 @@ register(Skeleton(
     intrinsic_params=((_PARAM_N, "ncols"),),
     doc="torch.std(x, unbiased=False): sqrt(mean((x - mean(x))^2))",
 ))
+
+register(Skeleton(
+    name="lse_scaled",
+    # TEMPERATURE-SCALED log-sum-exp: the softmax denominator for `logits / T`, which is how
+    # nearly every attention implementation writes its scores. Found by running the recogniser
+    # over real modules (experiments/real_modules.py) rather than by extending the family study.
+    #
+    # One declaration, and note what is NOT written: the producer. An exponential fold forces it
+    # -- g = exp(phi(c) - s) means phi = log(g) + s = c/T -- so `derived_producer_expr` produces
+    # `c / T` on its own, and the recogniser then solves T from the graph.
+    g=sp.exp(c_sym / _PARAM_T - s_sym),
+    finalize=_FINAL_M + sp.log(_FINAL_ACC + _PARAM_TINY),
+    producer="signed",
+    is_log=True,
+    params=((_PARAM_T, "T"), (_PARAM_TINY, "tiny")),
+    defaults=((_PARAM_TINY, 0.0),),
+    doc="logsumexp(x / T): the softmax denominator for temperature-scaled logits",
+))

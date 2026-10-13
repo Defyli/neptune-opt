@@ -28,6 +28,8 @@ def reference(name: str, x, **params):
     if name == "softcap_lse":
         # logsumexp of the squashed logits; torch.logsumexp is the stable form
         return torch.logsumexp(torch.tanh(p["beta"] * t), dim=-1)
+    if name == "lse_scaled":
+        return torch.logsumexp(t / p["T"], dim=-1)
     if name == "rmsnorm_max":
         # divide by the DECLARED N, not by the row length: the kernel has N baked in as a
         # literal, so using .mean() here would silently test two different operators.
@@ -73,6 +75,9 @@ def graph_reference(name: str, x, **params):
         return lse(t + p["alpha"])
     if name == "softcap_lse":
         return lse(torch.tanh(p["beta"] * t))
+    if name == "lse_scaled":
+        # the DECOMPOSED form Inductor is handed: subtract the scaled max, exponentiate, sum
+        return lse(t / p["T"])
     if name == "rmsnorm_max":
         r = (t * t).mean(dim=-1, keepdim=True)   # N is `ncols`, i.e. the row length
         return (t / torch.sqrt(r + p["eps"])).amax(dim=-1)

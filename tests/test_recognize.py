@@ -85,6 +85,15 @@ def d_variance_keepdim(t):
     return ((t - m) ** 2).mean(dim=-1, keepdim=True)
 
 
+def d_lse_scaled(t):
+    """Temperature-scaled log-sum-exp: `logsumexp(t / 8)`, i.e. an attention denominator.
+
+    The scale is a PARAMETER of the skeleton and is inferred from the graph: nothing tells the
+    recogniser that 8 is the temperature.
+    """
+    return torch.logsumexp(t / 8.0, dim=-1)
+
+
 def d_var_op(t):
     """`x.var(-1, unbiased=False)` -- a SINGLE aten op, not a decomposed pair."""
     return t.var(dim=-1, unbiased=False)
@@ -130,6 +139,7 @@ CASES = [
     ("variance", d_var_op),
     ("std", d_std_op),
     ("variance", d_var_correction0),
+    ("lse_scaled", d_lse_scaled),
 ]
 
 
@@ -183,7 +193,11 @@ def main() -> None:
     print("=" * 100)
     passed = failed = 0
     for want, fn in CASES:
-        ep = export(M(fn).eval(), (X,))
+        # The CORE-ATEN DECOMPOSITIONS, because that is what the pipeline sees: real modules
+        # export as one high-level aten op (`aten.logsumexp`, `aten.var`), and the frame needs
+        # the producer/consumer pair. `neptune_opt.export(..., decompose=True)` is the same
+        # step, so a case that passes here is a case the pipeline can serve.
+        ep = export(M(fn).eval(), (X,)).run_decompositions()
         match, reason = NR.recognize(ep.graph_module)
         got = match.skeleton if match else reason
         ok = got == want
@@ -196,7 +210,11 @@ def main() -> None:
         if not ok:
             print(f"         expected {want}")
     for label, fn in NEGATIVE:
-        ep = export(M(fn).eval(), (X,))
+        # The CORE-ATEN DECOMPOSITIONS, because that is what the pipeline sees: real modules
+        # export as one high-level aten op (`aten.logsumexp`, `aten.var`), and the frame needs
+        # the producer/consumer pair. `neptune_opt.export(..., decompose=True)` is the same
+        # step, so a case that passes here is a case the pipeline can serve.
+        ep = export(M(fn).eval(), (X,)).run_decompositions()
         match, got = NR.recognize(ep.graph_module)
         ok = match is None
         passed, failed = (passed + 1, failed) if ok else (passed, failed + 1)

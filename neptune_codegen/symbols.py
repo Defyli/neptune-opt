@@ -56,6 +56,10 @@ _PARAM_ALPHA = sp.Symbol("alpha", real=True)
 
 
 _PARAM_BETA = sp.Symbol("beta", positive=True)
+# Temperature. Real models scale logits before a log-sum-exp (`logits / T`), so the producer of
+# that fold is max(c/T) -- and because the fold is exponential, `phi = log(g) + s` derives `c/T`
+# without it having to be declared. See `lse_scaled`.
+_PARAM_T = sp.Symbol("T", positive=True)
 
 
 # Explicit, because the readout symbols are underscore-prefixed and `from ... import *`
@@ -69,5 +73,5 @@ __all__ = [
     "INTRINSICS",
     "u_sym", "s_sym", "s2_sym", "c_sym",
     "_FINAL_ACC", "_FINAL_M",
-    "_PARAM_TINY", "_PARAM_N", "_PARAM_EPS", "_PARAM_ALPHA", "_PARAM_BETA",
+    "_PARAM_TINY", "_PARAM_N", "_PARAM_EPS", "_PARAM_ALPHA", "_PARAM_BETA", "_PARAM_T",
 ]

@@ -217,8 +217,31 @@ def apply(exported_program, values: dict | None = None,
 
     `verify_with=(module, example_inputs)` adds the numeric self-check, which is otherwise
     unavailable here because `apply` has no access to the original module.
+
+    **Real modules need the graph decomposed first.** `nn.LayerNorm`, `nn.Softmax` and
+    `torch.logsumexp` export as ONE high-level aten op rather than as a producer/consumer pair,
+    and this frame needs the pair. `neptune_opt.export(..., decompose=True)` does that for you;
+    on an already-exported program, call `ep = ep.run_decompositions()` before `apply`. When a
+    refusal looks like this case, the report says so rather than leaving the user to guess.
     """
     report = _rewrite_graph(exported_program.graph_module, values)[1]
+    if not report.fusions:
+        # Retry on a decomposed COPY, purely to diagnose: if it WOULD match there, say so.
+        # Always attempted, rather than gated on a guess about whether the graph "looks
+        # decomposed": a guess is wrong in both directions (measured: `aten.logsumexp.default`
+        # is an aten op and is still a compound op), and this is the failure path anyway.
+        try:
+            dec = exported_program.run_decompositions()
+            m, _why = _recognize(dec.graph_module, values)
+        except Exception:  # noqa: BLE001 -- a diagnosis must never break the call
+            m = None
+        if m is not None:
+            report.skipped.insert(0, (
+                "needs-decomposition",
+                f"would recognise {m.skeleton!r} after the core-aten decompositions: call "
+                f"ep = ep.run_decompositions() first, or use "
+                f"neptune_opt.export(..., decompose=True)",
+            ))
     global LAST_REPORT
     LAST_REPORT = report
     if report.fusions and verify_with is not None:
@@ -241,14 +264,23 @@ def preview(exported_program, values: dict | None = None):
     return ([match] if match is not None else []), reason
 
 
-def export(module: torch.nn.Module, example_inputs: tuple, **export_kwargs):
+def export(module: torch.nn.Module, example_inputs: tuple, decompose: bool = True,
+           **export_kwargs):
     """`torch.export.export` followed by `apply`, returning the ExportedProgram.
 
     A drop-in replacement for `torch.export.export` that also fuses what it recognises. All
-    keyword arguments are forwarded to `torch.export.export` (`dynamic_shapes`, `strict`, ...),
-    so the caller keeps whatever export semantics they already relied on.
+    other keyword arguments are forwarded to `torch.export.export` (`dynamic_shapes`, `strict`,
+    ...), so the caller keeps whatever export semantics they already relied on.
+
+    `decompose=True` (the default) runs the CORE-ATEN DECOMPOSITIONS first, and for real models
+    that is not optional: `nn.LayerNorm`, `nn.Softmax` and `torch.logsumexp` each export as one
+    high-level op, which this frame cannot see. The decomposed form is also what AOTAutograd
+    would hand Inductor anyway, so compiling it is the normal path rather than a detour. Pass
+    `decompose=False` to fuse only what is already spelled out in the graph.
     """
     ep = torch.export.export(module, tuple(example_inputs), **export_kwargs)
+    if decompose:
+        ep = ep.run_decompositions()
     report = apply(ep, verify_with=(module, tuple(example_inputs)))
     if report.fusions and not report.verified:
         # optimise() would have returned the original module here; export cannot un-export,

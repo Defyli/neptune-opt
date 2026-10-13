@@ -33,7 +33,13 @@ _UNARY = {
     "tanh": sp.tanh,
     "abs": sp.Abs,
     "sqrt": sp.sqrt,
+    # `rsqrt(x) = 1/sqrt(x)`, a real op (it is how RMSNorm/LayerNorm are written), not a
+    # tracing artifact. Understanding it does not make those operators fusable -- they have a
+    # single reduction and are outside this frame -- but it lets the interpreter reach that
+    # structural verdict instead of reporting `aten.rsqrt` as "unfamiliar".
+    "rsqrt": lambda a: 1 / sp.sqrt(a),
     "neg": lambda a: -a,
+    "reciprocal": lambda a: 1 / a,
 }
 
 
@@ -59,6 +65,78 @@ _VAR_STD = ("var", "std")
 
 
 _IGNORED = ("clamp_min", "clamp", "squeeze", "unsqueeze", "getitem", "detach", "alias")
+
+# Allocation and literal-tensor construction. An exported module materialises its parameters
+# (weight, bias, eps) through these, and they carry no data path: `empty` produces a buffer, and
+# `full_like(x, v)` is just the constant `v`. Choking on `aten.empty.memory_format` would hide the
+# REAL verdict about an operator -- e.g. that RMSNorm has only one reduction -- behind a message
+# about a tensor allocation.
+_ALLOC = ("empty", "empty_like", "new_empty", "new_zeros", "new_ones")
+_CONST_FILL = ("full_like", "full", "scalar_tensor", "zeros_like", "ones_like")
+
+# Tracing wrappers that ExportedProgram inserts around a module's parameter handling. They carry
+# no data path -- nothing in the reduction pattern consumes their result -- so they are skipped
+# rather than reported as an "unfamiliar op".
+_WRAPPERS = ("wrap_with_set_grad_enabled",)
+
+
+def _is_zero(x) -> bool:
+    """Is `x` the constant 0 -- either a literal or a `scalar_tensor(0.0)` NODE?
+
+    The second form matters: `torch.logsumexp`'s guard passes `scalar_tensor(0.0)` as the
+    `where`'s value operand, so checking only for a Python float found no guard at all (measured:
+    the table came back empty and the graph was refused for an unrelated-looking reason).
+    """
+    try:
+        return float(x) == 0.0
+    except (TypeError, ValueError):
+        pass
+    if getattr(x, "op", None) == "call_function" and str(x.target).startswith("aten.scalar_tensor"):
+        return any(_is_zero(a) for a in x.args)
+    return False
+
+
+def _logsumexp_inf_guard(gm) -> dict:
+    """Map `torch.logsumexp`'s infinity guard onto the value it guards.
+
+    `torch.logsumexp` decomposes to
+
+        m = amax(t, -1, keepdim=True)
+        m = where(eq(abs(m), inf), 0.0, m)      # <- this
+        ...
+
+    The guard replaces an INFINITE max with 0, so that `exp(t - inf)` cannot yield nan. For the
+    finite inputs this frame assumes, it is the identity -- the same status as the `clamp_min`
+    the reference decomposition adds and the interpreter already ignores -- so it is treated as a
+    pass-through.
+
+    Its operands (`abs`, `eq`, `scalar_tensor`) are accepted ONLY inside this shape. `abs` on its
+    own is a real operator, and ignoring it in general would silently compute a different
+    function; the guard is recognised structurally, from the graph, rather than by name.
+    """
+    table: dict = {}
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or _op(node) != "where" or len(node.args) < 3:
+            continue
+        cond, low, high = node.args[:3]
+        if not _is_zero(low) or getattr(cond, "op", None) != "call_function":
+            continue
+        # cond must be `eq(abs(m), inf)`
+        if not str(cond.target).startswith("aten.eq") or not cond.args:
+            continue
+        inner = cond.args[0]
+        if getattr(inner, "op", None) != "call_function":
+            continue
+        if not str(inner.target).startswith("aten.abs"):
+            continue
+        table[node] = high
+        for structural in (cond, low):
+            if getattr(structural, "op", None) == "call_function":
+                table[structural] = None
+                for sub in structural.args:
+                    if getattr(sub, "op", None) == "call_function":
+                        table[sub] = None
+    return table
 
 
 def _rank_of(node):
@@ -200,7 +278,7 @@ class Candidate:
     producer_sym: object = None
 
 
-def interpret(gm):
+def interpret(gm, why: list | None = None):
     """Symbolically evaluate `gm`.
 
     Returns (input_node, phi, psi) or None:
@@ -211,8 +289,17 @@ def interpret(gm):
     input_node = None
     rank = None
     reductions: list = []
+    guard_table = _logsumexp_inf_guard(gm)
 
     for node in gm.graph.nodes:
+        if node in guard_table:
+            guarded = guard_table[node]
+            if guarded is not None:
+                gv, g_is_val = _as_expr(guarded, env)
+                if not g_is_val or gv is None:
+                    return None
+                env[node] = gv
+            continue
         if node.op == "placeholder":
             if input_node is None:
                 input_node = node
@@ -222,6 +309,23 @@ def interpret(gm):
         if node.op not in ("call_function", "call_method"):
             continue
         name = _op(node)
+
+        if name in _ALLOC or name in _WRAPPERS:
+            continue                       # a buffer / a tracing wrapper; no data path
+
+        if name in _CONST_FILL:
+            # `full_like(x, v)` (and friends) is the constant v. `zeros_like`/`ones_like` fill
+            # with 0/1, which is what makes an epsilon or a bias appear in a graph as a symbol.
+            fill = 0.0 if name.startswith("zeros") else 1.0 if name.startswith("ones") else None
+            if fill is None:
+                for a in node.args[1:]:
+                    if isinstance(a, (int, float, bool)):
+                        fill = float(a)
+                        break
+            if fill is None:
+                return None
+            env[node] = sp.Float(fill)
+            continue
 
         if name in _IGNORED:
             # pass through the first value operand (squeeze/getitem/clamp_min)
@@ -290,9 +394,28 @@ def interpret(gm):
             env[node] = _UNARY[name](v)
             continue
 
-        return None                        # unknown op: refuse rather than guess
+        # Unknown op: refuse rather than guess -- and NAME it. "not a producer/consumer
+        # reduction pair" is what a user sees otherwise, which says nothing about the fact that
+        # their graph contains `aten.softmax.int` and would be understood after the core-aten
+        # decompositions (`ep.run_decompositions()`). The refusal is the same; only the
+        # explanation improves.
+        if why is not None:
+            why.append(f"unfamiliar op {str(node.target)!r} -- if this is a high-level aten op "
+                       f"such as softmax/layer_norm, the core decompositions expose its "
+                       f"reductions (ep.run_decompositions())")
+        return None
 
-    if input_node is None or len(reductions) < 2:
+    if input_node is None:
+        if why is not None:
+            why.append("no input placeholder found")
+        return None
+    if len(reductions) < 2:
+        if why is not None:
+            why.append(
+                f"only {len(reductions)} reduction(s) found: this frame fuses a PRODUCER and a "
+                f"CONSUMER reduction, so a single reduction with elementwise work around it "
+                f"(RMSNorm, LayerNorm, softmax's normalisation) is outside it"
+            )
         return None
 
     # Which reduction is the PRODUCER is decided by DEPENDENCY, not by order in the graph.
@@ -313,5 +436,7 @@ def interpret(gm):
                 continue
             candidates.append(Candidate(vi, psi, ki, kj, ni, nj, sj, si))
     if not candidates:
+        if why is not None:
+            why.append(f"{len(reductions)} reductions found, but none depends on another")
         return None
     return input_node, candidates, env

@@ -58,11 +58,40 @@ are in [docs/evidence/](docs/evidence/).
 |---|---|
 | operator families classified (algebra) | 28 → 20 `EXACT`, 1 `AFFINE`, 5 `NEEDS_STATE`, 2 `NOT_INVERT` |
 | families the generator emits | **26 / 28**, via two plans (see `docs/design.md`) |
-| registered skeletons recognised from a graph | **10 / 10**, with no per-operator pattern rows |
+| registered skeletons recognised from a graph | **11 / 11**, with no per-operator pattern rows |
 | scalar parameters inferred from the graph | yes (`beta`, `alpha`, `N`, `eps`, …) |
 | dynamic shapes | supported; one kernel serves every width |
 | generated kernel present in the `.pt2` | verified (41 kernel occurrences, `cubins ≥ 1`) |
 | `torch.compile` backend | **does not work** — gated behind `experimental=True` |
+| real `torch.nn` modules | fuse **only after `ep.run_decompositions()`** — see below |
+
+### What it fuses, and what it cannot
+
+The frame fuses a **producer reduction together with a consumer reduction over the same row** —
+`max` then `sum(exp(x - max))`, `mean(x²)` then `max(x / sqrt(...))`. That pairing is the win,
+because Inductor compiles two dependent reductions into two kernels and cannot fuse them.
+
+It cannot serve an operator whose consumer is **elementwise**, and that is a structural limit
+rather than a missing pattern:
+
+| | |
+|---|---|
+| two dependent reductions (`rmsnorm_max`, `stable_l2`, `logsumexp`, `decay_renorm`, …) | fused, 1.1–2.5x kernel-level |
+| `torch.logsumexp`, `logsumexp(t / T)` | fused after decomposition; `T` inferred from the graph |
+| `nn.RMSNorm`, `nn.LayerNorm`, softmax's normalisation | **out of frame** — one reduction |
+| a `mul` consumer (`prod + ratio`) | refused — needs a carried count |
+
+End to end on real modules (256×16384, both sides packaged with AOTI and loaded):
+**1.19–1.57x** for `torch.logsumexp`, `logsumexp(t/8)`, `rmsnorm_max`, `stable_l2` and a
+hand-written `log_softmax`. At small shapes (64×4096) the same comparison is 0.9–1.05x, because
+the kernel is no longer the bottleneck — the win needs rows long enough to matter. Both numbers,
+and the two measurement bugs that produced the misleading one, are in
+[docs/evidence/exp33_real_modules.md](docs/evidence/exp33_real_modules.md).
+
+Real models also export as one high-level aten op per module, so they must be decomposed first:
+`neptune_opt.export(model, args)` does that by default, and on an existing `ExportedProgram`,
+`ep = ep.run_decompositions()` comes first. `experiments/real_modules.py` measures all of this
+against real modules and prints the reason for every refusal.
 
 ## Install
 
@@ -181,6 +210,7 @@ python tools/coverage_codegen.py       # how much of the algebra the generator c
 python experiments/gpu_m10_codegen_tests.py   # generator correctness across skeletons
 python experiments/gpu_m16_affine.py          # the affine repair, compiled and checked
 python experiments/gpu_m17_two_pass.py        # the two-pass plan, correctness and speed
+python experiments/real_modules.py            # what real torch.nn modules do, and why they don't
 python experiments/gpu_m15_integration.py     # the .pt2 evidence, end to end
 ```
 

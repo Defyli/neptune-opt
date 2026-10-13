@@ -105,6 +105,9 @@ cd neptune-opt
 pip install -e .            # or: pip install -e ".[gpu]" on a CUDA machine
 ```
 
+See [docs/roadmap.md](docs/roadmap.md) for what is done and what remains, and
+[docs/api.md](docs/api.md) for the public surface.
+
 Requires PyTorch and sympy. Triton is only needed to *generate* kernels, so recognition and the
 whole test suite work on a CPU-only machine:
 

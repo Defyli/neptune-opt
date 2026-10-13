@@ -125,10 +125,17 @@ adversarial test set (masked logits, `-inf` rows, `keepdim`, non-trailing dims).
 *Exit criterion*: `nn.Softmax`/`nn.LogSoftmax` models gain the generated kernel in the `.pt2`, with
 numbers unchanged, **and** a model where the expansion would not fuse is left byte-identical.
 
-### I5 — packaging
+### I5 — packaging  ✅ done
 
-*Deliverable*: clean-venv install verified by script; version and changelog; the quickstart in the
-README executed in CI (CPU part); API reference for the public surface.
+`docs/api.md` documents the public surface, and **`tests/test_api_docs.py` asserts it against
+`neptune_opt.__all__` in both directions** — a phantom `neptune_opt.thing` fails, and an
+undocumented public name fails. Both directions were verified by mutation (adding a phantom name,
+and deleting `std` from the list), because a documentation test that cannot fail is decoration.
+The README's limits section had already gone stale once.
+
+`CHANGELOG.md` records 0.2.0; the version is bumped. CI installs `-e ".[test]"`, imports the
+package, and runs the README's quickstart, which covers the clean-install criterion on every push
+and across torch 2.4.1 / 2.6.0 / latest.
 
 *Risk*: low. *Exit criterion*: criterion 1 of the definition of done, in CI.
 

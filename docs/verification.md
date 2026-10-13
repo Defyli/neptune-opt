@@ -51,6 +51,13 @@ Conventions:
 | rewriting the `ExportedProgram` reaches codegen, while every Inductor custom-pass hook does not | `gpu_diag_paths.py` (kept out of the repository) | 41 occurrences of the generated kernel vs 0 | — |
 | the AOTI route is the documented one; the `torch.compile` backend does not reach codegen | `experiments/gpu_m13_aoti_codegen.py`, `experiments/gpu_m15_integration.py` | exit 0 | — |
 
+## Portability
+
+| claim | evidence | result |
+|---|---|---|
+| the same stack on a different GPU reproduces the win | `experiments/gpu_m22_autotune.py` on an RTX 4090 D | 37 checks, exit 0; 3.22x at a single row of 262144, 2.57x end to end through AOTI; a different set of deviations, which is why the table is generated per machine |
+| an old stack supports what the README claims and not what it does not | `pytest`/test scripts on Tesla V100, torch 2.0.1 | algebra, recognition, gates and launch configuration work (11 + 27 tests); `torch.export`, `triton_op` and `aoti_compile_and_package` do not exist |
+
 ## Decisions taken from measurement
 
 | decision | evidence | where it is recorded |

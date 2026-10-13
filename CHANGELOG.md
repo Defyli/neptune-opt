@@ -11,6 +11,11 @@ push.
 
 ### Verification
 
+* **Cross-GPU and old-stack verification** (`docs/evidence/exp38_cross_gpu_and_old_stack.md`): the
+  same stack on an RTX 4090 D reproduces the ~3x single-long-row win (2.57x end to end) while
+  choosing a DIFFERENT set of deviations, and on Tesla V100 / torch 2.0.1 the algebra, recognition,
+  gates and launch configuration work while `torch.export`, `triton_op` and
+  `aoti_compile_and_package` do not exist.
 * Symbolic (dynamic) row length verified for **every** in-frame skeleton, not just `rmsnorm_max`:
   one compiled kernel is correct at widths 1024 / 999 / 333 / 7, and the `.pt2` carries it
   (`gpu_m18_dynamic_shapes.py`).
@@ -58,6 +63,11 @@ push.
 
 ### Fixed
 
+* The autotuning search reported a single timing STALL as a win: on a shared staging GPU one
+  candidate measured 0.1358 ms where the same configuration measured 0.0142 ms on the next run, and
+  the search's fastest-candidate rule turned that into a "2.89x better" table entry. Each candidate
+  is now timed in three interleaved rounds and the MINIMUM is kept, because a stall only ever adds
+  time. Found on a second GPU, not by re-reading the code.
 * `CG.run("logsumexp", x)` raised `KeyError` unless the caller recited the skeleton's scalars; the
   first autotuning search therefore "measured" seven failures, sorted them, and wrote a table from
   the first `inf`. `run` now fills the declared defaults, and a search in which everything failed

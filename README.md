@@ -193,9 +193,15 @@ direction, so a limit that stops being true is caught as well as one that is des
 Stated so that nobody assumes otherwise; these are **not** machine-checked, and they are the ones
 most likely to have gone stale:
 
-* **Verified on one stack:** torch 2.11.0+cu128 with Triton 3.6.0 on an RTX 5090, plus torch 2.14.1
-  on CPU (and CI on 2.4.1 / 2.6.0 / latest for the CPU half). The `triton_op` API differs between
-  releases, so portability beyond that is untested.
+* **Verified on three GPUs, not on one stack.** End to end on torch 2.11.0+cu128 / Triton 3.6.0 on
+  an RTX 5090 D v2 and an RTX **4090 D** (the same stack, a different GPU — and the measured launch
+  table differs between them, which is why it is a generated file that carries its machine), plus
+  torch 2.14.1 on CPU and CI on 2.4.1 / 2.6.0 / latest. On an **old** stack (Tesla V100, torch
+  **2.0.1**, Triton 2.0.0) the algebra, recognition, gates and launch configuration all work
+  (`test_autotune.py`: 11 passed; `test_neptune_opt.py`: 27 passed, 2 failed), while the integration
+  surface does not exist at all: no `torch.export`, no `torch.library.triton_op`, no
+  `aoti_compile_and_package`. Measured, not assumed — see
+  [docs/evidence/exp38](evidence/exp38_cross_gpu_and_old_stack.md).
 * **Inference only.** No gradients, and nothing here has been trained through.
 * **dtypes:** fp32 / bf16 / fp16. fp8, integer and complex are not supported, and the accumulation
   always happens in fp32.

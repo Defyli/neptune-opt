@@ -225,14 +225,21 @@ def best_of(results: list) -> list:
 
 
 def search(kernel_name: str, rows: int, ncols: int, dtype=None, device: str = "cuda",
-           reps: int = 100, candidates=CANDIDATES, params: dict | None = None,
-           warmup: int = 5) -> list:
+           reps: int = 50, candidates=CANDIDATES, params: dict | None = None,
+           warmup: int = 5, rounds: int = 3) -> list:
     """Time every candidate on a real tensor and return them fastest first.
 
     The input is made contiguous ONCE and the output allocated ONCE, so the comparison measures the
     launch configuration rather than the allocator. Launches are pipelined (`reps` in flight), which
     is the difference between measuring the kernel and measuring Python dispatch -- the lesson from
     `experiments/real_modules.py`.
+
+    Each candidate is timed `rounds` times, INTERLEAVED, and the MINIMUM is kept. This is not
+    decoration: on a shared staging GPU one candidate came back at 0.1358 ms where the same
+    configuration measured 0.0142 ms on the next run, and a single such stall was reported as a
+    2.89x win and would have become a table entry. Stalls only ever ADD time, so the minimum is the
+    better estimate of a kernel's cost, and interleaving keeps a slow period from landing on one
+    candidate only.
     """
     import time
 
@@ -264,15 +271,20 @@ def search(kernel_name: str, rows: int, ncols: int, dtype=None, device: str = "c
             for _ in range(warmup):
                 launch()
             torch.cuda.synchronize()
+        except Exception as e:  # noqa: BLE001
+            results.append(Result(block, warps, float("inf")))
+            print(f"      BLOCK={block:5d} num_warps={warps}  cannot launch: "
+                  f"{type(e).__name__}: {str(e)[:40]}")
+            continue
+        times = []
+        for _round in range(rounds):
             t0 = time.perf_counter()
             for _ in range(reps):
                 launch()
             torch.cuda.synchronize()
-            ms = (time.perf_counter() - t0) * 1e3 / reps
-        except Exception as e:  # noqa: BLE001
-            ms = float("inf")
-            print(f"      BLOCK={block:5d} num_warps={warps}  cannot launch: "
-                  f"{type(e).__name__}: {str(e)[:40]}")
+            times.append((time.perf_counter() - t0) * 1e3 / reps)
+        ms = min(times)
         results.append(Result(block, warps, ms))
-        print(f"      {results[-1]}")
+        spread = f"  (rounds: {' '.join('%.4f' % t for t in times)})" if len(times) > 1 else ""
+        print(f"      {results[-1]}{spread}")
     return best_of(results)

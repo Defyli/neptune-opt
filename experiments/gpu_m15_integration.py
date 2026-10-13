@@ -123,6 +123,18 @@ def search(root, needle: bytes):
     return code, text
 
 
+# Every load-bearing number below is asserted. This script used to print them and always exit
+# 0, so a caller checking `$?` could not distinguish a carried kernel from a fallback -- and
+# the same defect affected gpu_m10/m12/m13. See docs/evidence/exp31_two_pass_plan.md.
+_fails: list[str] = []
+
+
+def check(ok: bool, what: str) -> None:
+    if not ok:
+        _fails.append(what)
+        print(f"    [FAIL] {what}")
+
+
 # ---------------------------------------------------------------- A. AOTI path
 print("\n[A] RECOMMENDED FORM: torch.export -> neptune_opt.apply(ep) -> AOTI")
 print("    (one inserted line; no make_fx pre-trace, no re-export)")
@@ -132,6 +144,7 @@ for name, fn in (("stable_l2", l2norm), ("logsumexp", lse), ("rmsnorm_max", rmsn
     report = NO.apply(ep, verify_with=(mod, (X,)))
     if not report.fusions:
         print(f"    {name:12s} NOT FUSED: {report.summary().strip()[:70]}")
+        check(False, f"{name}: not fused at all")
         continue
     pkg = os.path.join(tempfile.mkdtemp(prefix=f"m15_{name}_"), "m.pt2")
     torch._inductor.aoti_compile_and_package(ep, package_path=pkg)
@@ -142,9 +155,13 @@ for name, fn in (("stable_l2", l2norm), ("logsumexp", lse), ("rmsnorm_max", rmsn
     with torch.no_grad():
         ref = mod(X)
     rel = ((got - ref).abs() / ref.abs().clamp_min(1e-6)).max().item()
+    mentions = raw.count(report.fusions[0].skeleton.encode())
     print(f"    {name:12s} fused={str(report.fusions[0]):26s} mentions="
-          f"{raw.count(report.fusions[0].skeleton.encode()):3d}x  cubins={cubins}  "
+          f"{mentions:3d}x  cubins={cubins}  "
           f"rel_err={rel:.3e}  verified={report.verified}")
+    check(mentions >= 1, f"{name}: generated kernel named in the .pt2")
+    check(cubins >= 1, f"{name}: .pt2 carries >= 1 cubin")
+    check(rel < 1e-3, f"{name}: rel_err {rel:.3e} < 1e-3")
 
 print("\n[A2] drop-in form: neptune_opt.export(model, args)")
 for name, fn in (("stable_l2", l2norm),):
@@ -228,6 +245,7 @@ refused = not report.fusions
 with torch.no_grad():
     same = torch.allclose(unwrap(opt(X)), mod(X), rtol=1e-5, atol=1e-6)
 print(f"    fused={bool(report.fusions)}  refused={refused}  result unchanged={same}")
+check(same, "safety gate: the neglected model's result is unchanged")
 print(f"    reason: {report.summary().strip()[:96]}")
 
 print("\n" + "=" * 100)
@@ -238,3 +256,8 @@ print("""Reading:
     never reaches codegen, so the name must appear in the compiled output.
   * C is the gate that stops the pass from deleting part of a model.""")
 print("=" * 100)
+
+print(f"TOTAL: {len(_fails)} failed checks")
+for _f in _fails:
+    print(f"   FAIL: {_f}")
+raise SystemExit(1 if _fails else 0)

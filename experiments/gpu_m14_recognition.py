@@ -195,8 +195,15 @@ for name, fn in NEW_OPS:
     print(f"\n    {name}")
     print(f"      baseline (decomposed)        : cubins={cub_b}  mentions '{name}' "
           f"{raw_b.count(name.encode()):3d}x")
-    print(f"      rewrite BEFORE export        : cubins={cub_f}  mentions '{name}' "
-          f"{raw_f.count(name.encode()):3d}x   <- generated kernel is in the package")
+    # Label corrected: this is the rewrite followed by a RE-EXPORT (mode "pre"), which is what
+    # makes the triton HOP appear during tracing. It used to read "rewrite BEFORE export",
+    # which describes the opposite order from the one the code performs.
+    named_f = raw_f.count(name.encode())
+    print(f"      rewrite + RE-EXPORT          : cubins={cub_f}  mentions '{name}' "
+          f"{named_f:3d}x   <- generated kernel is in the package")
+    # The claim this section exists to make, now binding instead of merely printed.
+    assert cub_f >= 1, f"{name}: the .pt2 carries no cubin"
+    assert named_f >= 1, f"{name}: generated kernel not named in the .pt2"
     if name == NEW_OPS[0][0]:
         _pp, cub_p, raw_p = aoti(fn, "post", "post")
         print(f"      (for comparison) AFTER export: cubins={cub_p}  mentions '{name}' "

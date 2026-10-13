@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import re
 import statistics
+import zlib
 import sys
 import tempfile
 import traceback
@@ -98,7 +99,12 @@ def test_correctness(name, shapes):
     for shape in shapes:
         # NB: the seed must not depend on the loop variable -- that raised
         # UnboundLocalError. Derive it from the shape/distribution index instead.
-        for idx, (dist, x) in enumerate(distributions(shape, seed=abs(hash((name, shape))) % 2**28)):
+        # A STABLE seed. `hash()` on a str/tuple is salted per process (PYTHONHASHSEED), so
+        # this suite silently tested DIFFERENT random data on every run -- which is how a
+        # single 2.4e-3 failure appeared once and could not be reproduced. crc32 is
+        # deterministic, so a passing run means the same thing tomorrow.
+        for idx, (dist, x) in enumerate(
+                distributions(shape, seed=zlib.crc32(f"{name}{shape}".encode()) % 2**28)):
             try:
                 _v = vals_for(name, x)
                 got = CG.run(name, x, **_v)
@@ -275,9 +281,24 @@ def test_performance():
                 _vals = vals_for(name, x)
                 med_g, _ = timeit(lambda: CG.run(name, x, **_vals))
                 sp = med_b / med_g if med_g > 0 else float("nan")
-                print(f"    {name:12s} {str(shape):>12} {base_load:>10} {1:>9} "
+                # The generated kernel's input traversals, counted from the emitted source
+                # instead of asserted to be 1. It IS 1 for every one-pass kernel, which is
+                # why the hardcoded `1` survived; it is 2 for the two-pass plan, so the old
+                # constant would have printed a number the kernel does not have.
+                gen_load = CG.emit_kernel_source(
+                    CG.SKELETONS[name], _vals).count("tl.load(")
+                print(f"    {name:12s} {str(shape):>12} {base_load:>10} {gen_load:>9} "
                       f"{med_b:9.3f} {med_g:8.3f} {sp:7.2f}x")
-                record(f"{name}{shape}/speedup>1.05", sp > 1.05, f"{sp:.2f}x")
+                # The >1.05x claim belongs to the ONE-PASS plan: it replaces a decomposed
+                # multi-kernel form with a single pass over the row. A two-pass kernel reads
+                # the row TWICE by design, so it can be at parity or worse, and asserting a
+                # speedup there would be asserting something that is not true in general.
+                # gpu_m17_two_pass.py measures the two-pass perf properly, against a one-pass
+                # kernel at the same shape. Here it only has to not be pathological.
+                if CG.SKELETONS[name].two_pass:
+                    record(f"{name}{shape}/not pathological", sp > 0.25, f"{sp:.2f}x")
+                else:
+                    record(f"{name}{shape}/speedup>1.05", sp > 1.05, f"{sp:.2f}x")
             except Exception as e:  # noqa: BLE001
                 record(f"{name}{shape}/perf", False, f"{type(e).__name__}: {str(e)[:60]}")
 
@@ -311,3 +332,7 @@ if __name__ == "__main__":
             if s == FAIL:
                 print(f"   {n}: {d}")
     print("=" * 100)
+    # Exit non-zero on failure. Without this the script always exited 0, so a caller that
+    # checked `$?` -- a CI job, or any automated runner -- saw success while the report above
+    # said 44 checks failed. The report was right and the exit code was the lie.
+    raise SystemExit(1 if n_fail else 0)

@@ -170,7 +170,12 @@ if __name__ == "__main__":
     print("\n" + "=" * 100)
     print("VERDICT:", "all auto-derived operators correct" if ok_all
           else "some auto-derived operators failed")
+    _exit = 0 if ok_all else 1
     print("""
 If this passes, the generator is not a table of hand-written kernels: a new operator is a
 symbolic expression, and the repair, the term and the Triton source all follow from it.""")
     print("=" * 100)
+    # Exit non-zero on failure. This file printed a VERDICT but never set an exit code, so an
+    # automated caller saw success either way; the verdict was the only signal, and nothing
+    # was reading it.
+    raise SystemExit(_exit)

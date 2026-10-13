@@ -81,6 +81,22 @@ CG.register(CG.Skeleton(
 # whole term, which Triton rejects as a loop-carried type change.
 VALUES = {"softcap_lse": {"beta": 0.5}}
 
+
+def _vals(name: str) -> dict:
+    """The declared scalar DEFAULTS merged with this file's overrides.
+
+    `param_bindings` deliberately refuses to invent a value for a declared scalar, so a
+    skeleton that has a default still needs it passed explicitly -- `logsumexp`'s `tiny` is a
+    kernel constant exactly as `softcap_lse`'s `beta` is. Passing only VALUES raised
+
+        KeyError: "skeleton 'logsumexp': no value supplied for scalar parameter 'tiny'"
+
+    in section [1], which killed the script BEFORE section [4] -- the section that carries this
+    file's actual evidence. It went unnoticed because the file always exited 0, so the crash
+    was indistinguishable from success to anything reading the exit code.
+    """
+    return {**CG.param_defaults(name), **(VALUES.get(name) or {})}
+
 _beta = sp.Symbol("beta", positive=True)
 CG.register(CG.Skeleton(
     name="softcap_lse",
@@ -101,8 +117,7 @@ for name in ("stable_l2", "sumsq_div", "logsumexp", "softcap_lse"):
     print(f"    derived repair R = {CG.repair_factor(sk)}")
     print(f"    derived term   T = {CG.term_expr(sk)}")
     if sk.is_log:
-        print(f"    derived producer operand = "
-              f"{CG.producer_operand(sk, VALUES.get(name))}")
+        print(f"    derived producer operand = {CG.producer_operand(sk, _vals(name))}")
 
 # ------------------------------------------------------------------ 1. triton_op
 OPS = {}
@@ -110,7 +125,7 @@ for name in ("stable_l2", "sumsq_div", "logsumexp", "softcap_lse"):
     # ask for the HANDLE rather than guessing the op name: registration encodes the scalar
     # parameter values into it (`softcap_lse_beta0p5`), because torch ops are global and two
     # different betas must not silently share one kernel.
-    OPS[name] = CG.op_handle(name, params=VALUES.get(name))
+    OPS[name] = CG.op_handle(name, params=_vals(name))
     print(f"[1] registered {OPS[name]}  (generated source -> custom op)")
 
 import torch._functorch.config as fcfg  # noqa: E402
@@ -318,6 +333,18 @@ def aoti(kind, use_fused, tag):
     return pkg, cubins, names, raw
 
 
+# Every check below that the prose calls "load-bearing" increments this. Before it existed the
+# script printed [PASS]/[FAIL]/[WARN] and always exited 0, so nothing that read the exit code
+# could tell a carried kernel from a fallback.
+_fails: list[str] = []
+
+
+def check(ok: bool, what: str) -> None:
+    print(f"      [{'PASS' if ok else 'FAIL'}] {what}")
+    if not ok:
+        _fails.append(what)
+
+
 print("\n[4] AOTI artifacts")
 for kind in ("stable_l2", "sumsq_div", "logsumexp", "softcap_lse"):
     pkg_b, cub_b, nm_b, txt_b = aoti(kind, False, "base")
@@ -333,8 +360,10 @@ for kind in ("stable_l2", "sumsq_div", "logsumexp", "softcap_lse"):
           f"  in_ptr0 loads={loads_f}")
     print(f"      size          : {os.path.getsize(pkg_b)/1024:.0f} KiB -> "
           f"{os.path.getsize(pkg_f)/1024:.0f} KiB")
+    check(named_f >= 1, f"{kind}: generated kernel named in the artifact")
+    check(len(cub_f) >= 1, f"{kind}: artifact carries >= 1 cubin")
     if named_f == 0:
-        print(f"      [WARN] generated kernel name not found in artifact; kernels seen:")
+        print("      kernels seen:")
         for n in nm_f:
             if n.endswith(".cubin"):
                 print(f"             {n}")
@@ -347,8 +376,10 @@ for kind in ("stable_l2", "sumsq_div", "logsumexp", "softcap_lse"):
         got = OPS[kind](x.reshape(shape[0], -1).contiguous())
         ref = REF[kind](x.reshape(shape[0], -1))
         rel = ((got - ref).abs() / ref.abs().clamp_min(1e-6)).max().item()
-        flag = "PASS" if rel < 1e-3 else "FAIL"
-        print(f"    [{flag}] {kind:10s} {str(shape):12s} rel_err={rel:.3e}")
+        ok = rel < 1e-3
+        print(f"    [{'PASS' if ok else 'FAIL'}] {kind:10s} {str(shape):12s} rel_err={rel:.3e}")
+        if not ok:
+            _fails.append(f"{kind}{shape}: rel_err {rel:.3e}")
 
 print("\n" + "=" * 96)
 print("""How to read this:
@@ -361,3 +392,7 @@ print("""How to read this:
   * Two operators are carried through the same path with no kernel written by hand; the
     second one did not exist in this repo before this file.""")
 print("=" * 96)
+print(f"TOTAL: {len(_fails)} failed checks")
+for f in _fails:
+    print(f"   FAIL: {f}")
+raise SystemExit(1 if _fails else 0)

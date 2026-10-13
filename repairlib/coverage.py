@@ -64,7 +64,18 @@ def build() -> list[tuple[str, str, str]]:
         ("RMSNorm + row max", "norm", sp.Max(x, y), c / sp.sqrt(r + eps),
          "max reducer; only meaningful with a SEPARATE producer"),
         ("L2-normalise rows", "norm", x + y, (c / r) ** 2, "same as stable L2"),
-        ("p-norm (p=3)", "norm", x + y, (c / r) ** p, "p is a compile-time constant"),
+        # CONCRETE 3, not the symbolic `p`. The note always said "p is a compile-time
+        # constant", but the expression declared a free symbol, which the coverage probe then
+        # had to declare as a RUNTIME kernel parameter -- contradicting the note, and failing
+        # for a reason that has nothing to do with the operator: the generator derives one
+        # repair per declared symbol, and `(c/s)**p / (c/s')**p` is not reduced to
+        # `(s'/s)**p` for a symbolic exponent (measured: the simplifier leaves
+        # exp(-p*(log(c/s) - log(c/s'))), which still mentions c). With p fixed it derives
+        # s**3/s2**3 exactly, like the p=2 skeleton already did. (The p-norm READOUT --
+        # the cube root -- is a separate, still-open precision concern, noted in
+        # neptune_codegen/skeleton.py; this family measures the fold only, and the probe
+        # passes the identity finalize for every family.)
+        ("p-norm (p=3)", "norm", x + y, (c / r) ** 3, "p is a compile-time constant"),
         ("standard deviation", "norm", x + y, (c - r) ** 2, "variance skeleton"),
 
         # ---- reduction pairs -------------------------------------------------------
@@ -76,6 +87,15 @@ def build() -> list[tuple[str, str, str]]:
          "DEGENERATE for the same reason; scale is a non-reduction input"),
         ("entropy", "reduction", x + y, c * sp.log(r), "log producer, sum reducer"),
         ("max-abs + sum of squares", "reduction", x + y, (c / r) ** 2, "same as stable L2"),
+        # RENAMED and RE-GROUPED. It used to sit under "explicitly outside the framework" as
+        # "two producers, one term", but `rp` is literally `s2` (see the import above), so what
+        # it declares is `sum_j c_j * mean(c)` -- a single-producer operator, and one the
+        # TWO-PASS plan serves exactly. The old name asserted something the expression does not
+        # say, and the old note ("needs MultiProducerRepair") pointed at the real two-producer
+        # case, which this one-producer data model cannot even DECLARE. So this row is not
+        # evidence about that case either way.
+        ("term reads the final producer", "reduction", x + y, c * rp,
+         "sum(c*mean(c)); served by the two-pass plan"),
 
         # ---- attention -------------------------------------------------------------
         ("FlashAttention prefill", "attention", x + y, sp.exp(c - r), "row-wise max/sum fold"),
@@ -86,8 +106,6 @@ def build() -> list[tuple[str, str, str]]:
         # ---- explicitly outside the framework --------------------------------------
         ("non-invertible producer", "outside", x + y, sp.exp(c - sp.Abs(c)),
          "Eq.5 cannot be instantiated"),
-        ("two producers, one term", "outside", x + y, c * rp,
-         "placeholder: real case needs MultiProducerRepair, see notes"),
         ("duration/decay renormalisation", "outside", x + y, c / (r + n),
          "additive denominator offset"),
     ]

@@ -100,8 +100,14 @@ def probe(f, g):
                              producer_reducer=pr, consumer_reducer=cr)
             try:
                 # use the REAL emitters, not a reimplementation, so this measures the
-                # generation path an integration would actually call
+                # generation path an integration would actually call -- and start where that
+                # path starts. `emit_kernel_source` gates on `check_supported`, so skipping it
+                # here would measure a laxer generator than the one that ships (measured: the
+                # two guards that refuse a term ignoring its producer live in
+                # `check_supported`, and without this call two dead-control families were
+                # reported as emitting).
                 vals = {arg: 1.0 for _sym, arg in params}   # literals; value irrelevant
+                CG.check_supported(sk)
                 r_src, t_src = CG.scale_source(sk, vals), CG.term_source(sk, vals)
                 # The fold itself, not just its two halves: an affine repair's bias lives
                 # only in this line, so reporting scale/term alone would hide it and let a
@@ -110,7 +116,37 @@ def probe(f, g):
             except (NotImplementedError, TranslationError) as e:
                 last = e
                 continue
-            return True, f"{pr}/{cr}", f"{fold}\n      scale={r_src}\n      term={t_src}"
+            return True, f"one-pass {pr}/{cr}", (
+                f"{fold}\n      scale={r_src}\n      term={t_src}")
+
+    # ---- the two-pass plan ------------------------------------------------------------
+    # Tried only after every one-pass declaration has failed, because a single pass that works
+    # is strictly better (one read of the row, not two) -- this is a fallback, not an option.
+    #
+    # The probe cannot know which producer finalization a family wants, so it tries the ones
+    # this study's families need: a raw reduction, and a mean (a reduction divided by the row
+    # length). That is the same kind of search the loop above already performs over the
+    # reducers rather than assuming one -- it asks "does ANY declaration of this family emit",
+    # which is the coverage question. The real declaration lives in the registry
+    # (`variance`/`std` in neptune_codegen/library.py), not here.
+    for cr in cons_reducers:
+        for label, fin in (("mean", CG._FINAL_M / CG._PARAM_N), ("raw", CG._FINAL_M)):
+            sk = CG.Skeleton(name="probe", g=g2, finalize=CG._FINAL_ACC,
+                             producer="signed", is_log=False, params=params,
+                             producer_reducer="sum", consumer_reducer=cr,
+                             two_pass=True, producer_finalize=fin,
+                             intrinsic_params=((CG._PARAM_N, "ncols"),))
+            try:
+                vals = {arg: 1.0 for _sym, arg in params}
+                CG.check_supported(sk)
+                fold = CG.consumer_fold_no_repair(sk, vals)
+                fin_src = CG.producer_finalize_source(sk, vals)
+                t_src = CG.term_source(sk, vals)
+            except (NotImplementedError, TranslationError) as e:
+                last = e
+                continue
+            return True, f"two-pass sum/{cr}", (
+                f"{fold}\n      producer_finalize={fin_src} ({label})\n      term={t_src}")
     if last is None:
         return False, "f-not-foldable", ""
     return False, classify_failure(last), ""

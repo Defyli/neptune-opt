@@ -63,7 +63,13 @@ Two blockers had to be removed, and one of them was hiding a *vacuous test*:
 *Risk*: low. *Exit criterion*: one kernel serves several widths for each skeleton, with the
 artifact carrying the generated kernel and the numbers unchanged.
 
-### I2 — reliability infrastructure
+### I2 — reliability infrastructure  ✅ done
+
+`.github/workflows/ci.yml` runs the CPU half on push and PR across **torch 2.4.1 / 2.6.0 /
+latest** — green on all three (run #2, `fe29279`). It was red first, which is the point: the
+suite passed locally on 2.14.1 and the tests' `numpy` dependency was declared nowhere, so
+`pip install -e ".[test]" && pytest` failed for anyone who tried it. CI installs the test EXTRA
+now, so an undeclared test dependency fails in CI rather than on a user's machine.
 
 *Deliverable*: GitHub Actions running the CPU half (recognition, gates, coverage tool, compile
 check, plus the packaging check from I5's criterion 1 once it exists); pytest usable, so the

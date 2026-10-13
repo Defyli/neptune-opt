@@ -1,5 +1,8 @@
 # neptune-opt
 
+[![ci](https://github.com/Defyli/neptune-opt/actions/workflows/ci.yml/badge.svg)](
+    https://github.com/Defyli/neptune-opt/actions/workflows/ci.yml)
+
 **Break-and-repair reduction fusion for PyTorch AOTInductor, generated from algebra.**
 
 A numerically stable softmax, L2 norm, RMSNorm or attention all need *two reductions of the same

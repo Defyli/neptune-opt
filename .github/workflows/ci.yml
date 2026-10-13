@@ -35,7 +35,9 @@ jobs:
             python -m pip install "torch==${{ matrix.torch }}" \
               --index-url https://download.pytorch.org/whl/cpu
           fi
-          python -m pip install sympy pytest
+          # Install the TEST EXTRA rather than a hand-written list, so an undeclared test
+          # dependency fails here instead of on a user's machine (numpy was exactly that).
+          python -m pip install -e ".[test]"
       - name: Recognition and the safety gates
         run: python -m pytest tests/ -q
       - name: The generator still covers what it claims

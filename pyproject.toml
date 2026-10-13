@@ -23,7 +23,10 @@ dependencies = ["torch>=2.4", "sympy>=1.12"]
 
 [project.optional-dependencies]
 gpu = ["triton>=3.0"]
-test = ["pytest"]
+# `numpy` because the numeric-replay tests use it to re-run a generated kernel's arithmetic
+# without a GPU. It is NOT a runtime dependency: the library itself never imports numpy, and CI
+# caught this by installing only what was declared and failing on an import.
+test = ["pytest", "numpy"]
 
 [project.urls]
 Homepage = "https://github.com/Defyli/neptune-opt"

@@ -33,6 +33,15 @@ def reference(name: str, x, **params):
         # literal, so using .mean() here would silently test two different operators.
         r = (t * t).mean(dim=-1, keepdim=True)   # N is `ncols`, i.e. the row length
         return (t / torch.sqrt(r + p["eps"])).amax(dim=-1)
+    if name in ("variance", "std"):
+        # PyTorch's OWN kernel, deliberately, rather than a hand-written mean/centre/square.
+        # The design notes warn that a reference written from the same reading as the kernel
+        # is a self-consistent error that no test can see; here an independent implementation
+        # exists, so it is the better reference. `unbiased=False` is the N divisor the
+        # skeleton declares.
+        if name == "variance":
+            return t.var(dim=-1, unbiased=False)
+        return t.std(dim=-1, unbiased=False)
     # clamp_min is required: without it an all-zero row gives 0/0 = nan in the
     # REFERENCE, which the tests would then attribute to the kernel.
     m = t.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
@@ -67,6 +76,14 @@ def graph_reference(name: str, x, **params):
     if name == "rmsnorm_max":
         r = (t * t).mean(dim=-1, keepdim=True)   # N is `ncols`, i.e. the row length
         return (t / torch.sqrt(r + p["eps"])).amax(dim=-1)
+    if name in ("variance", "std"):
+        # What Inductor is handed today: the producer is a SEPARATE reduction, so the centred
+        # pass is a second kernel and the mean is a materialised intermediate. The generated
+        # two-pass kernel does the same arithmetic with one launch and no intermediate.
+        centred = (t - t.mean(dim=-1, keepdim=True)) ** 2
+        if name == "variance":
+            return centred.mean(dim=-1)
+        return centred.mean(dim=-1).sqrt()
     m = t.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
     if name == "stable_l2":
         return (m * torch.sqrt(((t / m) ** 2).sum(dim=-1, keepdim=True))).squeeze(-1)

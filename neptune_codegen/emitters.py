@@ -57,6 +57,50 @@ def check_supported(sk: Skeleton) -> None:
             f"skeleton {sk.name!r}: an exponential fold requires producer='signed' "
             "(exp(v - m) <= 1); max|v| collapses rows whose values are all negative"
         )
+    if sk.two_pass:
+        # No repair exists for these operators -- that is what puts them in this plan -- so
+        # deriving one is not a check that can pass; it is the wrong question. What must hold
+        # instead is that the producer can be FINALIZED into the value the term reads, and
+        # that the term itself is translatable.
+        if sk.producer_finalize is None:
+            raise NotImplementedError(
+                f"skeleton {sk.name!r}: two_pass=True needs producer_finalize (the raw "
+                "producer reduction is not what the term reads, e.g. a mean before centering)"
+            )
+        if sk.producer_finalize.has(s2_sym) or sk.producer_finalize.has(c_sym):
+            raise NotImplementedError(
+                f"skeleton {sk.name!r}: producer_finalize must be a function of the raw "
+                f"producer only; got {sk.producer_finalize}"
+            )
+        # Pass 1 must not be dead work: the whole point of the plan is that the TERM reads
+        # the finalized producer. `term_expr` substitutes the fresh producer symbol in for
+        # `g`'s producer symbol, so this asks the question of the expression that is actually
+        # emitted. Without it, `g = exp(c - |c|)` (the coverage study's out-of-framework
+        # control) and the `c * s'` placeholder both pass -- they separate trivially in this
+        # plan -- and the kernel reduces a producer that nothing then reads.
+        #
+        # This is the frame-independent half of the guard in `repair_pair`: that one says the
+        # term may not read a *running* producer, this one says it must read the FINAL one.
+        #
+        # Note the deliberate ASYMMETRY with the one-pass frame. There, a `g` that mentions
+        # the fresh producer symbol is refused outright (`repair_pair`'s first guard), because
+        # "the fresh producer" there is a RUNNING value -- the value s takes after this element
+        # is consumed -- so a term depending on it is order-dependent and meaningless. Here the
+        # fresh producer is the single FINAL value, so a term depending on it is the normal
+        # case (it is what the plan exists for). Same symbol, two frames, opposite verdicts,
+        # and both are correct.
+        if not term_expr(sk).has(s2_sym):
+            raise NotImplementedError(
+                f"skeleton {sk.name!r}: the term {term_expr(sk)} does not depend on the "
+                "producer at all, so the first pass would be dead work. This is not a fold."
+            )
+        names = {c_sym: "v", s_sym: "m", s2_sym: "den", u_sym: "acc",
+                 _FINAL_ACC: "acc", _FINAL_M: "m"}
+        names.update({sym: name for sym, name in sk.params})
+        names.update(intrinsic_bindings(sk))
+        to_triton(sk.producer_finalize, names)
+        term_expr(sk)
+        return
     repair_factor(sk)          # raises if the algebra is not translatable
     repair_bias(sk)            # ... including a bias only a max consumer may use
     term_expr(sk)
@@ -157,6 +201,13 @@ def _needs_denominator_floor(sk: Skeleton) -> bool:
     shift family with c = [-5, -1, -3]: the floored producer is 1e-30, so the term becomes
     v - 1e-30 and the kernel returns -1 where the operator is identically 0.
     """
+    # The two-pass plan has no repair to consult -- and no floor either. The floor exists to
+    # stop a division by a RUNNING producer from becoming 0/0 on an all-zero row; in pass 2
+    # the producer is a finalized reduction (a mean, say), and flooring THAT is wrong in the
+    # same way flooring a shift is wrong. Whether such an operator is singular at a zero mean
+    # is the operator's business, not something the codegen should paper over.
+    if sk.two_pass:
+        return False
     # Memoized on the (frozen, hashable) skeleton: `sp.together` is not free, and this is
     # called from every emit, which the autotuner replays.
     return any(_producer_in_denominator(e) for e in
@@ -172,7 +223,14 @@ def denominator_expr(sk: Skeleton) -> str:
     an exponent (where the value is merely mis-scaled) but wrong for a shift (where the
     value is used as an offset). The floor is therefore decided per skeleton, by inspecting
     the derived expressions, not by the `is_log` flag.
+
+    In the two-pass plan the fresh producer is the FINALIZED producer, which pass 1 left in
+    `m` -- there is no `m_new` in pass 2 -- and it is not floored (see
+    `_needs_denominator_floor`). The binding still lives here rather than as a literal in the
+    template, so the symbol the term reads has exactly one definition.
     """
+    if sk.two_pass:
+        return "m"
     return "tl.maximum(m_new, 1e-30)" if _needs_denominator_floor(sk) else "m_new"
 
 
@@ -197,9 +255,53 @@ def _bindings(sk: Skeleton, values: dict | None = None) -> dict:
     return names
 
 
+# Functions that need a floating-point operand. `sp.sqrt` is a Pow, so it is covered by the
+# exponent test in `_intrinsics_needing_float` as well as by this tuple.
+_FLOAT_FUNCS = (sp.log, sp.exp, sp.tanh, sp.atanh, sp.asinh, sp.acosh, sp.atan, sp.asin, sp.acos)
+
+
+@functools.lru_cache(maxsize=None)
+def _intrinsics_needing_float(sk: Skeleton) -> frozenset:
+    """Intrinsics the algebra takes a ROOT (or other float-only function) of.
+
+    Intrinsics reach the kernel as INTEGERS, because they are shape values (`ncols`, `rows`,
+    `stride_row`). Triton's `tl.sqrt`/`tl.log` then reject them:
+
+        std: error: 'math.sqrt' op operand #0 must be floating-point-like, but got 'i32'
+
+    and it is easy to write a perfectly reasonable skeleton that trips this, because the
+    offending root is not written by hand -- sympy stores `sqrt(acc / N)` as
+    `sqrt(acc) / sqrt(N)`, so the readout of `std` puts an integer shape value under a square
+    root. The fix is to read those intrinsics as floats in the algebra, and only those: a
+    plain `1.0 / ncols` needs no cast (Triton promotes it), so `rmsnorm_max` and `variance`
+    emit exactly what they did before.
+    """
+    names = {sym for sym, _name in sk.intrinsic_params}
+    if not names:
+        return frozenset()
+    out: set = set()
+    exprs = (sk.g, sk.finalize, sk.producer_finalize, sk.producer_expr, term_expr(sk))
+    for e in exprs:
+        if e is None:
+            continue
+        for node in sp.preorder_traversal(e):
+            if isinstance(node, sp.Pow) and node.exp.is_integer is not True:
+                out |= (node.base.free_symbols & names)
+            elif isinstance(node, _FLOAT_FUNCS):
+                out |= (node.free_symbols & names)
+    return frozenset(out)
+
+
 def intrinsic_bindings(sk: Skeleton) -> dict:
-    """Parameters the generated kernel already has in scope, e.g. `N -> ncols`."""
-    return {sym: name for sym, name in sk.intrinsic_params}
+    """Parameters the generated kernel already has in scope, e.g. `N -> ncols`.
+
+    Intrinsics the algebra takes a root of are bound to `(1.0 * ncols)` so the emitted
+    expression is floating-point (see `_intrinsics_needing_float`); the template's own
+    structural uses of `ncols` (`range`, the mask) keep the integer name and are untouched.
+    """
+    need_float = _intrinsics_needing_float(sk)
+    return {sym: (f"(1.0 * {name})" if sym in need_float else name)
+            for sym, name in sk.intrinsic_params}
 
 
 def param_bindings(sk: Skeleton, values: dict | None = None) -> dict:
@@ -290,7 +392,6 @@ def scale_source(sk: Skeleton, values: dict | None = None) -> str:
     """Triton source for the repair factor a(m, safe_m)."""
     return to_triton(_marked(repair_factor(sk)), _bindings(sk, values))
 
-
 def bias_source(sk: Skeleton, values: dict | None = None) -> str:
     """Triton source for the repair bias b(m, safe_m)."""
     return to_triton(_marked(repair_bias(sk)), _bindings(sk, values))
@@ -308,3 +409,30 @@ def term_source(sk: Skeleton, values: dict | None = None, fill: str = "0.0") -> 
 
 def finalize_source(sk: Skeleton, values: dict | None = None) -> str:
     return to_triton(sk.finalize, _bindings(sk, values))
+
+
+# ---------------------------------------------------------------- two-pass plan
+def producer_finalize_source(sk: Skeleton, values: dict | None = None) -> str:
+    """Triton source turning the RAW producer reduction into the value `g` reads.
+
+    e.g. `m / ncols` for a mean. Emitted once, between the two passes, and it is the reason
+    pass 2 needs no repair: after this line the producer never changes again.
+    """
+    if sk.producer_finalize is None:
+        raise NotImplementedError(f"skeleton {sk.name!r}: no producer_finalize declared")
+    return to_triton(sk.producer_finalize, _bindings(sk, values))
+
+
+def consumer_fold_no_repair(sk: Skeleton, values: dict | None = None) -> str:
+    """Pass 2's accumulator update, with the producer held constant.
+
+    Deliberately shares nothing with `consumer_update`: that function exists to apply a
+    REPAIR, and in this plan the repair is the identity because the producer is already
+    final. Writing `acc = acc * 1.0 + ...` to reuse it would be noise pretending to be a
+    computation -- and would invite someone to "optimise" the repair back in.
+    """
+    if sk.consumer_reducer == "max":
+        term = term_source(sk, values, fill='-float("inf")')
+        return f'acc = tl.maximum(acc, tl.max({term}, axis=0))'
+    term = term_source(sk, values, fill="0.0")
+    return f'acc = acc + tl.sum({term}, axis=0)'

@@ -183,9 +183,19 @@ def test_every_public_emitter_is_callable():
         sk = CG.SKELETONS[name]
         v = CG.param_defaults(name)
         CG.check_supported(sk)
-        CG.repair_factor(sk)
-        CG.repair_bias(sk)
-        CG.repair_pair(sk)
+        if sk.two_pass:
+            # No repair EXISTS for these -- that is what puts them in this plan -- so asking
+            # for one is not a check that can pass, it is the wrong question. The plan's own
+            # emitters are what has to be callable.
+            CG.producer_finalize_source(sk, v)
+            CG.consumer_fold_no_repair(sk, v)
+        else:
+            CG.repair_factor(sk)
+            CG.repair_bias(sk)
+            CG.repair_pair(sk)
+            CG.scale_source(sk, v)
+            CG.bias_source(sk, v)
+            CG.bias_line(sk, v)
         CG.term_expr(sk)
         CG.producer_operand(sk, v)
         CG.producer_init(sk)
@@ -193,12 +203,10 @@ def test_every_public_emitter_is_callable():
         CG.guard_value(sk)
         CG.denominator_expr(sk)
         CG.producer_update(sk, v)
-        CG.consumer_update(sk, v)
-        CG.scale_source(sk, v)
-        CG.bias_source(sk, v)
-        CG.bias_line(sk, v)
         CG.term_source(sk, v)
         CG.finalize_source(sk, v)
+        if not sk.two_pass:
+            CG.consumer_update(sk, v)
         assert "def " + name + "(" in CG.emit_kernel_source(sk, v)
 
 
@@ -492,6 +500,137 @@ def test_producer_floor_is_applied_only_where_the_source_divides():
         "the floor is expected to break this family by ~|max|; if this changed, the "
         "justification for the per-skeleton predicate needs revisiting"
     )
+
+
+def test_two_pass_plan_emits_two_loops_and_no_repair():
+    """The fallback plan must look like a fallback plan.
+
+    These operators have NO repair -- `repair_pair` refuses them, and the refusal is the
+    reason the plan exists -- so the emitted kernel must contain no repair statement at all.
+    Two loops, one producer finalize, and the term reading that finalized value.
+    """
+    import neptune_codegen as CG
+
+    for name in ("variance", "std"):
+        sk = CG.SKELETONS[name]
+        assert sk.two_pass, f"{name} should be declared two_pass"
+        # The repair genuinely does not exist; this is the premise of the whole plan.
+        try:
+            CG.repair_pair(sk)
+        except NotImplementedError:
+            pass
+        else:
+            raise AssertionError(f"{name}: a repair exists, so it should not need two passes")
+        src = CG.emit_kernel_source(sk, {})
+        assert src.count("for off in range(0, ncols, BLOCK):") == 2, src
+        # Test the emitted STATEMENTS, not the substrings: the std docstring says
+        # "unbiased=False", so a bare `"bias" not in src` fails on prose.
+        assert "scale = tl.where" not in src, "a two-pass kernel must not carry a repair"
+        assert "bias = tl.where" not in src and "+ bias" not in src, src
+        # The producer is finalized before pass 2 and never moves again. Checked by position
+        # rather than by an exact literal: `std` takes a root of N, so its N is bound as a
+        # float and the same statement reads `(1.0 / (1.0 * ncols))` (see
+        # test_intrinsics_under_a_root_are_read_as_floats).
+        fin = [i for i, l in enumerate(src.splitlines()) if l.strip().startswith("m = m * (")]
+        den = [i for i, l in enumerate(src.splitlines()) if l.strip() == "den = m"]
+        assert fin and den and fin[0] < den[0], src
+        assert "den = m_new" not in src, src
+        # No floor: a finalized producer is not a running one (see _needs_denominator_floor).
+        assert "tl.maximum(m_new" not in src, src
+
+
+def test_two_pass_matches_torch_variance_numerically():
+    """Replay the emitted two-pass recurrence and compare with torch's own var/std.
+
+    The kernel cannot run here (no Triton), so this checks the ARITHMETIC the kernel is
+    generated from, transcribed from the template: finalize the producer, then accumulate
+    (v - den)^2 over the whole row and apply the readout. The reference is `torch.var`/
+    `torch.std` rather than a hand-written mean-centre-square, because an independent
+    implementation is the only kind that can catch a self-consistent misreading.
+    """
+    import numpy as np
+    import torch
+    import neptune_codegen as CG
+
+    rng = np.random.default_rng(0)
+    for name, readout in (("variance", lambda a, n: a / n), ("std", lambda a, n: np.sqrt(a / n))):
+        for shape, block in (((5, 7), 3), ((4, 10), 4), ((3, 8), 8), ((6, 9), 2), ((2, 33), 16)):
+            x = rng.normal(size=shape) * 3.0 + 1.0
+            rows, ncols = shape
+            got = np.empty(rows)
+            for r in range(rows):
+                # pass 1: the producer, then its finalization
+                m = 0.0
+                for off in range(0, ncols, block):
+                    blk = x[r, off:off + block]
+                    m = m + blk.sum()
+                m = m / ncols
+                # pass 2: the consumer, with the producer constant
+                acc = 0.0
+                for off in range(0, ncols, block):
+                    blk = x[r, off:off + block]
+                    acc = acc + ((blk - m) ** 2).sum()
+                got[r] = readout(acc, ncols)
+            want = CG.reference(name, torch.tensor(x, dtype=torch.float32)).numpy()
+            err = np.max(np.abs(got - want) / np.maximum(np.abs(want), 1e-6))
+            assert err < 1e-6, f"{name} shape={shape} block={block}: rel err {err:.3e}"
+
+
+def test_two_pass_requires_a_producer_finalize():
+    """A two-pass skeleton without `producer_finalize` is refused, not silently mis-emitted."""
+    import neptune_codegen as CG
+    from neptune_codegen.symbols import c_sym, s_sym
+
+    sk = CG.Skeleton(name="broken_two_pass", g=(c_sym - s_sym) ** 2,
+                     finalize=CG._FINAL_ACC, producer="signed",
+                     producer_reducer="sum", two_pass=True)
+    try:
+        CG.check_supported(sk)
+    except NotImplementedError as e:
+        assert "producer_finalize" in str(e), e
+        return
+    raise AssertionError("two_pass without producer_finalize must be refused")
+
+
+def test_all_registered_skeletons_have_a_usable_reference():
+    """Every supported skeleton needs a reference, or the GPU suite silently cannot test it.
+
+    Adding a skeleton to the registry automatically puts it in `CG.supported()`, into the
+    explicit operator library, and into the GPU correctness sweep -- where a missing reference
+    shows up as a KeyError far from the declaration that caused it.
+    """
+    import torch
+    import neptune_codegen as CG
+
+    x = torch.randn(4, 16)
+    for name in CG.supported():
+        for fn in (CG.reference, CG.graph_reference):
+            try:
+                out = fn(name, x, **CG.param_defaults(name))
+            except KeyError as e:
+                raise AssertionError(f"{name}: {fn.__name__} is not implemented ({e})") from None
+            assert out.shape == (4,), f"{name}: {fn.__name__} returned {out.shape}"
+
+
+def test_intrinsics_under_a_root_are_read_as_floats():
+    """A shape value under `tl.sqrt` is a Triton COMPILE error, and it is easy to write.
+
+    `std`'s readout is `sqrt(acc / ncols)`, but sympy stores that as `sqrt(acc) / sqrt(ncols)`,
+    so an INTEGER shape value ends up under a square root -- Triton rejects it with
+    "'math.sqrt' op operand #0 must be floating-point-like, but got 'i32'". The offender is not
+    visible in the declaration, which is why this is checked on the emitted source.
+    """
+    import neptune_codegen as CG
+
+    std_src = CG.emit_kernel_source(CG.SKELETONS["std"], {})
+    assert "tl.sqrt((1.0 * ncols))" in std_src, std_src
+    assert "tl.sqrt(ncols)" not in std_src, std_src
+    # A plain division needs no cast (Triton promotes it), so it must not silently gain one:
+    # the cast is a targeted fix, not a blanket rule.
+    var_src = CG.emit_kernel_source(CG.SKELETONS["variance"], {})
+    assert "(1.0 / (ncols))" in var_src, var_src
+    assert "1.0 * ncols" not in var_src, var_src
+    assert "(1.0 / (ncols))" in CG.emit_kernel_source(CG.SKELETONS["rmsnorm_max"], {"eps": 1e-6})
 
 
 def main() -> int:

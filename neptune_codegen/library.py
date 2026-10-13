@@ -110,3 +110,40 @@ register(Skeleton(
     defaults=((_PARAM_TINY, 0.0),),
     doc="ALiBi-biased logsumexp: logsumexp(x + alpha)",
 ))
+
+register(Skeleton(
+    name="variance",
+    # THE TWO-PASS PLAN, and the reason it exists. The term reads the FINAL producer value
+    # (the mean), not a running one, so no repair can exist: recomputing sum((c - mean)^2)
+    # from a running sum((c - s)^2) needs the running COUNT as well, which is the paper's
+    # NEEDS_STATE case and 5 of the 28 families in the coverage study.
+    #
+    # There is no algebra to invent here -- just a second traversal. Pass 1 sums c, the
+    # producer is finalized into the mean, and pass 2 sums the centered squares with the mean
+    # held constant. `g` therefore reads the FINALIZED producer, which is why `producer_finalize`
+    # exists and why `repair_pair` is never consulted.
+    g=(c_sym - s_sym) ** 2,
+    finalize=_FINAL_ACC / _PARAM_N,        # the VARIANCE = mean of squared deviations
+    producer="signed",
+    producer_reducer="sum",
+    two_pass=True,
+    producer_finalize=_FINAL_M / _PARAM_N,  # raw sum -> the mean
+    # N is the row length, which the kernel already receives as `ncols`. Baking it instead
+    # would make the artifact shape-specific, so it is declared intrinsic (see rmsnorm_max).
+    intrinsic_params=((_PARAM_N, "ncols"),),
+    doc="torch.var(x, unbiased=False): mean((x - mean(x))^2)",
+))
+
+register(Skeleton(
+    name="std",
+    # Same plan as `variance`; only the readout differs. Square root is safe here because
+    # `finalize` runs on the final nonnegative accumulator.
+    g=(c_sym - s_sym) ** 2,
+    finalize=sp.sqrt(_FINAL_ACC / _PARAM_N),
+    producer="signed",
+    producer_reducer="sum",
+    two_pass=True,
+    producer_finalize=_FINAL_M / _PARAM_N,
+    intrinsic_params=((_PARAM_N, "ncols"),),
+    doc="torch.std(x, unbiased=False): sqrt(mean((x - mean(x))^2))",
+))

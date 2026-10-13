@@ -79,6 +79,25 @@ class Skeleton:
     # (and therefore the AOTI artifact) specific to one shape, and makes it impossible to
     # compile at all when the shape is symbolic.
     intrinsic_params: tuple = ()
+    # ---- the two-pass plan: what to do when NO repair exists ---------------------------
+    # The repair frame assumes the accumulator can be rewritten as the producer moves. Some
+    # operators have no such rewrite, and then the accumulator is not the problem -- the TERM
+    # is: for g = (c - mean)^2 the term needs the mean ITSELF, and no rescaling of a running
+    # sum produces it (this is the paper's NEEDS_STATE group: five families in the coverage
+    # study). The frame then re-reads the row instead of repairing it:
+    #
+    #     pass 1  reduce the producer                  m = sum(c)
+    #             finalize it (producer_finalize)      m = m / ncols
+    #     pass 2  reduce the consumer term             acc = sum((c - m)^2)
+    #
+    # The producer is CONSTANT during pass 2, so there is nothing to repair and the whole
+    # `repair_pair` derivation is skipped. The cost is a second read of the row; the gain is
+    # that a two-kernel decomposed form becomes one kernel with no materialised intermediate.
+    two_pass: bool = False
+    # Maps the RAW producer reduction (the kernel's `m`, i.e. `_FINAL_M`) to the value `g`
+    # reads, e.g. `m / ncols` for a mean. Written over `_FINAL_M` and whatever
+    # `params`/`intrinsic_params` supply, exactly like `finalize`.
+    producer_finalize: sp.Expr | None = None
 
 
 SKELETONS: dict[str, Skeleton] = {}

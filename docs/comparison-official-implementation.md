@@ -90,18 +90,36 @@ Two corrections to what this document predicted, both worth recording:
 So the borrowed idea paid off on a different axis than predicted: the separation *formulation* is
 worth more than the inversion it replaces, even where the two give identical answers.
 
-### 2. A fallback when the foldability condition fails
+### 2. A fallback when the foldability condition fails  ✅ solved, by a different mechanism
 
 Their comment ends with *"This covers a lot of common cases"*, and there is a second mechanism:
 `ReduceToScan` converts a producer reduction into a scan block, which combines partial results
 without needing the repair to distribute over the reducer at all. The paper's `SplitKUpdate` is the
 same idea for split-K.
 
-This repository has no such fallback: when condition (4) fails, `repairlib` classifies the operator
-`NEEDS_STATE` and the pipeline refuses it. **Those are 6 of the 28 families** (the variance /
-Welford group). The algebra is not wrong — the classification is right — but "convert the producer
-into a scan" is a way to serve those operators without inventing a repair, and it is the honest
-route to the coverage this repository currently calls out of reach.
+This repository had no such fallback: when condition (4) fails, `repairlib` classifies the operator
+`NEEDS_STATE` and the pipeline refused it. **Those were 6 of the 28 families** (the variance /
+Welford group).
+
+**Solved — but not by adopting `ReduceToScan`.** That primitive is a TVM *scheduling*
+transformation: it turns the producer into a scan block so that `HasIncompleteBuffer` holds and the
+producer can be fused under the loop, which is what makes the tiling/split-K machinery work. This
+repository rewrites an ATen graph and emits one program per row, so it has no loop nest to schedule
+and no partial results to combine — adopting the primitive would mean adopting TVM's execution
+model. The fallback it needed is instead a **second traversal inside the same kernel**: pass 1
+finalizes the producer, pass 2 reduces the term with the producer held constant, and the repair is
+the identity *by construction*. See
+[design.md](design.md#when-no-repair-exists-the-two-pass-plan).
+
+That took the generator from 20 to **26 of 28** families, and it is worth being precise about what
+it does *not* show: it is not evidence that this repository now does what `ReduceToScan` does. The
+two mechanisms serve the same families from opposite directions — theirs avoids the repair by
+combining partial results across tiles, this one avoids it by reading the row again — and the
+second pass is the one that fits a single-program-per-row frame.
+
+Nor is the variance group something they serve: their own benchmark scripts use `rolling_update`
+only for softmax and attention (`scripts/neptune_bench/ours/{softmax,attn_plain,attn_gqa,attn_fp8}.py`),
+and no variance or standard-deviation schedule exists in the repository.
 
 ### 3. Memoize the derivation by printed expression  ✅ adopted
 
@@ -165,12 +183,11 @@ delivers it through TVM. Coverage inside the reduction is comparable; coverage a
 1. ~~**Variable separation** (item 1)~~ — **done**, and the payoff was the affine repair rather
    than the two-producer case this document expected.
 2. ~~**Memoization** (item 3)~~ — **done**.
-3. **Scan fallback** (item 2) — the largest remaining item, and now the *only* route to the six
-   `NEEDS_STATE` families. It is also the last thing standing between this repository and full
-   coverage of its own 28-family study: `ReduceToScan` combines partial results without needing
-   the repair to distribute over the reducer at all, which is exactly the property the
-   variance / Welford group lacks.
-4. Only then consider anything loop-nest-level, which would be a different architecture.
+3. ~~**A fallback for the failed foldability condition** (item 2)~~ — **done**, by a two-pass plan
+   rather than by `ReduceToScan`; see the note in item 2. This closed the `NEEDS_STATE` group.
+4. **Anything loop-nest-level** — still not attempted, and still a different architecture.
 
-The current state is reproducible with `python tools/coverage_codegen.py`: 19 of 28 families emit,
-and the 9 refusals are labelled by cause, so the remaining work is a list rather than a feeling.
+The current state is reproducible with `python tools/coverage_codegen.py`: 26 of 28 families emit,
+and both refusals are labelled by cause, so the remaining work is a list rather than a feeling.
+The two that remain are honest limits, not oversights: a `mul` consumer needs a carried count, and
+the last control family declares a term that ignores its producer.

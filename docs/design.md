@@ -108,6 +108,86 @@ inspecting the derived expressions (`_needs_denominator_floor`), and the emitted
 eight registered kernels is unchanged (verified by comparing the generated source with comments
 stripped, before and after).
 
+### When no repair exists: the two-pass plan
+
+Everything above assumes a repair exists. For some operators it cannot, and the reason is worth
+stating precisely, because it is not about the accumulator at all — it is about the **term**. For
+
+```
+g(s, c) = (c - s)^2          # variance, standard deviation, batch-norm stats
+```
+
+the term needs the **mean itself**. Repairing a running `sum((c - s)^2)` as `s` moves requires the
+running *count* as well (`sum((c-s)^2) = sum((c-s')^2) + n*(s'-s)^2`), and the count is state this
+frame does not carry. That is the paper's `NEEDS_STATE` group: 5 of the 28 families in the study.
+
+The answer is not more algebra. It is a second traversal, and declaring it is the whole change:
+
+```python
+register(Skeleton(
+    name="variance",
+    g=(c_sym - s_sym) ** 2,          # the term reads the FINAL producer
+    finalize=_FINAL_ACC / N,         # variance = mean of squared deviations
+    producer_reducer="sum",
+    two_pass=True,
+    producer_finalize=_FINAL_M / N,  # raw sum -> the mean
+    intrinsic_params=((N, "ncols"),),
+))
+```
+
+which emits
+
+```
+# pass 1
+m = 0.0
+for off in range(0, ncols, BLOCK):
+    ...  m = m + tl.sum(v)
+m = m * (1.0 / ncols)          # <- the producer is FINAL here
+# pass 2: the producer is constant, so there is NO repair to apply
+acc = 0.0
+for off in range(0, ncols, BLOCK):
+    ...  acc = acc + tl.sum((v - m) * (v - m))
+```
+
+The producer never moves during pass 2, so the repair is the identity **by construction** — which is
+why `repair_pair` is never consulted and `check_supported` asks a different question
+(`producer_finalize` must exist and be a function of the raw producer). For a max-abs producer
+declared with `two_pass` and an integer shape value under a root, the intrinsic is bound as a float;
+see `_intrinsics_needing_float`.
+
+Two guards had to be re-derived for this frame, and the asymmetry is instructive:
+
+| | one-pass frame | two-pass frame |
+|---|---|---|
+| `g` mentions the fresh producer symbol | **refused** — "fresh" is a *running* value, so the term would be order-dependent | **required** — "fresh" is the single final value, and reading it is the point |
+| `g` ignores the producer | refused — the repair collapses to the identity | refused — pass 1 would be dead work |
+
+Same symbols, two frames, opposite verdicts, and both are correct. The second row is the one that
+matters for honesty: without it the out-of-framework control `g = exp(c - |c|)` "separates" in this
+plan and gets reported as covered, while the emitted kernel reduces a producer that nothing reads.
+
+**What it costs.** This plan buys capability, not speed, and that distinction is worth stating
+plainly. It reads the row twice, so it wins only where the decomposed form's second kernel and its
+materialised intermediate cost more than a second read. Measured on an RTX 5090 D v2
+(`experiments/gpu_m17_two_pass.py`, which measures a ONE-PASS kernel at the same shapes so the two
+causes can be told apart):
+
+| shape | decomposed | two-pass `variance` | one-pass `stable_l2` |
+|---|---|---|---|
+| `(8, 4096)` | 0.0347 ms | **1.52x** | 1.52x |
+| `(8, 16384)` | 0.0563 ms | **2.07x** | 2.09x |
+| `(8, 65536)` | 0.0571 ms | 0.97x | 1.17x |
+| `(32, 65536)` | 0.0551 ms | 0.93x | 1.13x |
+| `(1, 262144)` | 0.0516 ms | 0.30x | **0.39x** |
+
+(One run's medians; repeated runs move these by a few percent, which is why the suite does not
+assert a speedup here.)
+
+The last row is the important one: the one-pass kernel loses there too, so that is a property of the
+**frame** (one program per row, a serial scan of the columns) rather than of this plan. The gap
+between the two columns is what the second pass actually costs. This is why the GPU suite asserts a
+>1.05x speedup only for the one-pass plan and merely "not pathological" here.
+
 ### The one thing the generator cannot derive
 
 `finalize` — what the operator *means* — has to be declared. `g` decides whether the fusion is
@@ -165,17 +245,25 @@ are all pure graph and algebra work, so the tests that matter most do not need a
 
 ## Scope, honestly
 
-Recall from [paper.md](paper.md) that the paper's classification admits an operator only if
-condition (4) holds. Across 28 operator families, **19 are `EXACT`** and the generator emits **all
-19** of them. The remaining 9 are enumerated with reasons in `tools/coverage_codegen.py`, and the
-structural limits are:
+Across 28 operator families the generator now emits **26**, by two plans:
 
-* `NEEDS_STATE` families (the variance / Welford group) need state carried across iterations,
-  which the accumulator-repair frame does not express;
-* a `mul` consumer needs a carried count.
+* **one-pass** (repair exists): 20 `EXACT` families. The accumulator is repaired as the producer
+  moves, so the row is read once.
+* **two-pass** (no repair exists): the 5 `NEEDS_STATE` families plus the "term reads the final
+  producer" family. Pass 1 finalizes the producer, pass 2 reduces the term with the producer
+  constant.
 
-Both are stated as limits rather than worked around, because "the algebra does not reach here" is
-a useful thing for a reader to know.
+The 2 refusals are enumerated with reasons in `tools/coverage_codegen.py`:
+
+* a `mul` consumer (`prod + ratio`) needs a carried count, which neither plan provides;
+* `g = exp(c - |c|)` is a deliberate out-of-framework control: its term ignores the producer, so
+  pass 1 would be dead work and there is no fold at all.
+
+The distinction that survives from the original framing: the algebra's condition (4) decides
+whether a **one-pass** fold exists, and the coverage study's `NEEDS_STATE` verdict is exactly
+"no one-pass fold exists". That verdict was never a statement that the operator cannot be
+served -- only that it cannot be served in one pass -- and the two-pass plan is what that
+observation turns into.
 
 ## Verification map
 
@@ -187,9 +275,19 @@ a useful thing for a reader to know.
 | the derived repair, for every registered skeleton | `tests/test_neptune_opt.py` (CPU, golden table) |
 | the affine repair, derived and replayed numerically | `tests/test_neptune_opt.py` (CPU) |
 | the affine kernel compiles and is exact on hardware | `experiments/gpu_m16_affine.py` (GPU) |
+| the two-pass plan's kernel, correctness and speed | `experiments/gpu_m17_two_pass.py` (GPU) |
 | the generated kernel inside the `.pt2` | `experiments/gpu_m15_integration.py` (GPU) |
 | one kernel serving several widths | `experiments/gpu_m15_integration.py` §E (GPU) |
 | generator correctness across skeletons | `experiments/gpu_m10_codegen_tests.py` (GPU) |
 | how much of the algebra is covered | `tools/coverage_codegen.py` (CPU) |
 
 Raw logs for these are under [evidence/](evidence/).
+
+**Every GPU script exits non-zero when a check fails**, and the numbers in the table above are
+asserted rather than printed. They were not always: `gpu_m10` printed `449 passed, 44 failed` and
+exited 0, `gpu_m12`/`gpu_m13`/`gpu_m15` printed verdicts and exited 0, and `gpu_m13` was crashing in
+section `[1]` — so the section `[4]` AOTI evidence it exists to produce had never actually run. One
+`raise SystemExit(1 if fails else 0)` per script is what surfaced all of it. `gpu_m10` also seeded
+its test data with `hash((name, shape))`, which is salted per process, so the suite tested different
+random data on every run. If you add a check, assert it, and if you need randomness, seed it
+deterministically.

@@ -1,0 +1,171 @@
+# Raw GPU log for experiments/gpu_m17_two_pass.py
+# RTX 5090 D v2, torch 2.11.0+cu128, triton 3.6.0
+# md5: emitters=37fc82a2e70b697554e1758db443acb4 template=0c94a2ffe85fdd3675e312abadf730bf
+#      library=48f2661f50136e4bc8490e51b42eeb7f skeleton=8fd971f6f2584f7ea187b189195fbf5f
+# produced by: python experiments/gpu_m17_two_pass.py   (exit 0)
+#
+# REDACTED: one torch._dynamo recompile warning was removed, because it prints the
+# absolute path of the script that was compiled. Nothing else was edited; re-running
+# the script regenerates the line.
+
+====================================================================================================
+two-pass plan GPU validation
+torch 2.11.0+cu128  cuda 12.8  NVIDIA GeForce RTX 5090 D v2
+====================================================================================================
+
+--- plan shape
+  [PASS] variance/declared two_pass
+  [PASS] variance/two loops
+  [PASS] variance/no repair statement
+  [PASS] variance/producer finalized before pass 2
+  [PASS] variance/no floor on the finalized producer
+  [PASS] std/declared two_pass
+  [PASS] std/two loops
+  [PASS] std/no repair statement
+  [PASS] std/producer finalized before pass 2
+  [PASS] std/no floor on the finalized producer
+
+--- correctness vs torch.var/std (well-conditioned)
+  [PASS] variance (1, 1) normal  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (1, 1) offset  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (1, 1) small  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (1, 1) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (1, 1) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (1, 1) two_values  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (1, 7) normal  -- abs_err=8.941e-08 rel=2.856e-07
+  [PASS] variance (1, 7) offset  -- abs_err=4.768e-07 rel=1.117e-07
+  [PASS] variance (1, 7) small  -- abs_err=5.684e-14 rel=5.684e-08
+  [PASS] variance (1, 7) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (1, 7) constant  -- abs_err=5.684e-14 rel=5.684e-08
+  [PASS] variance (1, 7) two_values  -- abs_err=1.192e-07 rel=1.460e-07
+  [PASS] variance (8, 33) normal  -- abs_err=1.192e-07 rel=9.691e-08
+  [PASS] variance (8, 33) offset  -- abs_err=9.537e-07 rel=1.418e-07
+  [PASS] variance (8, 33) small  -- abs_err=1.137e-13 rel=7.881e-08
+  [PASS] variance (8, 33) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (8, 33) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (8, 33) two_values  -- abs_err=5.960e-08 rel=5.966e-08
+  [PASS] variance (5, 128) normal  -- abs_err=1.192e-07 rel=1.072e-07
+  [PASS] variance (5, 128) offset  -- abs_err=7.153e-07 rel=1.572e-07
+  [PASS] variance (5, 128) small  -- abs_err=2.274e-13 rel=1.942e-07
+  [PASS] variance (5, 128) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (5, 128) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (5, 128) two_values  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (4, 1024) normal  -- abs_err=1.192e-07 rel=1.106e-07
+  [PASS] variance (4, 1024) offset  -- abs_err=4.768e-07 rel=1.170e-07
+  [PASS] variance (4, 1024) small  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (4, 1024) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (4, 1024) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (4, 1024) two_values  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (16, 4096) normal  -- abs_err=2.384e-07 rel=2.292e-07
+  [PASS] variance (16, 4096) offset  -- abs_err=7.153e-07 rel=1.737e-07
+  [PASS] variance (16, 4096) small  -- abs_err=2.274e-13 rel=2.248e-07
+  [PASS] variance (16, 4096) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (16, 4096) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (16, 4096) two_values  -- abs_err=2.980e-07 rel=2.980e-07
+  [PASS] variance (3, 1000) normal  -- abs_err=1.192e-07 rel=1.117e-07
+  [PASS] variance (3, 1000) offset  -- abs_err=7.153e-07 rel=1.763e-07
+  [PASS] variance (3, 1000) small  -- abs_err=1.137e-13 rel=1.094e-07
+  [PASS] variance (3, 1000) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (3, 1000) constant  -- abs_err=5.684e-14 rel=5.684e-08
+  [PASS] variance (3, 1000) two_values  -- abs_err=1.192e-07 rel=1.193e-07
+  [PASS] variance (2, 65536) normal  -- abs_err=1.192e-07 rel=1.188e-07
+  [PASS] variance (2, 65536) offset  -- abs_err=4.768e-07 rel=1.191e-07
+  [PASS] variance (2, 65536) small  -- abs_err=2.274e-13 rel=2.256e-07
+  [PASS] variance (2, 65536) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (2, 65536) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] variance (2, 65536) two_values  -- abs_err=8.941e-07 rel=8.941e-07
+  [PASS] std (1, 1) normal  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (1, 1) offset  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (1, 1) small  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (1, 1) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (1, 1) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (1, 1) two_values  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (1, 7) normal  -- abs_err=1.192e-07 rel=1.246e-07
+  [PASS] std (1, 7) offset  -- abs_err=1.192e-07 rel=6.982e-08
+  [PASS] std (1, 7) small  -- abs_err=5.821e-11 rel=7.251e-08
+  [PASS] std (1, 7) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (1, 7) constant  -- abs_err=2.384e-07 rel=2.384e-01
+  [PASS] std (1, 7) two_values  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (8, 33) normal  -- abs_err=1.192e-07 rel=9.537e-08
+  [PASS] std (8, 33) offset  -- abs_err=2.384e-07 rel=9.143e-08
+  [PASS] std (8, 33) small  -- abs_err=1.164e-10 rel=1.055e-07
+  [PASS] std (8, 33) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (8, 33) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (8, 33) two_values  -- abs_err=5.960e-08 rel=5.963e-08
+  [PASS] std (5, 128) normal  -- abs_err=1.192e-07 rel=1.129e-07
+  [PASS] std (5, 128) offset  -- abs_err=2.384e-07 rel=1.079e-07
+  [PASS] std (5, 128) small  -- abs_err=1.164e-10 rel=1.033e-07
+  [PASS] std (5, 128) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (5, 128) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (5, 128) two_values  -- abs_err=5.960e-08 rel=5.961e-08
+  [PASS] std (4, 1024) normal  -- abs_err=5.960e-08 rel=6.073e-08
+  [PASS] std (4, 1024) offset  -- abs_err=2.384e-07 rel=1.167e-07
+  [PASS] std (4, 1024) small  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (4, 1024) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (4, 1024) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (4, 1024) two_values  -- abs_err=5.960e-08 rel=5.961e-08
+  [PASS] std (16, 4096) normal  -- abs_err=2.384e-07 rel=2.352e-07
+  [PASS] std (16, 4096) offset  -- abs_err=2.384e-07 rel=1.163e-07
+  [PASS] std (16, 4096) small  -- abs_err=2.328e-10 rel=2.304e-07
+  [PASS] std (16, 4096) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (16, 4096) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (16, 4096) two_values  -- abs_err=1.192e-07 rel=1.192e-07
+  [PASS] std (3, 1000) normal  -- abs_err=1.192e-07 rel=1.150e-07
+  [PASS] std (3, 1000) offset  -- abs_err=1.192e-07 rel=5.893e-08
+  [PASS] std (3, 1000) small  -- abs_err=1.164e-10 rel=1.170e-07
+  [PASS] std (3, 1000) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (3, 1000) constant  -- abs_err=2.384e-07 rel=2.384e-01
+  [PASS] std (3, 1000) two_values  -- abs_err=5.960e-08 rel=5.962e-08
+  [PASS] std (2, 65536) normal  -- abs_err=2.384e-07 rel=2.382e-07
+  [PASS] std (2, 65536) offset  -- abs_err=4.768e-07 rel=2.379e-07
+  [PASS] std (2, 65536) small  -- abs_err=1.164e-10 rel=1.160e-07
+  [PASS] std (2, 65536) all_zero  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (2, 65536) constant  -- abs_err=0.000e+00 rel=0.000e+00
+  [PASS] std (2, 65536) two_values  -- abs_err=1.431e-06 rel=1.431e-06
+
+--- ill-conditioned (large offset, small spread)
+        offset   spread    torch var   kernel var    rel err
+       0.0e+00  1.0e+00  1.00720e+00  1.00720e+00  1.185e-07
+       0.0e+00  1.0e-02  1.00720e-04  1.00720e-04  1.446e-07
+       0.0e+00  1.0e-04  1.00720e-08  1.00720e-08  8.955e-08
+       1.0e+03  1.0e+00  1.00720e+00  1.00720e+00  2.282e-06
+       1.0e+03  1.0e-02  1.00720e-04  1.00732e-04  2.572e-04
+       1.0e+03  1.0e-04 unrepresentable      in fp32            1   (spread < ULP 1.2e-04)
+       1.0e+06  1.0e+00  1.01003e+00  1.00765e+00  4.021e-03
+       1.0e+06  1.0e-02 unrepresentable      in fp32            1   (spread < ULP 1.2e-01)
+       1.0e+06  1.0e-04 unrepresentable      in fp32            1   (spread < ULP 1.2e-01)
+       1.0e+08  1.0e+00 unrepresentable      in fp32            1   (spread < ULP 1.2e+01)
+W1013 10:52:55.464000 3197563 site-packages/torch/_dynamo/convert_frame.py:1743] [0/8] torch._dynamo hit config.recompile_limit (8)
+W1013 10:52:55.464000 3197563 site-packages/torch/_dynamo/convert_frame.py:1743] [0/8]    last reason: 0/7: GLOBAL_STATE changed: grad_mode 
+W1013 10:52:55.464000 3197563 site-packages/torch/_dynamo/convert_frame.py:1743] [0/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W1013 10:52:55.464000 3197563 site-packages/torch/_dynamo/convert_frame.py:1743] [0/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+       1.0e+08  1.0e-02 unrepresentable      in fp32            1   (spread < ULP 1.2e+01)
+       1.0e+08  1.0e-04 unrepresentable      in fp32            1   (spread < ULP 1.2e+01)
+  [PASS] ill-conditioning degrades as fp32 predicts  -- worst rel err 4.02e-03 over the 6 cases fp32 can represent (6 skipped as unrepresentable)
+
+--- agreement with torch.var over random rows
+  [PASS] tracks torch.var within fp32  -- worst rel err 2.295e-07
+
+--- explicit operator library
+  [PASS] neptune_opt.variance  -- abs_err=1.192e-07
+  [PASS] neptune_opt.variance needs no parameters  -- ()
+  [PASS] neptune_opt.std  -- abs_err=1.192e-07
+  [PASS] neptune_opt.std needs no parameters  -- ()
+
+--- performance vs the decomposed form (reported, not asserted)
+             shape   base ms    var ms   var x     l2 ms    l2 x  loads var/l2
+         (8, 4096)    0.0347    0.0228   1.52x    0.0229   1.52x      2/1
+  [PASS] variance(8, 4096)/not pathological  -- 1.52x
+        (8, 16384)    0.0563    0.0272   2.07x    0.0269   2.09x      2/1
+  [PASS] variance(8, 16384)/not pathological  -- 2.07x
+        (8, 65536)    0.0571    0.0586   0.97x    0.0487   1.17x      2/1
+  [PASS] variance(8, 65536)/not pathological  -- 0.97x
+       (32, 65536)    0.0551    0.0591   0.93x    0.0489   1.13x      2/1
+  [PASS] variance(32, 65536)/not pathological  -- 0.93x
+       (1, 262144)    0.0516    0.1715   0.30x    0.1332   0.39x      2/1
+  [PASS] variance(1, 262144)/not pathological  -- 0.30x
+    worst two-pass speedup 0.30x; the one-pass kernel is the reference for how much of that is the frame
+
+====================================================================================================
+TOTAL: 117 passed, 0 failed, 117 checks
+====================================================================================================

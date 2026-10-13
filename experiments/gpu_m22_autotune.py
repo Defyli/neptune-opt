@@ -89,21 +89,18 @@ def section_search() -> list:
     print(f"    candidates: {', '.join(f'({b},{w})' for b, w in autotune.CANDIDATES)}")
     print(f"    the fixed default being replaced: BLOCK={autotune.DEFAULT[0]} "
           f"num_warps={autotune.DEFAULT[1]}   noise margin: {autotune.NOISE:.0%}")
-    measured = []
-    for rows, ncols in SEARCH_SHAPES:
-        key = autotune.shape_key(rows, ncols)
-        print(f"    rows={rows:6d} ncols={ncols:7d}  (bucket {key[1]}, {key[0]})")
-        results = autotune.search("logsumexp", rows, ncols, reps=50)
-        picked, gain, why = autotune.choose(results)
-        default = next((r for r in results
-                        if (r.block, r.num_warps) == autotune.DEFAULT), None)
-        if default is None:
-            check(f"rows={rows} ncols={ncols}: the default was measurable", False)
-            continue
-        check(f"rows={rows} ncols={ncols}: a candidate was measured "
-              f"({len(results)} of {len(autotune.CANDIDATES)})", math.isfinite(gain), f"gain={gain}")
-        print(f"      -> choose {picked}: {why}  (default {default.ms:.4f} ms)")
-        measured.append((rows, ncols, key, results, picked, gain))
+    print(f"    this machine: {autotune.machine_key()}  "
+          f"(entries already in the registry: {', '.join(autotune.machines()) or 'none'})")
+    # The measurement itself lives in `autotune.measure_shapes`, shared with
+    # `experiments/measure_launch_configs.py` so that adding a GPU needs only torch + Triton.
+    body, measured = autotune.measure_shapes("logsumexp", SEARCH_SHAPES, reps=50)
+    for entry in measured:
+        rows, ncols = entry["shape"]
+        check(f"rows={rows} ncols={ncols}: a candidate was measured", math.isfinite(entry["gain"]),
+              f"gain={entry['gain']}")
+        if tuple(entry["picked"]) != tuple(autotune.DEFAULT):
+            check(f"rows={rows} ncols={ncols}: the choice {entry['picked']} is a real candidate",
+                  tuple(entry["picked"]) in autotune.CANDIDATES)
 
     print()
     print("    is the choice skeleton-specific? (logsumexp vs stable_l2, same shapes)")
@@ -144,49 +141,41 @@ TABLE = {{
 '''
 
 
-def section_table(measured: list) -> dict:
+def section_table(body: dict, measured: list) -> dict:
     print()
     print("=" * 112)
     print("[2] THE CHOICE: only deviations from the default are worth writing down")
     print("=" * 112)
-    grouped = {}
-    for rows, ncols, key, results, _picked, _gain in measured:
-        grouped.setdefault(key, []).append(results)
-    chosen = {}
-    for key, runs in sorted(grouped.items()):
-        cfg, worst, why = autotune.choose_many(runs)
-        chosen[key] = cfg
-        print(f"      {key}: {len(runs)} shape(s) -> {cfg}: {why}")
-        check(f"{key}: every candidate was measured on every shape in the bucket",
-              len(runs) > 0, f"{len(runs)} runs")
-    deviations = {k: v for k, v in chosen.items() if v != autotune.DEFAULT}
-    print(f"    {len(chosen)} buckets measured, {len(deviations)} deviate from the default")
-    for k, v in sorted(chosen.items()):
-        print(f"      {k}: {v}{'   <- deviation' if v != autotune.DEFAULT else ''}")
-    text = _TABLE_HEADER.format(
-        measured_on=f"{torch.cuda.get_device_name(0)}, torch {torch.__version__}, "
-                    f"triton {_triton()}",
-        noise=autotune.NOISE) + "".join(
-        f"    {k!r}: {v!r},\n" for k, v in sorted(deviations.items())) + "}\n"
+    machine = autotune.machine_key()
+    measured_on = (f"{torch.cuda.get_device_name(0)}, torch {torch.__version__}, "
+                   f"triton {_triton()}")
+    before = autotune.machines()
+    print(f"    machine {machine}: {len(body)} deviation(s) from the default")
+    for key, cfg in sorted(body.items()):
+        print(f"      {key}: {cfg}   <- deviation")
+        check(f"{key} -> {cfg} is a real candidate", tuple(cfg) in autotune.CANDIDATES)
+    merged = autotune.merge_table(autotune.tables(), machine, measured_on, body)
+    check("merging this machine leaves every other machine's entry alone",
+          all(m in merged for m in before), f"before {before}, after {sorted(merged)}")
     path = os.path.join(os.path.dirname(_HERE), "neptune_codegen", "launch_table.py")
-    with open(path, "w") as f:
-        f.write(text)
+    autotune.write_tables(path, merged)
     print("-" * 112)
-    print(text)
+    print(autotune.render_tables({machine: merged[machine]}))
+    print(f"    registry now holds: {', '.join(sorted(merged))}")
     print("-" * 112)
-    for k, v in deviations.items():
-        check(f"{k} -> {v} is a real candidate", tuple(v) in autotune.CANDIDATES)
-    return chosen
+    return merged
 
 
 # ---------------------------------------------------------------- §3 the exit criterion
-def section_check(measured: list) -> None:
+def section_check(measured: list, body: dict) -> None:
     print()
     print("=" * 112)
     print("[3] CHECK: what the table chooses is not slower than the fixed default")
     print("=" * 112)
     print("    (a) direct launches, at every shape that was measured")
-    for rows, ncols, _key, _results, picked, _gain in measured:
+    for entry in measured:
+        rows, ncols = entry["shape"]
+        picked = entry["picked"]
         x = torch.randn(rows, ncols, device="cuda").abs().contiguous()
         out = torch.empty(rows, device="cuda", dtype=torch.float32)
         kernel = CG.compile_skeleton("logsumexp", CG.param_defaults("logsumexp"))
@@ -231,7 +220,7 @@ def section_check(measured: list) -> None:
     rep_f, p_fixed, graph_f = package(True)
     check("both packages fused", bool(rep_t.fusions) and bool(rep_f.fusions),
           f"{[f.skeleton for f in rep_t.fusions]} / {[f.skeleton for f in rep_f.fusions]}")
-    cfg = autotune.best_config(rows, ncols)
+    cfg = autotune.best_config(rows, ncols, device=x.device)
     check("the configuration is IN the package's op name", f"_b{cfg[0]}w{cfg[1]}" in graph_t,
           f"expected _b{cfg[0]}w{cfg[1]} in the rewritten graph")
     check("and the forced-default package carries the default instead",
@@ -336,9 +325,9 @@ def main() -> int:
         return 2
     print(f"torch {torch.__version__}  triton {_triton()}  {torch.cuda.get_device_name(0)}")
     try:
-        measured = section_search()
-        section_table(measured)
-        section_check(measured)
+        body, measured = section_search()
+        section_table(body, measured)
+        section_check(measured, body)
         decision = section_split()
     except Exception:  # noqa: BLE001
         traceback.print_exc()

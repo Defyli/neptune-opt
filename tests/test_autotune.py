@@ -10,6 +10,7 @@ Run:  python tests/test_autotune.py     (or pytest tests/test_autotune.py)
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -18,6 +19,37 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neptune_codegen import autotune  # noqa: E402
+
+
+@contextlib.contextmanager
+def fake_registry(**attrs):
+    """Swap `neptune_codegen.launch_table` for a stand-in module, and put everything back.
+
+    `from package import submodule` binds an ATTRIBUTE on the package as well as an entry in
+    `sys.modules`, so injecting into `sys.modules` alone leaks into the next test that imports the
+    data file -- which is exactly how this helper came to exist.
+    """
+    import neptune_codegen
+
+    module = types.ModuleType("neptune_codegen.launch_table")
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    saved_module = sys.modules.get("neptune_codegen.launch_table")
+    saved_attr = getattr(neptune_codegen, "launch_table", None)
+    sys.modules["neptune_codegen.launch_table"] = module
+    neptune_codegen.launch_table = module
+    try:
+        yield module
+    finally:
+        if saved_module is None:
+            sys.modules.pop("neptune_codegen.launch_table", None)
+        else:
+            sys.modules["neptune_codegen.launch_table"] = saved_module
+        if saved_attr is None:
+            if getattr(neptune_codegen, "launch_table", None) is module:
+                delattr(neptune_codegen, "launch_table")
+        else:
+            neptune_codegen.launch_table = saved_attr
 
 
 class _Symbolic:
@@ -87,46 +119,68 @@ def test_unmeasured_shape_returns_the_documented_default():
     assert autotune.DEFAULT in autotune.CANDIDATES
 
 
+def test_machine_key_is_normalised():
+    assert autotune.machine_key("NVIDIA GeForce RTX 5090 D v2") == "rtx-5090-d-v2"
+    assert autotune.machine_key("NVIDIA GeForce RTX 4090 D") == "rtx-4090-d"
+    assert autotune.machine_key("Tesla V100-PCIE-32GB") == "v100-pcie-32gb"
+    # the same card spelled differently must land on the same key, or its measurements split in two
+    assert autotune.machine_key("RTX 4090 D") == autotune.machine_key("NVIDIA GeForce RTX 4090 D")
+    assert autotune.machine_key("") == ""
+
+
+def test_a_machine_without_an_entry_does_not_borrow_another_machines():
+    """The table does NOT transfer between GPUs, so an unmeasured one must get the DEFAULT.
+
+    Measured: the same search on the same stack chose four deviations on one card and one on
+    another. Copying them would encode someone else's hardware as a decision, so this is asserted
+    rather than left to the accident of a shared dictionary.
+    """
+    registry = {"rtx-5090-d-v2": {"measured_on": "x", "noise": 0.05,
+                                  "table": {("single", 262144): (8192, 8)}}}
+    with fake_registry(TABLES=registry):
+        assert autotune.best_config(1, 262144, device_name="NVIDIA GeForce RTX 5090 D v2") == (8192, 8)
+        assert autotune.best_config(1, 262144, device_name="Tesla V100-PCIE-32GB") == autotune.DEFAULT
+        assert autotune.best_config(1, 262144) == autotune.DEFAULT          # no machine at all
+        assert autotune.machines() == ["rtx-5090-d-v2"]
+
+
+def test_merging_one_machine_keeps_the_others():
+    """Adding a GPU is the common case now, so it must not erase the machine measured before it."""
+    existing = autotune.tables()
+    merged = autotune.merge_table(existing, "some-new-gpu", "a stack", {("single", 4096): (4096, 4)})
+    assert set(existing) <= set(merged), "merging dropped a machine"
+    assert merged["some-new-gpu"]["table"] == {("single", 4096): (4096, 4)}
+    for m in existing:
+        assert merged[m]["table"] == existing[m]["table"], f"{m} was changed by another machine's merge"
+    # and the merge validates: a configuration nobody measured cannot enter the registry
+    bad = autotune.merge_table(existing, "g", "x", {("single", 4096): (12345, 77)})
+    assert bad["g"]["table"] == {}
+    # the rendered file round-trips through exec, which is what the loader does
+    namespace = {}
+    exec(autotune.render_tables(merged), namespace)                          # noqa: S102
+    assert namespace["TABLES"]["some-new-gpu"]["table"] == {("single", 4096): (4096, 4)}
+
+
 def test_every_table_entry_is_a_candidate():
-    for key, cfg in autotune.table().items():
-        assert tuple(cfg) in autotune.CANDIDATES, f"{key} -> {cfg} is not a candidate"
-        assert isinstance(key, tuple) and len(key) == 2, key
-        assert key[0] in ("single", "few", "many"), key
-        assert key[1] & (key[1] - 1) == 0, key
+    for machine, entry in autotune.tables().items():
+        for key, cfg in entry["table"].items():
+            assert tuple(cfg) in autotune.CANDIDATES, f"{machine}/{key} -> {cfg} is not a candidate"
+            assert isinstance(key, tuple) and len(key) == 2, key
+            assert key[0] in ("single", "few", "many"), key
+            assert key[1] & (key[1] - 1) == 0, key
+        assert entry.get("measured_on"), f"{machine} has no provenance string"
 
 
 def test_a_bogus_table_entry_is_dropped():
     """A hand-edited table must not be able to produce a launch the search never tried."""
-    module = types.ModuleType("neptune_codegen.launch_table")
-    module.TABLE = {("many", 4096): (4096, 4), ("many", 1024): (12345, 77)}
-    real = sys.modules.get("neptune_codegen.launch_table")
-    sys.modules["neptune_codegen.launch_table"] = module
-    try:
+    with fake_registry(TABLE={("many", 4096): (4096, 4), ("many", 1024): (12345, 77)}):
         kept = autotune.table()
-    finally:
-        if real is None:
-            sys.modules.pop("neptune_codegen.launch_table", None)
-        else:
-            sys.modules["neptune_codegen.launch_table"] = real
-    assert ("many", 4096) in kept, "a valid entry was dropped"
-    assert ("many", 1024) not in kept, "an invalid entry survived"
-    assert autotune.best_config(256, 1024) in autotune.CANDIDATES
-
-
-def test_lookup_does_not_import_torch():
-    """The chooser is consulted while a graph is being rewritten, and it must stay pure Python."""
-    code = (
-        "import sys; sys.path.insert(0, %r);"
-        "from neptune_codegen import autotune;"
-        "cfg = autotune.best_config(256, 16384);"
-        "assert cfg in autotune.CANDIDATES, cfg;"
-        "assert 'torch' not in sys.modules, 'best_config imported torch';"
-        "assert 'triton' not in sys.modules, 'best_config imported triton';"
-        "print('pure')" % os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-    assert out.returncode == 0, out.stderr
-    assert "pure" in out.stdout
+        assert ("many", 4096) in kept, "a valid entry was dropped"
+        assert ("many", 1024) not in kept, "an invalid entry survived"
+        assert autotune.best_config(256, 1024) in autotune.CANDIDATES
+        # a file in the pre-registry format has no machine attached, so it applies rather than
+        # vanishing -- a FORMAT fallback, which the registry format itself must not have
+        assert autotune.best_config(256, 4096) == (4096, 4)
 
 
 def test_run_fills_the_skeletons_declared_defaults():

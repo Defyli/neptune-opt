@@ -11,6 +11,9 @@ push.
 
 ### Verification
 
+* **Unverified:** `experiments/gpu_m22_autotune.py` was refactored to share the measurement code
+  with `measure_launch_configs.py`; the shared code is verified on two GPUs, the refactored
+  experiment's own GPU run is not (it died after §1, cause unidentified).
 * **Cross-GPU and old-stack verification** (`docs/evidence/exp38_cross_gpu_and_old_stack.md`): the
   same stack on an RTX 4090 D reproduces the ~3x single-long-row win (2.57x end to end) while
   choosing a DIFFERENT set of deviations, and on Tesla V100 / torch 2.0.1 the algebra, recognition,
@@ -35,6 +38,12 @@ push.
 
 ### Added
 
+* **The launch configuration is a per-GPU registry.** `experiments/measure_launch_configs.py`
+  measures one machine, prints every candidate timing, and MERGES its entry, leaving the others
+  alone; it needs only torch and Triton, so a machine whose stack is too old for the AOTI path can
+  still contribute (the V100 on torch 2.0.1 / Triton 2.0.0 did). A GPU with no entry uses the
+  default instead of another machine's numbers — measured: the same search chose four deviations on
+  an RTX 5090 D v2 and one on an RTX 4090 D.
 * **A measured launch configuration** instead of the fixed `BLOCK=1024` / 4 warps: chosen per shape
   from a generated table, part of the op's identity (so it is baked into the package), and kept at
   the default unless a candidate beats it by more than the measured noise margin. Worth **3.04x** at
@@ -63,11 +72,18 @@ push.
 
 ### Fixed
 
-* The autotuning search reported a single timing STALL as a win: on a shared staging GPU one
-  candidate measured 0.1358 ms where the same configuration measured 0.0142 ms on the next run, and
-  the search's fastest-candidate rule turned that into a "2.89x better" table entry. Each candidate
-  is now timed in three interleaved rounds and the MINIMUM is kept, because a stall only ever adds
-  time. Found on a second GPU, not by re-reading the code.
+* `best_config` never consulted the table when the GPU could not be identified, which made the
+  pre-registry (flat `TABLE`) fallback dead code: a valid old-format entry was silently ignored.
+  Caught by a test that asserted on `table()` succeeding while `best_config` did not look.
+* Test isolation: `from package import submodule` binds an ATTRIBUTE on the package as well as an
+  entry in `sys.modules`, so a test that injected a fake data module leaked into the next one.
+* The autotuning search compared candidates against a SINGLE timing round, so a noisy measurement of
+  the default made ordinary candidates look like wins: the first 4090 D run chose four deviations
+  from the default, one of them on a shape whose entire candidate spread is ~2%. Every candidate is
+  now timed in three interleaved rounds and the MINIMUM is kept, which removes the baseline's
+  variance (a stall only ever adds time). Re-measured, the same machine chose one deviation. (My
+  first write-up of this attributed the effect to a specific 0.1358 ms stall at `(1, 4096)`; that was
+  a mis-reading of grep output and is corrected in `docs/evidence/exp38`.)
 * `CG.run("logsumexp", x)` raised `KeyError` unless the caller recited the skeleton's scalars; the
   first autotuning search therefore "measured" seven failures, sorted them, and wrote a table from
   the first `inf`. `run` now fills the declared defaults, and a search in which everything failed

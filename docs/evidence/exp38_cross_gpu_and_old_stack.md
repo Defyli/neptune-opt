@@ -33,19 +33,29 @@ The TABLE does not transfer — four deviations on one card, one on the other �
 `launch_table.py` is a generated file carrying its machine in the header rather than a constant
 somebody edits.
 
-**A measurement flaw this run exposed, and the fix.** On machine B one candidate came back at
-`0.1358 ms` where the next run measured the same configuration at `0.0142 ms`; the search reports the
-fastest candidate, so that single stall was reported as a **2.89x win** and became a table entry. The
-next section of the same run re-measured it at 1.01x, i.e. the entry was harmless but wrong. Stalls
-only ever ADD time on a shared staging GPU, so `autotune.search` now times each candidate `rounds`
-(=3) times, INTERLEAVED, and keeps the minimum. Re-measured on the same machine:
+**A correction to the first report of this run.** I first wrote that a single timing stall
+(`0.1358 ms` where the same configuration measured `0.0142 ms`) was reported as a 2.89x win, and
+attributed it to `(1, 4096)`. That attribution was WRONG, and it came from reading grep output
+line-by-line against the shape list: the grep had dropped one line, so every shape after the gap was
+shifted by one. `0.1358 ms` is the *legitimate* cost of the default at `(1, 262144)`, where the
+candidate that wins really is `(8192, 8)` and really is ~3x better. The correction is recorded here
+rather than quietly edited out, because a mis-read measurement is exactly what this file exists to
+catch.
 
-```
-    before:  rows=1 ncols=4096  default 0.1358 ms  ->  "2.89x better", deviation recorded
-    after:   rows=1 ncols=4096  rounds 0.0145 0.0141 0.0144  -> 0.0141 ms, within noise, default kept
-```
+**What the first run did show, and what was fixed.** With a single timing round, the *default itself*
+was sometimes measured favourably and sometimes not, so candidates were compared against a noisy
+baseline: that run chose four deviations on the 4090 D, including `(1, 256) -> (8192, 8)`, a shape
+where the entire spread across candidates is ~2%. `autotune.search` now times every candidate in
+three INTERLEAVED rounds and keeps the minimum, which removes the baseline's variance rather than the
+candidate's luck. Re-measured, the same machine chose one deviation. The mechanism claimed is right;
+the number I first attached to it was not.
 
-The whole re-run then chose exactly one deviation, the one that is real.
+**One thing is NOT verified.** `experiments/gpu_m22_autotune.py` was refactored to share
+`autotune.measure_shapes` with `measure_launch_configs.py` (the two §1/§2 blocks). The shared code is
+verified: it ran on both the 4090 D and the V100 through `measure_launch_configs.py`, and 62 CPU
+tests pass. The refactored *experiment* run died after §1 on the 4090 D with no traceback
+(process gone, log ends mid-section) and the cause is unidentified, so its 37-check result belongs to
+the pre-refactor version. Recorded as a follow-up rather than assumed to work.
 
 ## Machine C (V100): a genuinely old stack — what works, measured
 
@@ -70,3 +80,24 @@ README says, now with a number. Two concrete follow-ups are recorded in the road
 than papered over: the test suite should SKIP a stack without `torch.export` instead of crashing at
 import, and `test_recognize.py` should build its graphs with `make_fx` (available on 2.0.1) so the
 recognition half is testable there.
+
+## Adding a machine is now a script, and the V100 used it
+
+Measuring the launch configuration no longer requires the export/AOTI stack, so the old machine could
+contribute its own numbers:
+
+```
+    $ python experiments/measure_launch_configs.py      # on each host, detached, then poll
+    4090 D : 1 deviation  ('single',262144): (8192,8)          -> registry: rtx-4090-d, rtx-5090-d-v2
+    V100   : 2 deviations ('many',262144): (4096,4), ('single',262144): (8192,8)
+                                                              -> registry: + v100-pcie-32gb
+    both runs: "other machines' entries were left alone"
+```
+
+That both hosts merged into the registry they were shipped (rather than overwriting it) is the
+property the merge was written for, and it is asserted on CPU by
+`tests/test_autotune.py::test_merging_one_machine_keeps_the_others`.
+
+The V100's two deviations are a useful cross-check on the physics: 262144 columns is the case where
+the block size matters, and on every GPU measured it is the long single row (and, on the
+bandwidth-poorer V100, the long *many*-row shape too) that wants a bigger block.

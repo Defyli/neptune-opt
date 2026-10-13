@@ -55,6 +55,7 @@ Conventions:
 
 | claim | evidence | result |
 |---|---|---|
+| a new GPU can contribute its own launch table without the export/AOTI stack | `experiments/measure_launch_configs.py` on Tesla V100 (torch 2.0.1, Triton 2.0.0) | merged an entry for `v100-pcie-32gb` (2 deviations) into a 3-machine registry; other entries untouched |
 | the same stack on a different GPU reproduces the win | `experiments/gpu_m22_autotune.py` on an RTX 4090 D | 37 checks, exit 0; 3.22x at a single row of 262144, 2.57x end to end through AOTI; a different set of deviations, which is why the table is generated per machine |
 | an old stack supports what the README claims and not what it does not | `pytest`/test scripts on Tesla V100, torch 2.0.1 | algebra, recognition, gates and launch configuration work (11 + 27 tests); `torch.export`, `triton_op` and `aoti_compile_and_package` do not exist |
 

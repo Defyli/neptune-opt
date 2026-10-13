@@ -74,7 +74,7 @@ are in [docs/evidence/](docs/evidence/).
 | dynamic shapes | supported; one kernel serves every width |
 | dtypes | **fp32, bf16, fp16** — the result takes the input's dtype, accumulation stays fp32 |
 | generated kernel present in the `.pt2` | verified (41 kernel occurrences, `cubins ≥ 1`) |
-| launch configuration (`BLOCK`, `num_warps`) | **measured per shape**, and part of the op's identity |
+| launch configuration (`BLOCK`, `num_warps`) | **measured per shape and per GPU**, part of the op's identity; three GPUs measured so far |
 | `torch.compile` backend | **does not work** — gated behind `experimental=True` |
 | real `torch.nn` modules | fuse **only after `ep.run_decompositions()`** — see below |
 

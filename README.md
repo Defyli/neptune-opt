@@ -5,6 +5,24 @@
 
 **Break-and-repair reduction fusion for PyTorch AOTInductor, generated from algebra.**
 
+## One line, one report
+
+```python
+import neptune_opt
+
+ep = torch.export.export(model, args)      # your existing AOTI flow
+report = neptune_opt.apply(ep)             # <- the line you add
+print(report.summary())
+#   fused   : stable_l2
+#   verified: fused output matches the original on the example inputs
+
+torch._inductor.aoti_compile_and_package(ep, package_path="model.pt2")
+```
+
+`apply` returns a report, not a boolean, and it never raises. Every refusal comes back with its
+reason (`skipped : no-fusion: unfamiliar op 'aten.layer_norm.default' …`), and the graph is left
+untouched whenever the pass cannot help — so the safe way to try it is to try it.
+
 A numerically stable softmax, L2 norm, RMSNorm or attention all need *two reductions of the same
 data where the second depends on the first*. That dependency normally costs two passes over the
 input. This library applies [Neptune](#based-on) — break the dependency, then repair the
@@ -13,16 +31,6 @@ them from algebra, and carry that kernel into an AOTInductor `.pt2`.
 
 The kernel is not chosen from a table. An operator is described by one symbolic expression, and the
 repair, the term and all of the Triton source follow from it.
-
-```python
-import neptune_opt
-
-ep = torch.export.export(model, args)      # your existing AOTI flow
-report = neptune_opt.apply(ep)             # <- the line you add
-print(report.summary())                    # always says what it did, and what it skipped
-
-torch._inductor.aoti_compile_and_package(ep, package_path="model.pt2")
-```
 
 ## Based on
 
@@ -66,6 +74,7 @@ are in [docs/evidence/](docs/evidence/).
 | dynamic shapes | supported; one kernel serves every width |
 | dtypes | **fp32, bf16, fp16** — the result takes the input's dtype, accumulation stays fp32 |
 | generated kernel present in the `.pt2` | verified (41 kernel occurrences, `cubins ≥ 1`) |
+| launch configuration (`BLOCK`, `num_warps`) | **measured per shape**, and part of the op's identity |
 | `torch.compile` backend | **does not work** — gated behind `experimental=True` |
 | real `torch.nn` modules | fuse **only after `ep.run_decompositions()`** — see below |
 
@@ -82,6 +91,7 @@ rather than a missing pattern:
 |---|---|
 | two dependent reductions (`rmsnorm_max`, `stable_l2`, `logsumexp`, `decay_renorm`, …) | fused, 1.1–2.5x kernel-level |
 | `torch.logsumexp`, `logsumexp(t / T)` | fused after decomposition; `T` inferred from the graph |
+| `torch.log_softmax`, `F.log_softmax`, `nn.LogSoftmax` | fused after the lowering pass, fp32 and fp16, **1.11–1.42x** |
 | `nn.RMSNorm`, `nn.LayerNorm`, softmax's normalisation | **out of frame** — one reduction |
 | a `mul` consumer (`prod + ratio`) | refused — needs a carried count |
 
@@ -164,31 +174,36 @@ algebra, same code generation — you choose the operator instead of the compile
 
 ## Known limits
 
-* **One operator per graph.** `apply` fuses a single region; a model with two RMSNorms gets one
-  fused. Lifting this needs the interpreter to skip already-fused ops.
-* **Only row reductions.** A reduction over any other dimension is refused outright, as is a
-  `.mean()` over anything but the last dimension. Deliberate — nothing verified the reduction dims
-  before, so `sum(dim=0)` would have been silently reinterpreted as a row reduction.
-* **The operator's tail must match the declared `finalize`.** An algebraically equivalent but
-  textually different readout will not match. Declared constants are inferred, so those are fine.
-* **Out of frame structurally:** an operator with a single reduction and elementwise work around
-  it — `nn.RMSNorm`, `nn.LayerNorm`, softmax's normalisation — cannot be served by more algebra,
-  because the frame fuses two *dependent reductions* (see above).
-* **Refused, with reasons:** a `mul` consumer (`prod + ratio`) needs a carried count; a
-  runtime-variable exponent is refused because the only safe lowering is `exp(log(x)·p)` and that
-  is nan for negative `x`; `x.var(-1)` is refused because its default is the `/(N-1)` form while
-  the kernel computes `/(N)`.
-* **A decomposition pass may be required.** Real modules export as one high-level aten op, so
-  `apply` on a freshly exported program will refuse and say so; `export(..., decompose=True)` (the
-  default) handles it. `aten._softmax` / `aten.native_layer_norm` are not decomposed by the core
-  table at all, so those modules are still out of reach.
-* **The LSE *inside* softmax is not extracted.** `nn.Softmax`/`nn.LogSoftmax` would need a graph
-  expansion that materialises the log-sum-exp as a node before the region gate can replace it.
-  Not implemented.
+Every row of this table is asserted by [`tests/test_readme_limits.py`](tests/test_readme_limits.py),
+which runs on CPU with no Triton and fails when this README and the code disagree — in **either**
+direction, so a limit that stops being true is caught as well as one that is described wrongly.
+
+| limit | what it means here |
+|---|---|
+| **`region-is-the-operator`** | only the operator's own dataflow is replaced, so `logsumexp(x) * 2` keeps its `* 2`. A readout that is algebraically equal but written differently — `m + ½·log Σexp(2(x−m))` — is **refused**, not matched: this is a frame, not an algebra solver |
+| **`one-operator-per-graph`** | `apply` fuses one region; a second in-frame operator in the same graph is left alone |
+| **`row-reductions-only`** | a reduction over any dimension but the last is refused, `mean(0)` included |
+| **`var-default-is-unbiased`** | `x.var(-1)` and `x.std(-1)` are refused because their default is the `/(N−1)` form while the kernel computes `/N`; `unbiased=False` is served |
+| **`single-reduction-operators`** | `nn.LayerNorm`, `nn.RMSNorm` and `nn.Softmax` are out of frame: their consumer is elementwise, so there is no second reduction to fuse. More algebra cannot fix a shape mismatch |
+| **`softmax-internals-not-lowered`** | the log-sum-exp inside `aten._softmax` is not extracted, by measurement (0.59x); the one inside `aten._log_softmax` is (1.11–1.42x) |
+| **`needs-decomposition`** | a freshly exported `torch.logsumexp` is refused *by name*, with a diagnostic saying the core decompositions would expose it; `export(..., decompose=True)` is the default |
+| **`prod-ratio-needs-a-count`** | the one probed family of 28 the generator refuses, with the reason `f-needs-carried-state` |
+| **`lower-only-when-it-pays`** | the lowering pass is a no-op — byte-for-byte on the graph — whenever it would not enable a fusion |
+
+Stated so that nobody assumes otherwise; these are **not** machine-checked, and they are the ones
+most likely to have gone stale:
+
 * **Verified on one stack:** torch 2.11.0+cu128 with Triton 3.6.0 on an RTX 5090, plus torch 2.14.1
-  on CPU. The `triton_op` API differs between releases, so portability across versions is untested.
-* **Inference only.** No gradients. `BLOCK` is not autotuned yet (see the roadmap), and the
-  dtypes supported are fp32 / bf16 / fp16 -- other types (fp8, int) are not.
+  on CPU (and CI on 2.4.1 / 2.6.0 / latest for the CPU half). The `triton_op` API differs between
+  releases, so portability beyond that is untested.
+* **Inference only.** No gradients, and nothing here has been trained through.
+* **dtypes:** fp32 / bf16 / fp16. fp8, integer and complex are not supported, and the accumulation
+  always happens in fp32.
+* **A runtime-variable exponent** is refused, because the only safe lowering is `exp(log(x)·p)` and
+  that is `nan` for negative `x`.
+* **One operator family per fused region**, and no attention-chain fusion (`QKᵀ → softmax → PV`) or
+  multi-GPU: those are architectural non-goals, with the reasons in
+  [docs/roadmap.md](docs/roadmap.md).
 
 ## Repository layout
 
@@ -199,6 +214,8 @@ neptune_codegen/     algebra -> Triton source
   algebra.py           conditions (3)/(4) as executable code: derive the repair and the term
   emitters.py          every piece of Triton text, derived rather than templated
   library.py           the registered operators (one declaration each)
+  autotune.py          (BLOCK, num_warps): measured table, with a documented fallback
+  launch_table.py      the measurements themselves -- generated, not hand-edited
   template.py          render the kernel, compile it into a real Triton function
   torch_op.py          expose a generated kernel to torch.compile / AOTInductor
   references.py        the references the kernels are checked against
@@ -207,6 +224,7 @@ neptune_recognize/   graph -> "which skeleton is this?"
   params.py            recover a skeleton's scalar parameters from the graph
   match.py             compare expressions against the registry
   rewrite.py           replace the operator's own region with one kernel call
+  lowering.py          expand a compound op the core decompositions leave whole
 neptune_opt/         the user-facing layer: apply / export / operator library
 repairlib/           the standalone algebra classifier (28 families, CPU + sympy only)
 tests/               CPU test suite
@@ -223,6 +241,9 @@ pytest tests/ -v                       # recognition + gates, CPU
 # the same tests without pytest installed:
 python tests/test_neptune_opt.py
 python tests/test_recognize.py
+python tests/test_lowering.py              # the log_softmax expansion, and its no-op guarantee
+python tests/test_readme_limits.py         # this README's limits table, asserted in both directions
+python tests/test_autotune.py              # the launch-configuration chooser
 python tools/coverage_codegen.py --check   # coverage, and FAILS if it regresses (CI runs this)
 python -m pytest tests/ -q              # recognition + gates, CPU
 # on a CUDA machine:
@@ -232,6 +253,8 @@ python experiments/gpu_m17_two_pass.py        # the two-pass plan, correctness a
 python experiments/real_modules.py            # what real torch.nn modules do, and why they don't
 python experiments/gpu_m18_dynamic_shapes.py  # symbolic row length, every in-frame skeleton
 python experiments/gpu_m19_dtypes.py          # fp32 / bf16 / fp16, every skeleton
+python experiments/gpu_m21_i4_log_softmax.py  # log_softmax reach, speed, and the no-op guarantee
+python experiments/gpu_m22_autotune.py        # the launch-configuration search, and the split decision
 python experiments/gpu_m15_integration.py     # the .pt2 evidence, end to end
 ```
 

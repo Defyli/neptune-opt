@@ -181,19 +181,37 @@ def compile_skeleton(name: str, values: dict | None = None, force: bool = False)
     return kernel
 
 
-def run(name: str, x, block: int = 1024, **params):
+def run(name: str, x, block: int | None = None, num_warps: int | None = None, **params):
     """Execute the generated kernel, reducing over the last dimension.
 
     `params` supplies the extra scalars the skeleton declared, by kernel argument name
     (e.g. `run("lse_alibi", x, alpha=0.5)`).
+
+    `block` and `num_warps` default to the measured configuration for the shape (see
+    `neptune_codegen.autotune`), which is also what the shipped op uses -- this function exists so
+    tests and experiments can launch the kernel directly, and it must not quietly differ from the
+    op that ships.
     """
     import torch
+
+    from neptune_codegen.autotune import best_config
+    from neptune_codegen.skeleton import param_defaults
+
+    # Fill the skeleton's declared defaults for anything the caller did not give, the same way
+    # `neptune_opt.<op>()` does. Without this, `run("logsumexp", x)` raised
+    # `KeyError: no value supplied for scalar parameter` -- a footgun that silently turned a whole
+    # measurement run into `inf` timings (experiments/gpu_m22_autotune.py, first attempt).
+    params = {**param_defaults(name), **(params or {})}
     kernel = compile_skeleton(name, params)
     rows = x.shape[0]
     ncols = x.numel() // rows
+    if block is None or num_warps is None:
+        cfg = best_config(rows, ncols, x.dtype, x.device)
+        block = cfg[0] if block is None else block
+        num_warps = cfg[1] if num_warps is None else num_warps
     x2 = x.reshape(rows, ncols).contiguous()
     # The input's dtype, matching `as_triton_op` -- `run` exists so tests and experiments can
     # launch the kernel directly, and it must not quietly differ from the op that ships.
     out = torch.empty(rows, device=x.device, dtype=x.dtype)
-    kernel[(rows,)](x2, out, rows, ncols, x2.stride(0), BLOCK=block)
+    kernel[(rows,)](x2, out, rows, ncols, x2.stride(0), BLOCK=block, num_warps=num_warps)
     return out

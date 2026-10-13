@@ -197,18 +197,96 @@ and across torch 2.4.1 / 2.6.0 / latest.
 
 *Risk*: low. *Exit criterion*: criterion 1 of the definition of done, in CI.
 
-### I6 — performance: block autotuning, then decide on split reduction
+### I6 — performance: block autotuning, then decide on split reduction  ✅ done
 
-*Deliverable (a)*: `BLOCK` (and `num_warps`) chosen per shape by a measured search, with the search
-logged, instead of a fixed default.
+**Deliverable (a), shipped.** `neptune_codegen/autotune.py` chooses `(BLOCK, num_warps)` per shape;
+`neptune_codegen/launch_table.py` holds the measurements (a generated file, with the command and the
+machine in its header); the configuration is part of the operator's IDENTITY, so
+`apply`/`export` bake it into the registered op name — two shapes get two ops instead of whichever
+registered first deciding for both. `experiments/gpu_m22_autotune.py`, **40 checks, exit 0**, log in
+[evidence/exp37_autotune_gpu.txt](evidence/exp37_autotune_gpu.txt).
 
-*Deliverable (b)*: an honest evaluation of tall-thin shapes, where the frame currently loses badly
-(0.30x at `(1, 262144)`, and the one-pass kernel loses too — so that is the frame, not the plan).
-Split reduction is the fix and it is a real architectural step; this iteration ends with a
-measurement and a decision, not with code in the other direction.
+The rule the table encodes is the interesting part, and the first attempt got it wrong in a way
+worth recording. Measured across the candidate set, most shapes spread by a few percent run to run:
+for a row of 4096 the best four configurations are 0.0098 / 0.0099 / 0.0099 / 0.0101 ms. Recording
+that minimum would have been recording noise, in a file that then decides a compiled artifact's
+launch. So the policy is `autotune.choose`: **keep the default unless a candidate beats it by more
+than the measured noise margin** (5%), and for shapes sharing a bucket take the best WORST CASE
+(`choose_many`), not the best of whichever shape was timed first — the first version flapped at the
+margin, choosing two different configurations for one bucket off 1.0500x vs 1.0501x.
 
-*Risk*: medium. *Exit criterion*: autotuning demonstrably not slower than the fixed default, and a
-written decision on split reduction with the numbers behind it.
+What the table then holds is short, and that is the finding:
+
+| bucket | chosen | gain vs the old fixed default |
+|---|---|---|
+| `('single', 262144)` | `(8192, 8)` | **3.04x** (0.1252 → 0.0411 ms) |
+| `('many', 262144)` | `(8192, 8)` | 1.07x |
+| `('many', 1024)` | `(512, 2)` | 1.23x |
+| `('few', 4096)` | `(512, 2)` | 1.05x |
+| everything else measured | the default | within noise |
+
+End to end through AOTI at the shape where the choice is not noise (a single row of 262144, both
+sides packaged and loaded): **2.74x** (0.1315 → 0.0481 ms), and the measurement is only meaningful
+because the configuration is visible in the package's op name (`_b8192w8`), which is asserted.
+
+Three things had to be fixed for that number to exist at all, and all three were silent:
+
+* `CG.run("logsumexp", x)` raised `KeyError: no value supplied for scalar parameter` — the skeleton's
+  scalars had to be recited by the caller. Every candidate in the first search therefore "failed to
+  compile", the sort returned the first of seven `inf` timings, and a table was written from them.
+  `run` now fills the skeleton's declared defaults, and `autotune.best_of` REFUSES to name a winner
+  when every measurement failed;
+* the bucket key was too coarse: with `MAX_BUCKET` at 16384, a row of 262144 and a row of 16384 shared
+  a key, and one row is not four rows. Buckets now reach `1<<20`, and one row is its own class
+  (`single` / `few` / `many`) because measurement says it wants a different block;
+* the op registration raised `NameError` for every operator after a refactor, because the shared
+  key builder left a stale local behind — and every CPU test stubbed the very function that broke.
+  The name construction is now shared (`autotune.op_key`) and tested without a GPU.
+
+**Deliverable (b), the written decision: do NOT build split reduction.** The ceiling was measured
+rather than argued — a chunked kernel (grid of `k` programs) plus a combine is exactly what a split
+reduction costs — against the now-tuned single-program kernel at `(1, 262144)`:
+
+```
+    Inductor's own lowering                0.0275 ms   1.00x
+    our single program, tuned (8192, 8)    0.0411 ms   0.67x
+    our emulated split, best k=16          0.0423 ms   0.65x
+```
+
+Note what changed from the 0.30x this file used to record: **3x of that gap was our own default**,
+not the architecture, and autotuning closed it. What remains is that Inductor splits this reduction
+across programs and does it better than a chunked two-launch emulation does. So the decision is not
+"split reduction is impossible" but "our split reduction would have to beat an emulation of itself
+that is already 1.5x behind Inductor's" — and for a single row of 262144 the honest advice is to let
+Inductor lower it. The frame wins where rows are long *and* numerous, which is where models are.
+
+*Risk*: was medium, is now low. *Exit criterion*: met — the chosen configuration is never slower than
+the default (9 direct launches, plus 2.74x end to end through AOTI), and the split question has a
+number behind its answer in both directions.
+
+### I7 — close out  ✅ done
+
+*Deliverable*: the README leads with the one line and the report it returns; "what this is not" is
+stated next to what it is; and the limits are a table whose every row is **asserted by
+`tests/test_readme_limits.py` in both directions** — a row with no check fails, and a check with no
+row fails. Nine rows, each a real measurement made on CPU with no Triton:
+
+| key | how it is checked |
+|---|---|
+| `region-is-the-operator` | `logsumexp(x) * 2` keeps its `* 2` (the graph still multiplies after the rewrite), while an algebraically equal but differently written readout is refused |
+| `one-operator-per-graph` | a graph with two in-frame operators yields exactly one fusion, and the other operator is still in the graph |
+| `row-reductions-only` | `sum(dim=0)`, `mean(dim=0)`, `amax(dim=0)` are all refused |
+| `var-default-is-unbiased` | `var(-1)`/`std(-1)` refused, `unbiased=False` served |
+| `single-reduction-operators` | `nn.LayerNorm`, `nn.RMSNorm`, `nn.Softmax` refused after decomposition |
+| `softmax-internals-not-lowered` | `lower_if_it_helps(softmax) == 0` and `== 1` for `log_softmax` |
+| `needs-decomposition` | a fresh `torch.logsumexp` export refuses with that reason by name |
+| `prod-ratio-needs-a-count` | `tools/coverage_codegen.py --check` still reports `f-needs-carried-state` for it |
+| `lower-only-when-it-pays` | the lowering leaves an unrelated graph byte-identical |
+
+Both directions were verified by mutation (de-keying a row, and adding a phantom row), as was the
+one check that could have passed vacuously: the stub-kernel trick that makes the graph-level rows
+testable on CPU was first applied at the wrong scope, so `apply` failed with `triton-missing` and the
+assertion about the surviving `* 2` passed for the wrong reason.
 
 ### I7 — close out
 

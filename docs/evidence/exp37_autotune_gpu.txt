@@ -1,0 +1,238 @@
+# Raw GPU log for iteration I6: experiments/gpu_m22_autotune.py
+# RTX 5090 D v2, torch 2.11.0+cu128, triton 3.6.0
+# produced by: python experiments/gpu_m22_autotune.py   (exit 0, 40 passed / 0 failed)
+# REDACTED: 0 line(s) checked for absolute paths and host names (0 left)
+
+torch 2.11.0+cu128  triton 3.6.0  NVIDIA GeForce RTX 5090 D v2
+================================================================================================================
+[1] THE SEARCH: every candidate, timed on real shapes (fp32, kernel=logsumexp)
+================================================================================================================
+    candidates: (256,1), (512,2), (1024,4), (2048,4), (4096,4), (2048,8), (8192,8)
+    the fixed default being replaced: BLOCK=1024 num_warps=4   noise margin: 5%
+    rows=     1 ncols=    256  (bucket 256, single)
+      BLOCK=  256 num_warps=1   0.0104 ms
+      BLOCK=  512 num_warps=2   0.0103 ms
+      BLOCK= 1024 num_warps=4   0.0099 ms
+      BLOCK= 2048 num_warps=4   0.0103 ms
+      BLOCK= 4096 num_warps=4   0.0123 ms
+      BLOCK= 2048 num_warps=8   0.0099 ms
+      BLOCK= 8192 num_warps=8   0.0102 ms
+    [PASS] rows=1 ncols=256: a candidate was measured (7 of 7) -- gain=1.0038794142461132
+      -> choose (1024, 4): within noise (1.00x): keeping the default  (default 0.0099 ms)
+    rows=     1 ncols=   4096  (bucket 4096, single)
+      BLOCK=  256 num_warps=1   0.0104 ms
+      BLOCK=  512 num_warps=2   0.0098 ms
+      BLOCK= 1024 num_warps=4   0.0100 ms
+      BLOCK= 2048 num_warps=4   0.0099 ms
+      BLOCK= 4096 num_warps=4   0.0097 ms
+      BLOCK= 2048 num_warps=8   0.0099 ms
+      BLOCK= 8192 num_warps=8   0.0098 ms
+    [PASS] rows=1 ncols=4096: a candidate was measured (7 of 7) -- gain=1.0352275323448608
+      -> choose (1024, 4): within noise (1.04x): keeping the default  (default 0.0100 ms)
+    rows=     1 ncols= 262144  (bucket 262144, single)
+      BLOCK=  256 num_warps=1   0.3278 ms
+      BLOCK=  512 num_warps=2   0.2238 ms
+      BLOCK= 1024 num_warps=4   0.1252 ms
+      BLOCK= 2048 num_warps=4   0.0862 ms
+      BLOCK= 4096 num_warps=4   0.0694 ms
+      BLOCK= 2048 num_warps=8   0.0761 ms
+      BLOCK= 8192 num_warps=8   0.0412 ms
+    [PASS] rows=1 ncols=262144: a candidate was measured (7 of 7) -- gain=3.0362086056659647
+      -> choose (8192, 8): 3.04x better than the default  (default 0.1252 ms)
+    rows=     4 ncols=   4096  (bucket 4096, few)
+      BLOCK=  256 num_warps=1   0.0104 ms
+      BLOCK=  512 num_warps=2   0.0097 ms
+      BLOCK= 1024 num_warps=4   0.0102 ms
+      BLOCK= 2048 num_warps=4   0.0098 ms
+      BLOCK= 4096 num_warps=4   0.0129 ms
+      BLOCK= 2048 num_warps=8   0.0101 ms
+      BLOCK= 8192 num_warps=8   0.0098 ms
+    [PASS] rows=4 ncols=4096: a candidate was measured (7 of 7) -- gain=1.050536538347527
+      -> choose (512, 2): 1.05x better than the default  (default 0.0102 ms)
+    rows=     8 ncols=   1024  (bucket 1024, few)
+      BLOCK=  256 num_warps=1   0.0101 ms
+      BLOCK=  512 num_warps=2   0.0097 ms
+      BLOCK= 1024 num_warps=4   0.0100 ms
+      BLOCK= 2048 num_warps=4   0.0096 ms
+      BLOCK= 4096 num_warps=4   0.0098 ms
+      BLOCK= 2048 num_warps=8   0.0096 ms
+      BLOCK= 8192 num_warps=8   0.0096 ms
+    [PASS] rows=8 ncols=1024: a candidate was measured (7 of 7) -- gain=1.037111262143066
+      -> choose (1024, 4): within noise (1.04x): keeping the default  (default 0.0100 ms)
+    rows=   256 ncols=   1024  (bucket 1024, many)
+      BLOCK=  256 num_warps=1   0.0104 ms
+      BLOCK=  512 num_warps=2   0.0098 ms
+      BLOCK= 1024 num_warps=4   0.0121 ms
+      BLOCK= 2048 num_warps=4   0.0100 ms
+      BLOCK= 4096 num_warps=4   0.0103 ms
+      BLOCK= 2048 num_warps=8   0.0098 ms
+      BLOCK= 8192 num_warps=8   0.0101 ms
+    [PASS] rows=256 ncols=1024: a candidate was measured (7 of 7) -- gain=1.2342727442512855
+      -> choose (512, 2): 1.23x better than the default  (default 0.0121 ms)
+    rows=   256 ncols=   4096  (bucket 4096, many)
+      BLOCK=  256 num_warps=1   0.0101 ms
+      BLOCK=  512 num_warps=2   0.0100 ms
+      BLOCK= 1024 num_warps=4   0.0097 ms
+      BLOCK= 2048 num_warps=4   0.0099 ms
+      BLOCK= 4096 num_warps=4   0.0100 ms
+      BLOCK= 2048 num_warps=8   0.0100 ms
+      BLOCK= 8192 num_warps=8   0.0097 ms
+    [PASS] rows=256 ncols=4096: a candidate was measured (7 of 7) -- gain=1.0
+      -> choose (1024, 4): within noise (1.00x): keeping the default  (default 0.0097 ms)
+    rows=   256 ncols= 262144  (bucket 262144, many)
+      BLOCK=  256 num_warps=1   0.5929 ms
+      BLOCK=  512 num_warps=2   0.3668 ms
+      BLOCK= 1024 num_warps=4   0.2292 ms
+      BLOCK= 2048 num_warps=4   0.2161 ms
+      BLOCK= 4096 num_warps=4   0.2172 ms
+      BLOCK= 2048 num_warps=8   0.2164 ms
+      BLOCK= 8192 num_warps=8   0.2140 ms
+    [PASS] rows=256 ncols=262144: a candidate was measured (7 of 7) -- gain=1.0706320424032094
+      -> choose (8192, 8): 1.07x better than the default  (default 0.2292 ms)
+    rows=  4096 ncols=   4096  (bucket 4096, many)
+      BLOCK=  256 num_warps=1   0.0166 ms
+      BLOCK=  512 num_warps=2   0.0146 ms
+      BLOCK= 1024 num_warps=4   0.0133 ms
+      BLOCK= 2048 num_warps=4   0.0125 ms
+      BLOCK= 4096 num_warps=4   0.0125 ms
+      BLOCK= 2048 num_warps=8   0.0135 ms
+      BLOCK= 8192 num_warps=8   0.0146 ms
+    [PASS] rows=4096 ncols=4096: a candidate was measured (7 of 7) -- gain=1.0637993353585675
+      -> choose (4096, 4): 1.06x better than the default  (default 0.0133 ms)
+
+    is the choice skeleton-specific? (logsumexp vs stable_l2, same shapes)
+      BLOCK=  256 num_warps=1   0.0099 ms
+      BLOCK=  512 num_warps=2   0.0096 ms
+      BLOCK= 1024 num_warps=4   0.0096 ms
+      BLOCK= 2048 num_warps=4   0.0098 ms
+      BLOCK= 4096 num_warps=4   0.0097 ms
+      BLOCK= 2048 num_warps=8   0.0098 ms
+      BLOCK= 8192 num_warps=8   0.0096 ms
+      BLOCK=  256 num_warps=1   0.0103 ms
+      BLOCK=  512 num_warps=2   0.0099 ms
+      BLOCK= 1024 num_warps=4   0.0104 ms
+      BLOCK= 2048 num_warps=4   0.0102 ms
+      BLOCK= 4096 num_warps=4   0.0099 ms
+      BLOCK= 2048 num_warps=8   0.0103 ms
+      BLOCK= 8192 num_warps=8   0.0099 ms
+      rows=256 ncols=4096: logsumexp chooses (1024, 4), stable_l2 chooses (1024, 4)  agree
+      BLOCK=  256 num_warps=1   0.3278 ms
+      BLOCK=  512 num_warps=2   0.2236 ms
+      BLOCK= 1024 num_warps=4   0.1252 ms
+      BLOCK= 2048 num_warps=4   0.0862 ms
+      BLOCK= 4096 num_warps=4   0.0693 ms
+      BLOCK= 2048 num_warps=8   0.0761 ms
+      BLOCK= 8192 num_warps=8   0.0412 ms
+      BLOCK=  256 num_warps=1   0.3118 ms
+      BLOCK=  512 num_warps=2   0.2052 ms
+      BLOCK= 1024 num_warps=4   0.1151 ms
+      BLOCK= 2048 num_warps=4   0.0674 ms
+      BLOCK= 4096 num_warps=4   0.0453 ms
+      BLOCK= 2048 num_warps=8   0.0699 ms
+      BLOCK= 8192 num_warps=8   0.0330 ms
+      rows=1 ncols=262144: logsumexp chooses (8192, 8), stable_l2 chooses (8192, 8)  agree
+    [PASS] the CHOICE does not depend on the skeleton -- disagreements: []
+
+================================================================================================================
+[2] THE CHOICE: only deviations from the default are worth writing down
+================================================================================================================
+      ('few', 1024): 1 shape(s) -> (1024, 4): within noise (1.04x worst case): keeping the default
+    [PASS] ('few', 1024): every candidate was measured on every shape in the bucket -- 1 runs
+      ('few', 4096): 1 shape(s) -> (512, 2): 1.05x better than the default in the worst case
+    [PASS] ('few', 4096): every candidate was measured on every shape in the bucket -- 1 runs
+      ('many', 1024): 1 shape(s) -> (512, 2): 1.23x better than the default in the worst case
+    [PASS] ('many', 1024): every candidate was measured on every shape in the bucket -- 1 runs
+      ('many', 4096): 2 shape(s) -> (1024, 4): within noise (1.00x worst case): keeping the default
+    [PASS] ('many', 4096): every candidate was measured on every shape in the bucket -- 2 runs
+      ('many', 262144): 1 shape(s) -> (8192, 8): 1.07x better than the default in the worst case
+    [PASS] ('many', 262144): every candidate was measured on every shape in the bucket -- 1 runs
+      ('single', 256): 1 shape(s) -> (1024, 4): within noise (1.00x worst case): keeping the default
+    [PASS] ('single', 256): every candidate was measured on every shape in the bucket -- 1 runs
+      ('single', 4096): 1 shape(s) -> (1024, 4): within noise (1.04x worst case): keeping the default
+    [PASS] ('single', 4096): every candidate was measured on every shape in the bucket -- 1 runs
+      ('single', 262144): 1 shape(s) -> (8192, 8): 3.04x better than the default in the worst case
+    [PASS] ('single', 262144): every candidate was measured on every shape in the bucket -- 1 runs
+    8 buckets measured, 4 deviate from the default
+      ('few', 1024): (1024, 4)
+      ('few', 4096): (512, 2)   <- deviation
+      ('many', 1024): (512, 2)   <- deviation
+      ('many', 4096): (1024, 4)
+      ('many', 262144): (8192, 8)   <- deviation
+      ('single', 256): (1024, 4)
+      ('single', 4096): (1024, 4)
+      ('single', 262144): (8192, 8)   <- deviation
+----------------------------------------------------------------------------------------------------------------
+"""
+MEASURED launch configurations -- GENERATED FILE, do not hand-edit.
+
+Produced by `experiments/gpu_m22_autotune.py`, which prints the whole search it ran. Regenerate it
+on a different GPU rather than editing a number: the point of the table is that every entry was
+timed on the machine that uses it.
+
+    NVIDIA GeForce RTX 5090 D v2, torch 2.11.0+cu128, triton 3.6.0
+
+ONLY DEVIATIONS FROM THE DEFAULT ARE LISTED. Every other shape uses `autotune.DEFAULT`, because the
+measurement did not justify anything else: candidates for a short row differ by a few percent run to
+run, and a candidate has to beat the default by more than `autotune.NOISE` (5%) to be
+recorded here. Where the choice does matter it is not marginal -- one of the rows below is a single
+row of 262144 columns, where the default is several times slower.
+
+Keys are `(rows class, ncols bucket)`; see `neptune_codegen/autotune.py` for what a bucket is, why
+the class exists, and why a choice has to clear the noise margin.
+"""
+TABLE = {
+    ('few', 4096): (512, 2),
+    ('many', 1024): (512, 2),
+    ('many', 262144): (8192, 8),
+    ('single', 262144): (8192, 8),
+}
+
+----------------------------------------------------------------------------------------------------------------
+    [PASS] ('few', 4096) -> (512, 2) is a real candidate
+    [PASS] ('many', 1024) -> (512, 2) is a real candidate
+    [PASS] ('many', 262144) -> (8192, 8) is a real candidate
+    [PASS] ('single', 262144) -> (8192, 8) is a real candidate
+
+================================================================================================================
+[3] CHECK: what the table chooses is not slower than the fixed default
+================================================================================================================
+    (a) direct launches, at every shape that was measured
+    [PASS] rows=1 ncols=256: (1024, 4) >= default (1024, 4) -- 0.0100 ms -> 0.0099 ms = 1.01x
+    [PASS] rows=1 ncols=4096: (1024, 4) >= default (1024, 4) -- 0.0103 ms -> 0.0102 ms = 1.00x
+    [PASS] rows=1 ncols=262144: (8192, 8) >= default (1024, 4) -- 0.1250 ms -> 0.0411 ms = 3.04x
+    [PASS] rows=4 ncols=4096: (512, 2) >= default (1024, 4) -- 0.0100 ms -> 0.0100 ms = 1.00x
+    [PASS] rows=8 ncols=1024: (1024, 4) >= default (1024, 4) -- 0.0099 ms -> 0.0098 ms = 1.01x
+    [PASS] rows=256 ncols=1024: (512, 2) >= default (1024, 4) -- 0.0099 ms -> 0.0098 ms = 1.01x
+    [PASS] rows=256 ncols=4096: (1024, 4) >= default (1024, 4) -- 0.0099 ms -> 0.0098 ms = 1.01x
+    [PASS] rows=256 ncols=262144: (8192, 8) >= default (1024, 4) -- 0.2297 ms -> 0.2147 ms = 1.07x
+    [PASS] rows=4096 ncols=4096: (4096, 4) >= default (1024, 4) -- 0.0133 ms -> 0.0124 ms = 1.07x
+    (b) end to end through AOTI, at the shape where the choice is NOT noise
+    [PASS] both packages fused -- ['logsumexp'] / ['logsumexp']
+    [PASS] the configuration is IN the package's op name -- expected _b8192w8 in the rewritten graph
+    [PASS] and the forced-default package carries the default instead
+      default (1024, 4) 0.1315 ms -> chosen (8192, 8) 0.0481 ms = 2.74x
+    [PASS] end to end, the chosen configuration is not slower -- 2.74x
+    [PASS] and the two agree numerically -- max|diff|=0.00e+00
+
+================================================================================================================
+[4] DECIDE: tall-thin shapes, and the CEILING of split reduction
+================================================================================================================
+    a single row of 262144 -- one program, so one SM is busy out of many
+    [PASS] the tuned single-program kernel is numerically right -- max|diff|=0.00e+00
+    our single program, tuned (8192,8)   :   0.0411 ms    0.67x vs Inductor
+    [PASS] k=4: the emulated split is numerically right -- max|diff|=0.00e+00
+    split into   4 chunks (ceiling)     :   0.0452 ms    0.61x vs Inductor
+    [PASS] k=16: the emulated split is numerically right -- max|diff|=0.00e+00
+    split into  16 chunks (ceiling)     :   0.0423 ms    0.65x vs Inductor
+    [PASS] k=64: the emulated split is numerically right -- max|diff|=0.00e+00
+    split into  64 chunks (ceiling)     :   0.0429 ms    0.64x vs Inductor
+
+    best split k=16: 0.65x vs Inductor; tuned single program: 0.67x
+    VERDICT: split reduction is NOT worth building: ceiling 0.0423 ms vs 0.0411 ms for the tuned single program
+
+================================================================================================================
+TOTAL: 40 passed, 0 failed
+DECISION: split reduction for tall-thin shapes: do not build it (ceiling 0.0423 ms at k=16 vs 0.0411 ms for the tuned single program)
+READING: the table holds only what the noise margin could not explain, and the
+split-reduction question is answered against the TUNED kernel, not the old default.
+============================================================================================

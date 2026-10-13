@@ -30,6 +30,13 @@ push.
 
 ### Added
 
+* **A measured launch configuration** instead of the fixed `BLOCK=1024` / 4 warps: chosen per shape
+  from a generated table, part of the op's identity (so it is baked into the package), and kept at
+  the default unless a candidate beats it by more than the measured noise margin. Worth **3.04x** at
+  a single row of 262144 columns, and **2.74x** end to end through AOTI at that shape
+  (`gpu_m22_autotune.py`, 40 checks, exit 0).
+* `tests/test_readme_limits.py`: the README's limits are a table whose every row is asserted against
+  the code, in both directions, so a stale limit fails the build.
 * A **lowering pass** (`neptune_recognize/lowering.py`, on by default in `apply`) that expands
   `log_softmax` into `x - logsumexp(x, keepdim=True)` so the region gate has a node to replace. It
   is committed **only** when it enables a rewrite, and `lower=False` is the control. `softmax`,
@@ -51,6 +58,13 @@ push.
 
 ### Fixed
 
+* `CG.run("logsumexp", x)` raised `KeyError` unless the caller recited the skeleton's scalars; the
+  first autotuning search therefore "measured" seven failures, sorted them, and wrote a table from
+  the first `inf`. `run` now fills the declared defaults, and a search in which everything failed
+  reports no winner instead of one.
+* Op registration raised `NameError` for **every** operator after a refactor left a stale local in
+  the shared name construction — and every CPU test stubbed the function that broke, so nothing
+  caught it. The name is built in one place now (`autotune.op_key`) and tested without a GPU.
 * The lowering's first version inserted nodes with **no shape metadata**, so every rewrite was
   refused with *"the operator's output rank is unknown"* — the recogniser needs to know whether the
   operator keeps the reduced dimension. The metadata now comes from running the same expansion on

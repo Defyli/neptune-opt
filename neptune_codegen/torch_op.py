@@ -12,6 +12,7 @@ import tempfile
 
 import sympy as sp
 
+from neptune_codegen import autotune
 from neptune_codegen.skeleton import SKELETONS
 from neptune_codegen.template import compile_skeleton
 
@@ -20,8 +21,8 @@ from neptune_codegen.template import compile_skeleton
 _TRITON_OPS: dict[str, object] = {}
 
 
-def as_triton_op(name: str, block: int = 1024, lib: str = "neptune",
-                 params: dict | None = None, keepdim: bool = False):
+def as_triton_op(name: str, block: int | None = None, num_warps: int | None = None,
+                 lib: str = "neptune", params: dict | None = None, keepdim: bool = False):
     """Expose one generated kernel to torch.compile / AOTInductor as a custom op.
 
     This is the bridge that makes the generated source part of the compiled artifact
@@ -38,10 +39,12 @@ def as_triton_op(name: str, block: int = 1024, lib: str = "neptune",
     # The op name must encode the parameter values: torch ops are global, so registering
     # `neptune::softcap_lse` twice with different betas would silently reuse the first
     # kernel. Distinct values get distinct ops.
-    tag = "_keep" if keepdim else ""
-    for arg_name, val in sorted((params or {}).items()):
-        tag += "_" + arg_name + f"{float(val):g}".replace(".", "p").replace("-", "m")
-    key = f"{lib}::{name}{tag}"
+    # The name carries the parameters, the output rank and the launch configuration: a package
+    # bakes the launch in, and torch ops are global, so two shapes with different configurations
+    # must not share a name. When the configuration is not known (the explicit operator library has
+    # no shape), the body resolves it per call instead and it stays out of the name -- correct
+    # either way. `autotune.op_key` is shared with the tests so this cannot drift from the claim.
+    key = autotune.op_key(lib, name, params, keepdim, block, num_warps)
     if key in _TRITON_OPS:
         return _TRITON_OPS[key]
 
@@ -57,7 +60,12 @@ def as_triton_op(name: str, block: int = 1024, lib: str = "neptune",
     globals().setdefault("torch", torch)
 
     kernel = compile_skeleton(name, params)
-    op_name = f"{lib}::{name}{tag}"
+    # The registered name IS the key: one place computes it (`autotune.op_key`), so the name a graph
+    # carries and the name the op is registered under cannot drift apart. They did once -- a
+    # refactor left a stale local behind, and every registration raised NameError while the CPU
+    # tests, which stub `op_handle`, stayed green.
+    op_name = key
+    impl_name = key.split("::", 1)[1]
 
     # An explicit schema is required: this module uses `from __future__ import
     # annotations`, so the annotation is the string 'torch.Tensor' and torch's schema
@@ -67,6 +75,10 @@ def as_triton_op(name: str, block: int = 1024, lib: str = "neptune",
         # x is (rows, ncols); the generated kernel reduces the last dimension.
         rows = x.shape[0]
         ncols = x.numel() // rows
+        cfg = (block, num_warps)
+        if block is None or num_warps is None:
+            chosen = autotune.best_config(rows, ncols, x.dtype, x.device)
+            cfg = (chosen[0] if block is None else block, chosen[1] if num_warps is None else num_warps)
         # A `(rows, 1)` and a `(rows,)` result broadcast differently against the rest of a
         # model, so the rank is part of the operator, not a detail of the caller.
         shape = (rows, 1) if keepdim else (rows,)
@@ -75,16 +87,17 @@ def as_triton_op(name: str, block: int = 1024, lib: str = "neptune",
         # from a bf16 node is a dtype mismatch rather than a precision improvement. The
         # ACCUMULATION still happens in fp32 inside the kernel -- only the result is narrowed.
         out = torch.empty(shape, device=x.device, dtype=x.dtype)
-        wrap_triton(kernel)[(rows,)](x, out, rows, ncols, x.stride(0), BLOCK=block)
+        wrap_triton(kernel)[(rows,)](x, out, rows, ncols, x.stride(0), BLOCK=cfg[0],
+                                     num_warps=cfg[1])
         return out
 
-    _impl.__name__ = f"neptune_{name}{tag}"
+    _impl.__name__ = f"neptune_{impl_name}"
     _TRITON_OPS[key] = _impl
     return _impl
 
 
 def op_handle(name: str, params: dict | None = None, lib: str = "neptune",
-              keepdim: bool = False):
+              keepdim: bool = False, block: int | None = None, num_warps: int | None = None):
     """The OpOverload for a compiled skeleton, for building graph nodes.
 
     Registration tags the op with its parameter values and output rank (see `as_triton_op`),
@@ -92,7 +105,8 @@ def op_handle(name: str, params: dict | None = None, lib: str = "neptune",
     """
     import torch
 
-    impl = as_triton_op(name, params=params, lib=lib, keepdim=keepdim)
+    impl = as_triton_op(name, block=block, num_warps=num_warps, params=params, lib=lib,
+                        keepdim=keepdim)
     packet = getattr(getattr(torch.ops, lib), impl.__name__[len(lib) + 1:])
     # Return the OVERLOAD, not the packet: an FX graph carries `torch.ops.aten.amax.default`,
     # not `torch.ops.aten.amax`, and Inductor's post-grad graph rejects a packet outright

@@ -41,6 +41,8 @@ Conventions:
 | fp32 / bf16 / fp16 take the input's dtype, accumulate in fp32, and stay inside a dtype-aware bound | `experiments/gpu_m19_dtypes.py` | 134 checks, exit 0 | `exp35_dtypes.txt` |
 | end to end through AOTI, the generated kernel is in the package and the numbers are unchanged | `experiments/real_modules.py` | 1.19–1.57x on the in-frame rows | `exp33_real_modules_gpu.txt` |
 | `log_softmax` in fp32 and fp16 fuses at 1.11–1.42x, and the excluded operators are byte-identical | `experiments/gpu_m21_i4_log_softmax.py` | 37 checks, exit 0 | `exp36_i4_log_softmax_gpu.txt` |
+| the launch configuration is measured per shape, kept at the default unless it clears the noise margin, and baked into the package's op name | `experiments/gpu_m22_autotune.py` | 40 checks, exit 0; 2.74x end to end at `(1, 262144)` | `exp37_autotune_gpu.txt` |
+| the README's limits table is true, and complete in both directions | `tests/test_readme_limits.py` | 3 tests passed (9 limit rows) | — |
 
 ## Integration placement
 
@@ -54,5 +56,5 @@ Conventions:
 | decision | evidence | where it is recorded |
 |---|---|---|
 | do **not** lower `softmax` (0.59x) or `layer_norm` (0.41x) | `experiments/gpu_m20_i4_ceiling.py` | `docs/roadmap.md` §I4, and pinned by `gpu_m21` §3 |
-| do not chase split reduction without measuring it first | 0.30x at `(1, 262144)` | `docs/roadmap.md` §I6 |
+| do **not** build split reduction: its ceiling (0.0423 ms) does not beat the tuned single-program kernel (0.0411 ms), and Inductor's own is 0.0275 ms | `experiments/gpu_m22_autotune.py` §4 | `docs/roadmap.md` §I6 |
 | attention-chain fusion and multi-GPU are architectural non-goals | architecture, not algebra | `docs/roadmap.md`, README |

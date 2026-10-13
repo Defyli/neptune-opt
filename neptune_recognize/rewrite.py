@@ -31,6 +31,28 @@ def _wants_keepdim(node):
     return len(shape) >= 2
 
 
+def _launch_config(node) -> tuple:
+    """`(BLOCK, num_warps)` measured for this region's shape, or `(None, None)` if unknown.
+
+    Read from the value metadata the tracer left on the input node. `(None, None)` is not a
+    failure: the generated op then resolves the configuration from the tensor at call time, which
+    is what the explicit operator library does.
+    """
+    value = node.meta.get("val") if node is not None else None
+    shape = getattr(value, "shape", None)
+    if shape is None or len(shape) == 0:
+        return None, None
+    try:
+        ncols = int(shape[-1])
+        rows = 1
+        for d in shape[:-1]:
+            rows *= int(d)
+    except Exception:  # noqa: BLE001 -- a symbolic shape: let the op resolve it at call time
+        return None, None
+    block, warps = CG.autotune.best_config(rows, ncols, getattr(value, "dtype", None))
+    return block, warps
+
+
 def _locate(gm, values=None):
     """(match, root, keepdim, reason). `reason` is set exactly when the region cannot be replaced.
 
@@ -81,7 +103,9 @@ def rewrite(gm, values=None, ops=None, lib="neptune"):
         return gm, None, reason
 
     graph = gm.graph
-    op = CG.op_handle(match.skeleton, params=match.params or None, lib=lib, keepdim=keepdim)
+    block, num_warps = _launch_config(match.input_node)
+    op = CG.op_handle(match.skeleton, params=match.params or None, lib=lib, keepdim=keepdim,
+                      block=block, num_warps=num_warps)
     with graph.inserting_before(root):
         call = graph.call_function(op, args=(match.input_node,))
     root.replace_all_uses_with(call)

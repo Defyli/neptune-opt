@@ -70,7 +70,11 @@ def as_triton_op(name: str, block: int = 1024, lib: str = "neptune",
         # A `(rows, 1)` and a `(rows,)` result broadcast differently against the rest of a
         # model, so the rank is part of the operator, not a detail of the caller.
         shape = (rows, 1) if keepdim else (rows,)
-        out = torch.empty(shape, device=x.device, dtype=torch.float32)
+        # The result takes the INPUT's dtype, which is what torch's own reductions do
+        # (`torch.logsumexp(bf16)` is bf16): the graph downstream is typed, and returning fp32
+        # from a bf16 node is a dtype mismatch rather than a precision improvement. The
+        # ACCUMULATION still happens in fp32 inside the kernel -- only the result is narrowed.
+        out = torch.empty(shape, device=x.device, dtype=x.dtype)
         wrap_triton(kernel)[(rows,)](x, out, rows, ncols, x.stride(0), BLOCK=block)
         return out
 

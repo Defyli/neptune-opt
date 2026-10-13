@@ -1,0 +1,188 @@
+# Raw GPU log for iteration I3: experiments/gpu_m19_dtypes.py
+# RTX 5090 D v2, torch 2.11.0+cu128, triton 3.6.0
+# produced by: python experiments/gpu_m19_dtypes.py   (exit 0)
+# REDACTED: 0 line(s) carrying an absolute path or host name.
+
+ITERATION I3 -- fp32 / bf16 / fp16
+torch 2.11.0+cu128  NVIDIA GeForce RTX 5090 D v2
+====================================================================================================
+
+--- the result takes the input's dtype
+  [PASS] decay_renorm/torch.float32/output dtype  -- got float32
+  [PASS] decay_renorm/torch.float32/not widened
+  [PASS] decay_renorm/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] decay_renorm/torch.bfloat16/not widened
+  [PASS] decay_renorm/torch.float16/output dtype  -- got float16
+  [PASS] decay_renorm/torch.float16/not widened
+  [PASS] linear_attn/torch.float32/output dtype  -- got float32
+  [PASS] linear_attn/torch.float32/not widened
+  [PASS] linear_attn/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] linear_attn/torch.bfloat16/not widened
+  [PASS] linear_attn/torch.float16/output dtype  -- got float16
+  [PASS] linear_attn/torch.float16/not widened
+  [PASS] logsumexp/torch.float32/output dtype  -- got float32
+  [PASS] logsumexp/torch.float32/not widened
+  [PASS] logsumexp/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] logsumexp/torch.bfloat16/not widened
+  [PASS] logsumexp/torch.float16/output dtype  -- got float16
+  [PASS] logsumexp/torch.float16/not widened
+  [PASS] lse_biased/torch.float32/output dtype  -- got float32
+  [PASS] lse_biased/torch.float32/not widened
+  [PASS] lse_biased/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] lse_biased/torch.bfloat16/not widened
+  [PASS] lse_biased/torch.float16/output dtype  -- got float16
+  [PASS] lse_biased/torch.float16/not widened
+  [PASS] lse_scaled/torch.float32/output dtype  -- got float32
+  [PASS] lse_scaled/torch.float32/not widened
+  [PASS] lse_scaled/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] lse_scaled/torch.bfloat16/not widened
+  [PASS] lse_scaled/torch.float16/output dtype  -- got float16
+  [PASS] lse_scaled/torch.float16/not widened
+  [PASS] rmsnorm_max/torch.float32/output dtype  -- got float32
+  [PASS] rmsnorm_max/torch.float32/not widened
+  [PASS] rmsnorm_max/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] rmsnorm_max/torch.bfloat16/not widened
+  [PASS] rmsnorm_max/torch.float16/output dtype  -- got float16
+  [PASS] rmsnorm_max/torch.float16/not widened
+  [PASS] softcap_lse/torch.float32/output dtype  -- got float32
+  [PASS] softcap_lse/torch.float32/not widened
+  [PASS] softcap_lse/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] softcap_lse/torch.bfloat16/not widened
+  [PASS] softcap_lse/torch.float16/output dtype  -- got float16
+  [PASS] softcap_lse/torch.float16/not widened
+  [PASS] stable_l2/torch.float32/output dtype  -- got float32
+  [PASS] stable_l2/torch.float32/not widened
+  [PASS] stable_l2/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] stable_l2/torch.bfloat16/not widened
+  [PASS] stable_l2/torch.float16/output dtype  -- got float16
+  [PASS] stable_l2/torch.float16/not widened
+  [PASS] std/torch.float32/output dtype  -- got float32
+  [PASS] std/torch.float32/not widened
+  [PASS] std/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] std/torch.bfloat16/not widened
+  [PASS] std/torch.float16/output dtype  -- got float16
+  [PASS] std/torch.float16/not widened
+  [PASS] sumsq_div/torch.float32/output dtype  -- got float32
+  [PASS] sumsq_div/torch.float32/not widened
+  [PASS] sumsq_div/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] sumsq_div/torch.bfloat16/not widened
+  [PASS] sumsq_div/torch.float16/output dtype  -- got float16
+  [PASS] sumsq_div/torch.float16/not widened
+  [PASS] variance/torch.float32/output dtype  -- got float32
+  [PASS] variance/torch.float32/not widened
+  [PASS] variance/torch.bfloat16/output dtype  -- got bfloat16
+  [PASS] variance/torch.bfloat16/not widened
+  [PASS] variance/torch.float16/output dtype  -- got float16
+  [PASS] variance/torch.float16/not widened
+
+--- CG.run: every skeleton, every dtype
+    skeleton       dtype             shape     relerr      bound
+    decay_renorm   float32      (64, 1024)   1.76e-07   3.10e-05
+  [PASS] decay_renorm/torch.float32/numerics  -- worst 1.76e-07 at (64, 1024) (bound 3.10e-05)
+    decay_renorm   bfloat16      (8, 4096)   2.84e-03   3.13e-02
+  [PASS] decay_renorm/torch.bfloat16/numerics  -- worst 2.84e-03 at (8, 4096) (bound 3.13e-02)
+    decay_renorm   float16      (64, 1024)   3.92e-04   3.94e-03
+  [PASS] decay_renorm/torch.float16/numerics  -- worst 3.92e-04 at (64, 1024) (bound 3.94e-03)
+    linear_attn    float32       (8, 4096)   1.79e-07   6.15e-05
+  [PASS] linear_attn/torch.float32/numerics  -- worst 1.79e-07 at (8, 4096) (bound 6.15e-05)
+    linear_attn    bfloat16     (64, 1024)   3.04e-03   3.13e-02
+  [PASS] linear_attn/torch.bfloat16/numerics  -- worst 3.04e-03 at (64, 1024) (bound 3.13e-02)
+    linear_attn    float16      (64, 1024)   4.05e-04   3.94e-03
+  [PASS] linear_attn/torch.float16/numerics  -- worst 4.05e-04 at (64, 1024) (bound 3.94e-03)
+    logsumexp      float32      (64, 1024)   7.98e-08   3.10e-05
+  [PASS] logsumexp/torch.float32/numerics  -- worst 7.98e-08 at (64, 1024) (bound 3.10e-05)
+    logsumexp      bfloat16     (64, 1024)   2.61e-03   3.13e-02
+  [PASS] logsumexp/torch.bfloat16/numerics  -- worst 2.61e-03 at (64, 1024) (bound 3.13e-02)
+    logsumexp      float16      (64, 1024)   3.21e-04   3.94e-03
+  [PASS] logsumexp/torch.float16/numerics  -- worst 3.21e-04 at (64, 1024) (bound 3.94e-03)
+    lse_biased     float32        (4, 999)   7.40e-08   3.06e-05
+  [PASS] lse_biased/torch.float32/numerics  -- worst 7.40e-08 at (4, 999) (bound 3.06e-05)
+    lse_biased     bfloat16     (64, 1024)   2.23e-03   3.13e-02
+  [PASS] lse_biased/torch.bfloat16/numerics  -- worst 2.23e-03 at (64, 1024) (bound 3.13e-02)
+    lse_biased     float16      (64, 1024)   3.08e-04   3.94e-03
+  [PASS] lse_biased/torch.float16/numerics  -- worst 3.08e-04 at (64, 1024) (bound 3.94e-03)
+    lse_scaled     float32      (64, 1024)   1.13e-07   3.10e-05
+  [PASS] lse_scaled/torch.float32/numerics  -- worst 1.13e-07 at (64, 1024) (bound 3.10e-05)
+    lse_scaled     bfloat16     (64, 1024)   3.66e-03   3.13e-02
+  [PASS] lse_scaled/torch.bfloat16/numerics  -- worst 3.66e-03 at (64, 1024) (bound 3.13e-02)
+    lse_scaled     float16      (64, 1024)   4.48e-04   3.94e-03
+  [PASS] lse_scaled/torch.float16/numerics  -- worst 4.48e-04 at (64, 1024) (bound 3.94e-03)
+    rmsnorm_max    float32      (64, 1024)   2.88e-07   3.10e-05
+  [PASS] rmsnorm_max/torch.float32/numerics  -- worst 2.88e-07 at (64, 1024) (bound 3.10e-05)
+    rmsnorm_max    bfloat16     (64, 1024)   2.85e-03   3.13e-02
+  [PASS] rmsnorm_max/torch.bfloat16/numerics  -- worst 2.85e-03 at (64, 1024) (bound 3.13e-02)
+    rmsnorm_max    float16       (8, 4096)   4.48e-04   3.97e-03
+  [PASS] rmsnorm_max/torch.float16/numerics  -- worst 4.48e-04 at (8, 4096) (bound 3.97e-03)
+    softcap_lse    float32       (8, 4096)   1.08e-07   6.15e-05
+  [PASS] softcap_lse/torch.float32/numerics  -- worst 1.08e-07 at (8, 4096) (bound 6.15e-05)
+    softcap_lse    bfloat16      (8, 4096)   3.32e-03   3.13e-02
+  [PASS] softcap_lse/torch.bfloat16/numerics  -- worst 3.32e-03 at (8, 4096) (bound 3.13e-02)
+    softcap_lse    float16       (8, 4096)   4.14e-04   3.97e-03
+  [PASS] softcap_lse/torch.float16/numerics  -- worst 4.14e-04 at (8, 4096) (bound 3.97e-03)
+    stable_l2      float32        (4, 999)   1.57e-07   3.06e-05
+  [PASS] stable_l2/torch.float32/numerics  -- worst 1.57e-07 at (4, 999) (bound 3.06e-05)
+    stable_l2      bfloat16     (64, 1024)   2.42e-03   3.13e-02
+  [PASS] stable_l2/torch.bfloat16/numerics  -- worst 2.42e-03 at (64, 1024) (bound 3.13e-02)
+    stable_l2      float16      (64, 1024)   3.11e-04   3.94e-03
+  [PASS] stable_l2/torch.float16/numerics  -- worst 3.11e-04 at (64, 1024) (bound 3.94e-03)
+    std            float32      (64, 1024)   1.62e-07   3.10e-05
+  [PASS] std/torch.float32/numerics  -- worst 1.62e-07 at (64, 1024) (bound 3.10e-05)
+    std            bfloat16       (4, 999)   2.65e-03   3.13e-02
+  [PASS] std/torch.bfloat16/numerics  -- worst 2.65e-03 at (4, 999) (bound 3.13e-02)
+    std            float16      (64, 1024)   3.18e-04   3.94e-03
+  [PASS] std/torch.float16/numerics  -- worst 3.18e-04 at (64, 1024) (bound 3.94e-03)
+    sumsq_div      float32      (64, 1024)   1.51e-07   3.10e-05
+  [PASS] sumsq_div/torch.float32/numerics  -- worst 1.51e-07 at (64, 1024) (bound 3.10e-05)
+    sumsq_div      bfloat16     (64, 1024)   3.61e-03   3.13e-02
+  [PASS] sumsq_div/torch.bfloat16/numerics  -- worst 3.61e-03 at (64, 1024) (bound 3.13e-02)
+    sumsq_div      float16      (64, 1024)   4.63e-04   3.94e-03
+  [PASS] sumsq_div/torch.float16/numerics  -- worst 4.63e-04 at (64, 1024) (bound 3.94e-03)
+    variance       float32      (64, 1024)   2.92e-07   3.10e-05
+  [PASS] variance/torch.float32/numerics  -- worst 2.92e-07 at (64, 1024) (bound 3.10e-05)
+    variance       bfloat16     (64, 1024)   3.45e-03   3.13e-02
+  [PASS] variance/torch.bfloat16/numerics  -- worst 3.45e-03 at (64, 1024) (bound 3.13e-02)
+    variance       float16      (64, 1024)   4.55e-04   3.94e-03
+  [PASS] variance/torch.float16/numerics  -- worst 4.55e-04 at (64, 1024) (bound 3.94e-03)
+
+--- the registered torch op (the AOTI path)
+  [PASS] decay_renorm/torch.float32/op  -- dtype=float32 rel=1.95e-06
+  [PASS] decay_renorm/torch.bfloat16/op  -- dtype=bfloat16 rel=3.55e-03
+  [PASS] decay_renorm/torch.float16/op  -- dtype=float16 rel=4.35e-04
+  [PASS] linear_attn/torch.float32/op  -- dtype=float32 rel=6.62e-06
+  [PASS] linear_attn/torch.bfloat16/op  -- dtype=bfloat16 rel=3.39e-03
+  [PASS] linear_attn/torch.float16/op  -- dtype=float16 rel=3.73e-04
+  [PASS] logsumexp/torch.float32/op  -- dtype=float32 rel=0.00e+00
+  [PASS] logsumexp/torch.bfloat16/op  -- dtype=bfloat16 rel=3.40e-03
+  [PASS] logsumexp/torch.float16/op  -- dtype=float16 rel=4.28e-04
+  [PASS] lse_biased/torch.float32/op  -- dtype=float32 rel=0.00e+00
+  [PASS] lse_biased/torch.bfloat16/op  -- dtype=bfloat16 rel=3.38e-03
+  [PASS] lse_biased/torch.float16/op  -- dtype=float16 rel=4.26e-04
+  [PASS] lse_scaled/torch.float32/op  -- dtype=float32 rel=0.00e+00
+  [PASS] lse_scaled/torch.bfloat16/op  -- dtype=bfloat16 rel=1.50e-03
+  [PASS] lse_scaled/torch.float16/op  -- dtype=float16 rel=2.40e-04
+  [PASS] rmsnorm_max/torch.float32/op  -- dtype=float32 rel=2.04e-07
+  [PASS] rmsnorm_max/torch.bfloat16/op  -- dtype=bfloat16 rel=3.24e-03
+  [PASS] rmsnorm_max/torch.float16/op  -- dtype=float16 rel=3.35e-04
+  [PASS] softcap_lse/torch.float32/op  -- dtype=float32 rel=6.10e-08
+  [PASS] softcap_lse/torch.bfloat16/op  -- dtype=bfloat16 rel=2.00e-03
+  [PASS] softcap_lse/torch.float16/op  -- dtype=float16 rel=2.30e-04
+  [PASS] stable_l2/torch.float32/op  -- dtype=float32 rel=1.72e-07
+  [PASS] stable_l2/torch.bfloat16/op  -- dtype=bfloat16 rel=2.38e-03
+  [PASS] stable_l2/torch.float16/op  -- dtype=float16 rel=3.32e-04
+  [PASS] std/torch.float32/op  -- dtype=float32 rel=1.18e-07
+  [PASS] std/torch.bfloat16/op  -- dtype=bfloat16 rel=3.78e-03
+  [PASS] std/torch.float16/op  -- dtype=float16 rel=4.59e-04
+  [PASS] sumsq_div/torch.float32/op  -- dtype=float32 rel=1.17e-07
+  [PASS] sumsq_div/torch.bfloat16/op  -- dtype=bfloat16 rel=3.49e-03
+  [PASS] sumsq_div/torch.float16/op  -- dtype=float16 rel=3.32e-04
+  [PASS] variance/torch.float32/op  -- dtype=float32 rel=2.35e-07
+  [PASS] variance/torch.bfloat16/op  -- dtype=bfloat16 rel=3.58e-03
+  [PASS] variance/torch.float16/op  -- dtype=float16 rel=4.23e-04
+
+--- a value bf16 cannot represent
+  [PASS] float16/1+2^-9 kept  -- input rounds to 1.001953
+  [PASS] bfloat16/1+2^-9 lost  -- input rounds to 1.000000
+
+====================================================================================================
+TOTAL: 134 passed, 0 failed, 134 checks
+====================================================================================================

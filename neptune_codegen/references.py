@@ -15,6 +15,45 @@ import sympy as sp
 from neptune_codegen.skeleton import SKELETONS, param_defaults
 
 
+def rel_tolerance(dtype, ulps: float = 4.0) -> float:
+    """A relative tolerance appropriate to `dtype`.
+
+    Comparing a `bf16` kernel against an `fp32` reference with an `fp32` bound fails for the
+    right answer: bf16 carries ~8 mantissa bits, so a relative error near 2**-8 is the FORMAT,
+    not a bug. The tolerances are a few ulps of the dtype, which is tight enough to catch a
+    wrong formula (those are off by O(1)) and loose enough not to fail on rounding.
+
+    Verified in `experiments/gpu_m19_dtypes.py`, which reports the measured error per dtype so
+    the bound can be seen to hold rather than assumed.
+    """
+    import torch
+
+    return ulps * float(torch.finfo(dtype).eps)
+
+
+def summation_tolerance(dtype, n, ulps: float = 4.0) -> float:
+    """A relative tolerance for a SUM of `n` terms whose result is stored as `dtype`.
+
+    Two effects, and only the first is what `rel_tolerance` covers:
+
+      * the result is narrowed to `dtype`, costing up to `ulps` of ITS eps;
+      * the sum itself is accumulated in fp32 over `n` terms, and a different summation order
+        (the kernel reduces per block, torch reduces its own way) costs roughly `eps_f32 * sqrt(n)`
+        for a random walk -- measured to matter: `linear_attn` over 2048 terms showed 6.2e-6, which
+        is 13 ulps of fp32 and completely correct.
+
+    The sqrt(n) growth is the standard random-walk model for accumulated rounding, not a fitted
+    constant; the measured errors sit an order of magnitude inside it (see
+    `experiments/gpu_m19_dtypes.py`, which prints both).
+    """
+    import torch
+
+    n = max(int(n), 1)
+    own = ulps * float(torch.finfo(dtype).eps)
+    acc = 2 * ulps * float(torch.finfo(torch.float32).eps) * (n ** 0.5)
+    return own + acc
+
+
 def reference(name: str, x, **params):
     """Row-wise torch reference (the mathematically exact result)."""
     import torch

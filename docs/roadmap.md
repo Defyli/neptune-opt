@@ -81,18 +81,32 @@ regression and `main` is that I remember to run the suites.
 *Risk*: low, mostly mechanics. *Exit criterion*: CI green on a push that breaks a test (verified by
 deliberately breaking one).
 
-### I3 — dtypes: bf16 and fp16
+### I3 — dtypes: bf16 and fp16  ✅ done
 
-*Deliverable*: the kernel loads the input in its own dtype, accumulates in fp32, and writes the
-output in the input dtype; the generated op's schema and the AOTI graph agree. References and
-tolerances per dtype.
+`experiments/gpu_m19_dtypes.py`: **134 checks, 0 failed** (see
+[evidence/exp35_dtypes.txt](evidence/exp35_dtypes.txt)). Every skeleton returns the INPUT's dtype
+and is numerically right in all three; measured worst relative error vs the bound:
 
-*Why*: real inference runs in bf16. fp32-only makes it unusable on the models it targets. Today
-the dtype is hardcoded in three places (`template.py` load cast, `template.run`, `torch_op`).
+| dtype | worst measured | bound | what dominates |
+|---|---|---|---|
+| fp32 | 2.9e-07 | 3.1e-05 | summation order over the row |
+| bf16 | 3.7e-03 | 3.1e-02 | bf16's eps/2 = 3.9e-03 |
+| fp16 | 4.6e-04 | 3.9e-03 | fp16's eps/2 = 4.9e-04 |
 
-*Risk*: medium — accumulation precision and the reference tolerances both need care, and the
-existing 27 CPU tests assume fp32. *Exit criterion*: GPU suite green for fp32/bf16/fp16 on every
-in-frame skeleton, with the per-dtype worst relative error reported.
+A control pins that the dtype is not decoration: `1 + 2**-9` is kept by fp16 and rounded away by
+bf16, so a kernel that secretly up-cast would be caught.
+
+Two corrections along the way, both worth keeping: the OUTPUT was allocated fp32 regardless of
+the input (a dtype mismatch for the graph, not a precision question), and the tolerance must
+scale with the reduction LENGTH -- `linear_attn` over 2048 terms showed 6.2e-6, which is 13 ulps
+of fp32 and entirely correct, so `summation_tolerance` adds `eps_f32*sqrt(n)`. And an early
+version of the control asserted fp16 could represent `1 + 2**-12`; it cannot (fp16 has 11 mantissa
+bits, not 23). The test was wrong, not the kernel -- the third time in this project that a
+reference/expectation written from a misreading had to be corrected.
+
+The accumulation still happens in fp32 whatever the input dtype, and that is pinned by a CPU test
+(`test_accumulation_stays_fp32_whatever_the_input_dtype`) because accumulating in bf16 is a
+plausible "optimisation" that would lose catastrophic precision on long rows.
 
 ### I4 — reach: expose the reductions that are hidden inside compound ops
 

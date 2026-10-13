@@ -64,6 +64,7 @@ are in [docs/evidence/](docs/evidence/).
 | registered skeletons recognised from a graph | **11 / 11**, with no per-operator pattern rows |
 | scalar parameters inferred from the graph | yes (`beta`, `alpha`, `N`, `eps`, …) |
 | dynamic shapes | supported; one kernel serves every width |
+| dtypes | **fp32, bf16, fp16** — the result takes the input's dtype, accumulation stays fp32 |
 | generated kernel present in the `.pt2` | verified (41 kernel occurrences, `cubins ≥ 1`) |
 | `torch.compile` backend | **does not work** — gated behind `experimental=True` |
 | real `torch.nn` modules | fuse **only after `ep.run_decompositions()`** — see below |
@@ -183,7 +184,8 @@ algebra, same code generation — you choose the operator instead of the compile
   Not implemented.
 * **Verified on one stack:** torch 2.11.0+cu128 with Triton 3.6.0 on an RTX 5090, plus torch 2.14.1
   on CPU. The `triton_op` API differs between releases, so portability across versions is untested.
-* **fp32 inference only.** No gradients, and `BLOCK` is not autotuned.
+* **Inference only.** No gradients. `BLOCK` is not autotuned yet (see the roadmap), and the
+  dtypes supported are fp32 / bf16 / fp16 -- other types (fp8, int) are not.
 
 ## Repository layout
 
@@ -226,6 +228,7 @@ python experiments/gpu_m16_affine.py          # the affine repair, compiled and 
 python experiments/gpu_m17_two_pass.py        # the two-pass plan, correctness and speed
 python experiments/real_modules.py            # what real torch.nn modules do, and why they don't
 python experiments/gpu_m18_dynamic_shapes.py  # symbolic row length, every in-frame skeleton
+python experiments/gpu_m19_dtypes.py          # fp32 / bf16 / fp16, every skeleton
 python experiments/gpu_m15_integration.py     # the .pt2 evidence, end to end
 ```
 

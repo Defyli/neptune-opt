@@ -695,6 +695,41 @@ def test_intrinsics_under_a_root_are_read_as_floats():
     assert "(1.0 / (ncols))" in CG.emit_kernel_source(CG.SKELETONS["rmsnorm_max"], {"eps": 1e-6})
 
 
+def test_accumulation_stays_fp32_whatever_the_input_dtype():
+    """The dtype support narrows the RESULT; the ACCUMULATION must stay fp32.
+
+    Accumulating in bf16 would be a plausible "optimisation" -- half the register pressure -- and
+    it would lose precision catastrophically on long rows, because summing thousands of bf16
+    values has an effective precision far below even bf16. The emitted source must cast at the
+    load, for every skeleton, and that is checkable without a GPU.
+    """
+    import neptune_codegen as CG
+
+    for name in CG.supported():
+        src = CG.emit_kernel_source(CG.SKELETONS[name], CG.param_defaults(name))
+        assert ".to(tl.float32)" in src, f"{name}: the load must cast to fp32"
+        # nothing may narrow the VALUE before or during the accumulation
+        assert ".to(tl.bfloat16)" not in src, f"{name}: narrows the value before accumulating"
+        assert ".to(tl.float16)" not in src, f"{name}: narrows the value before accumulating"
+
+
+def test_dtype_tolerances_are_ordered_and_justified():
+    """A bf16 result cannot be judged by an fp32 bound -- that is the whole point.
+
+    The bounds are a few ulps of the dtype, so they must be ordered bf16 > fp16 > fp32, and the
+    bf16 one must be large enough to accept a correct bf16 result (its eps is 2**-8).
+    """
+    import torch
+    from neptune_codegen.references import rel_tolerance
+
+    t32, tbf, t16 = (rel_tolerance(d) for d in
+                     (torch.float32, torch.bfloat16, torch.float16))
+    assert t32 < t16 < tbf, (t32, t16, tbf)
+    assert tbf >= float(torch.finfo(torch.bfloat16).eps), tbf
+    # ...and still tight enough to catch a wrong formula, which is off by O(1).
+    assert tbf < 0.1, tbf
+
+
 def main() -> int:
     tests = [(n, o) for n, o in sorted(globals().items()) if n.startswith("test_")]
     failed = 0

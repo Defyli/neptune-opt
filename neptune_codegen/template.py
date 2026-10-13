@@ -192,6 +192,8 @@ def run(name: str, x, block: int = 1024, **params):
     rows = x.shape[0]
     ncols = x.numel() // rows
     x2 = x.reshape(rows, ncols).contiguous()
-    out = torch.empty(rows, device=x.device, dtype=torch.float32)
+    # The input's dtype, matching `as_triton_op` -- `run` exists so tests and experiments can
+    # launch the kernel directly, and it must not quietly differ from the op that ships.
+    out = torch.empty(rows, device=x.device, dtype=x.dtype)
     kernel[(rows,)](x2, out, rows, ncols, x2.stride(0), BLOCK=block)
     return out

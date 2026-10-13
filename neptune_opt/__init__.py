@@ -225,11 +225,16 @@ def apply(exported_program, values: dict | None = None,
     refusal looks like this case, the report says so rather than leaving the user to guess.
     """
     report = _rewrite_graph(exported_program.graph_module, values)[1]
-    if not report.fusions:
-        # Retry on a decomposed COPY, purely to diagnose: if it WOULD match there, say so.
-        # Always attempted, rather than gated on a guess about whether the graph "looks
-        # decomposed": a guess is wrong in both directions (measured: `aten.logsumexp.default`
-        # is an aten op and is still a compound op), and this is the failure path anyway.
+    if not report.fusions and _recognize(exported_program.graph_module, values)[0] is None:
+        # The given graph was not recognised AT ALL, so try a decomposed copy purely to
+        # diagnose: if it matches there, the graph was simply not decomposed yet, and saying so
+        # is far more useful than "no match".
+        #
+        # Both halves of that condition matter. Firing on "no fusions" alone was wrong: a graph
+        # that WAS recognised but could not be generated (no Triton installed, say) has no
+        # fusions either, and the report then claimed it "needs decomposition" while the very
+        # next line said it had already recognised the operator. Measured on the dynamic-shape
+        # cases, where every report carried both lines at once.
         try:
             dec = exported_program.run_decompositions()
             m, _why = _recognize(dec.graph_module, values)

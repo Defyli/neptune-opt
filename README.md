@@ -164,10 +164,20 @@ algebra, same code generation — you choose the operator instead of the compile
   before, so `sum(dim=0)` would have been silently reinterpreted as a row reduction.
 * **The operator's tail must match the declared `finalize`.** An algebraically equivalent but
   textually different readout will not match. Declared constants are inferred, so those are fine.
-* **Not reachable by the algebra:** `NEEDS_STATE` families (variance / Welford / LayerNorm — 6 of
-  28) need state carried across iterations; a `mul` consumer needs a carried count; a runtime-variable
-  exponent is refused because the only safe lowering is `exp(log(x)·p)` and that is nan for negative
-  `x`.
+* **Out of frame structurally:** an operator with a single reduction and elementwise work around
+  it — `nn.RMSNorm`, `nn.LayerNorm`, softmax's normalisation — cannot be served by more algebra,
+  because the frame fuses two *dependent reductions* (see above).
+* **Refused, with reasons:** a `mul` consumer (`prod + ratio`) needs a carried count; a
+  runtime-variable exponent is refused because the only safe lowering is `exp(log(x)·p)` and that
+  is nan for negative `x`; `x.var(-1)` is refused because its default is the `/(N-1)` form while
+  the kernel computes `/(N)`.
+* **A decomposition pass may be required.** Real modules export as one high-level aten op, so
+  `apply` on a freshly exported program will refuse and say so; `export(..., decompose=True)` (the
+  default) handles it. `aten._softmax` / `aten.native_layer_norm` are not decomposed by the core
+  table at all, so those modules are still out of reach.
+* **The LSE *inside* softmax is not extracted.** `nn.Softmax`/`nn.LogSoftmax` would need a graph
+  expansion that materialises the log-sum-exp as a node before the region gate can replace it.
+  Not implemented.
 * **Verified on one stack:** torch 2.11.0+cu128 with Triton 3.6.0 on an RTX 5090, plus torch 2.14.1
   on CPU. The `triton_op` API differs between releases, so portability across versions is untested.
 * **fp32 inference only.** No gradients, and `BLOCK` is not autotuned.

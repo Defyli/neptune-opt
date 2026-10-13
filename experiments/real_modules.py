@@ -22,6 +22,7 @@ On CPU it still runs the recognition half and skips the timing.
 """
 from __future__ import annotations
 
+import copy
 import os
 import statistics
 import sys
@@ -42,6 +43,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
 import neptune_codegen as CG  # noqa: E402
 import neptune_recognize as NR  # noqa: E402
 import neptune_opt as NO  # noqa: E402
+from neptune_recognize.lowering import lower_compound  # noqa: E402
 
 X = torch.randn(64, 4096)
 # Timing input: large enough that the kernels, not the launch, dominate the measurement.
@@ -80,7 +82,7 @@ CASES = [
     ("nn.RMSNorm", lambda t: nn.RMSNorm(t.shape[-1])(t), False),
     ("F.layer_norm", lambda t: F.layer_norm(t, (t.shape[-1],)), False),
     ("nn.Softmax", lambda t: nn.Softmax(dim=-1)(t), False),
-    ("nn.LogSoftmax", lambda t: nn.LogSoftmax(dim=-1)(t), False),
+    ("nn.LogSoftmax", lambda t: nn.LogSoftmax(dim=-1)(t), True),   # in frame via I4's lowering
     ("F.cross_entropy", None, False),          # filled in below (needs targets)
     ("torch.logsumexp", lambda t: torch.logsumexp(t, dim=-1), True),
     ("log_softmax by hand", _log_softmax_by_hand, True),
@@ -99,9 +101,10 @@ class M(nn.Module):
         return self.fn(t)
 
 
-def _verdict(ep):
-    """(skeleton | None, reason) for one exported program."""
-    match, reason = NR.recognize(ep.graph_module)
+def _verdict(obj):
+    """(skeleton | None, reason) for an ExportedProgram OR a bare GraphModule."""
+    gm = getattr(obj, "graph_module", obj)
+    match, reason = NR.recognize(gm)
     return (match.skeleton if match else None), reason
 
 
@@ -122,13 +125,27 @@ def test_recognition() -> list:
             print(f"    {label:24s} EXPORT FAILED: {type(e).__name__}: {str(e)[:48]}")
             continue
         raw_sk, raw_why = _verdict(ep)
+        lowered = ""
         try:
             dep = ep.run_decompositions()
             dep_sk, dep_why = _verdict(dep)
         except Exception as e:  # noqa: BLE001
-            dep_sk, dep_why = None, f"run_decompositions failed: {type(e).__name__}"
+            dep, dep_sk, dep_why = None, None, f"run_decompositions failed: {type(e).__name__}"
+        if dep_sk is None and dep is not None:
+            # The core decompositions leave some operators WHOLE (`_log_softmax`: no table entry
+            # for the overload export produces). The lowering pass expands those, so the honest
+            # question is what the graph looks like AFTER it -- not what the decompositions alone
+            # can see. This is the column I4 changed.
+            probe = copy.deepcopy(dep.graph_module)
+            try:
+                if lower_compound(probe):
+                    got = _verdict(probe)[0]
+                    if got:
+                        dep_sk, lowered = got, " (lowered)"
+            except Exception:  # noqa: BLE001 -- a failed trial must not end the table
+                pass
         raw = raw_sk or _short(raw_why)
-        dec = dep_sk or _short(dep_why)
+        dec = (dep_sk + lowered) if dep_sk else _short(dep_why)
         print(f"    {label:24s} {raw:28s} {dec:34s}")
         if dep_sk:
             fusable.append((label, dep_sk, fn))

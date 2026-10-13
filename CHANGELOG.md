@@ -18,6 +18,11 @@ push.
   fp32, and the tolerances are dtype-aware and reduction-length-aware (`gpu_m19_dtypes.py`).
 * Recognition reaches real modules at all: they must be decomposed first, which is now the default
   in `export` and is diagnosed by name when missing (`real_modules.py`).
+* **`log_softmax` is reachable now, in both directions.** The core decomposition table has no
+  entry for the overload `torch.export` produces, so the log-sum-exp inside it is invisible without
+  the lowering pass; with it, `torch.log_softmax` / `F.log_softmax` / `nn.LogSoftmax` fuse at
+  **1.11–1.42x** in fp32 and fp16, with the generated kernel 41 times in the fused `.pt2` and 0
+  times in the baseline (`gpu_m21`, 37 checks, exit 0).
 * End-to-end, on real modules, both sides AOTI-packaged and loaded: **1.19–1.57x** for
   `torch.logsumexp`, `logsumexp(t/8)`, `rmsnorm_max`, `stable_l2` and a hand-written
   `log_softmax`. At small rows the same comparison is 0.9–1.05x, which is recorded rather than
@@ -25,6 +30,13 @@ push.
 
 ### Added
 
+* A **lowering pass** (`neptune_recognize/lowering.py`, on by default in `apply`) that expands
+  `log_softmax` into `x - logsumexp(x, keepdim=True)` so the region gate has a node to replace. It
+  is committed **only** when it enables a rewrite, and `lower=False` is the control. `softmax`,
+  `layer_norm` and a reduction over a non-last dim come out byte-identical, because the ceiling
+  experiment measured them at 0.59x and 0.41x against Inductor's dedicated lowerings.
+* `neptune_recognize.would_rewrite`: whether a rewrite is possible, decided without generating a
+  kernel, so the question can be asked on a CPU machine and inside the lowering's trial.
 * A **two-pass plan** for operators that have no repair, because their term reads the *final*
   producer (variance, standard deviation). Coverage 20 → 26 of 28 families.
 * **Affine repairs**: when the ratio keeps the data but a shift absorbs it, `h(t) = a*t + b`, with
@@ -39,6 +51,13 @@ push.
 
 ### Fixed
 
+* The lowering's first version inserted nodes with **no shape metadata**, so every rewrite was
+  refused with *"the operator's output rank is unknown"* — the recogniser needs to know whether the
+  operator keeps the reduced dimension. The metadata now comes from running the same expansion on
+  the input's fake tensor (one spec, two interpreters), so the shapes are torch's own.
+* The lowering's commit gate asked whether the graph was *recognised*, not whether it was
+  *rewritable*. Recognition can succeed on a region the rewrite then refuses, so the pass committed
+  expansions that fused nothing — strictly more kernels than the operator it replaced.
 * The output was allocated fp32 regardless of the input dtype — a graph-level dtype mismatch for
   any bf16 model.
 * `std` did not compile at all: sympy stores `sqrt(acc/N)` as `sqrt(acc)/sqrt(N)`, putting an
@@ -55,6 +74,10 @@ push.
 
 ### Documented
 
+* A limit found while verifying I4, pinned as a test expectation rather than left as a surprise:
+  fp16 `torch.logsumexp` (hand-written) decomposes with an explicit fp32 upcast
+  (`aten._to_copy`) and is refused rather than matched through. The documented spellings —
+  `torch.log_softmax` / `F.log_softmax` / `nn.LogSoftmax`, fp32 and fp16 — are unaffected.
 * What the frame **cannot** do, with the reason: operators with a single reduction and elementwise
   work around it (RMSNorm, LayerNorm, softmax's normalisation) are outside it structurally, not for
   want of algebra.

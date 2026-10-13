@@ -200,7 +200,7 @@ def _rewrite_graph(gm: torch.fx.GraphModule, values: dict | None = None) -> tupl
 
 
 def apply(exported_program, values: dict | None = None,
-          verify_with: tuple | None = None) -> Report:
+          verify_with: tuple | None = None, lower: bool = True) -> Report:
     """Rewrite a recognised operator inside an `ExportedProgram`, **in place**.
 
     This is the recommended entry point. Insert it into an existing AOTI flow:
@@ -218,12 +218,35 @@ def apply(exported_program, values: dict | None = None,
     `verify_with=(module, example_inputs)` adds the numeric self-check, which is otherwise
     unavailable here because `apply` has no access to the original module.
 
+    `lower=True` (the default) first tries to expand compound ops the core decomposition table
+    leaves alone -- currently `aten._log_softmax`, whose log-sum-exp otherwise has no node for the
+    region gate to replace. It is committed only when it enables a fusion, so a graph it cannot
+    help is left byte-identical. See `neptune_recognize/lowering.py` and the measurement in
+    `experiments/gpu_m20_i4_ceiling.py` for why softmax and layer_norm are deliberately excluded.
+
     **Real modules need the graph decomposed first.** `nn.LayerNorm`, `nn.Softmax` and
     `torch.logsumexp` export as ONE high-level aten op rather than as a producer/consumer pair,
     and this frame needs the pair. `neptune_opt.export(..., decompose=True)` does that for you;
     on an already-exported program, call `ep = ep.run_decompositions()` before `apply`. When a
     refusal looks like this case, the report says so rather than leaving the user to guess.
     """
+    global LAST_REPORT
+    if lower:
+        # Expand the compound ops the core decomposition table leaves alone (`_log_softmax`), so
+        # the log-sum-exp inside them becomes a node the region gate can replace. It is only
+        # KEPT when it enables a fusion: `lower_if_it_helps` trials on a copy, because the
+        # decomposed form of an operator that does not fuse is more kernels than the operator.
+        from neptune_recognize.lowering import lower_if_it_helps
+
+        report_lowered = lower_if_it_helps(exported_program.graph_module, values)
+        if report_lowered:
+            report = _rewrite_graph(exported_program.graph_module, values)[1]
+            LAST_REPORT = report
+            if report.fusions and verify_with is not None:
+                module, args = verify_with
+                ok, detail = _verify(module, exported_program.graph_module, tuple(args))
+                report.verified = ok
+            return report
     report = _rewrite_graph(exported_program.graph_module, values)[1]
     if not report.fusions and _recognize(exported_program.graph_module, values)[0] is None:
         # The given graph was not recognised AT ALL, so try a decomposed copy purely to
@@ -247,7 +270,6 @@ def apply(exported_program, values: dict | None = None,
                 f"ep = ep.run_decompositions() first, or use "
                 f"neptune_opt.export(..., decompose=True)",
             ))
-    global LAST_REPORT
     LAST_REPORT = report
     if report.fusions and verify_with is not None:
         module, args = verify_with

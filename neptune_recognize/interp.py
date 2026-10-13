@@ -85,6 +85,18 @@ _WRAPPERS = (
 )
 
 
+def _no_value(node, why, where: str) -> None:
+    """Record why a value could not be interpreted.
+
+    Every `return None` in the walk used to be silent about WHICH node defeated it, and the
+    caller then reported the generic "graph is not a producer/consumer reduction pair" -- which
+    says nothing. Measured: a graph whose reduction was fine but whose parameter plumbing was not
+    produced exactly that message, with no clue in it.
+    """
+    if why is not None:
+        why.append(f"{where} could not be interpreted at {str(node.target)!r}")
+
+
 def _is_zero(x) -> bool:
     """Is `x` the constant 0 -- either a literal or a `scalar_tensor(0.0)` NODE?
 
@@ -429,6 +441,7 @@ def interpret(gm, why: list | None = None):
             for a in node.args[:2]:
                 v, is_val = _as_expr(a, env)
                 if not is_val:
+                    _no_value(node, why, "a binary operand")
                     return None
                 vals.append(v)
             if None in vals:
@@ -439,6 +452,7 @@ def interpret(gm, why: list | None = None):
         if name in _UNARY:
             v, is_val = _as_expr(node.args[0], env) if node.args else (None, False)
             if not is_val or v is None:
+                _no_value(node, why, "a unary operand")
                 return None
             env[node] = _UNARY[name](v)
             continue

@@ -5,7 +5,7 @@ The public surface of `neptune_opt`. `tests/test_api_docs.py` asserts that this 
 
 ## Recommended
 
-### `apply(exported_program, values=None, verify_with=None) -> Report`
+### `apply(exported_program, values=None, verify_with=None, lower=True) -> Report`
 
 Rewrite a recognised operator inside an `ExportedProgram`, **in place**. This is the recommended
 entry point: one line in an existing AOTI flow.
@@ -23,6 +23,11 @@ torch._inductor.aoti_compile_and_package(ep, package_path="model.pt2")
   same inputs and compare. Sets `Report.verified`. Without it there is no numeric check, because
   `apply` has no access to the original module.
 
+* `lower` — on by default. Expands a compound op the core decomposition table leaves whole
+  (currently `log_softmax`, whose log-sum-exp is otherwise not a node at all) so the region gate has
+  something to replace. It is **committed only when it enables a rewrite**, so a graph it cannot
+  help is left byte-identical; `lower=False` is the control, and a test asserts the difference.
+
 Never raises on a refusal: the graph is left alone and `Report.skipped` says why. When the graph
 has not been decomposed yet and decomposing would have helped, it says that by name.
 
@@ -34,6 +39,10 @@ has not been decomposed yet and decomposing would have helped, it says that by n
 that is not optional: `nn.Softmax`, `nn.LayerNorm` and `torch.logsumexp` each export as *one*
 high-level op, which this frame cannot see. The decomposed form is what AOTAutograd hands
 Inductor anyway. Pass `decompose=False` to fuse only what is already spelled out in the graph.
+
+One operator the decompositions do **not** reach is `log_softmax`: `get_decompositions` has no
+entry for the overload `torch.export` produces. That one is expanded by `apply`'s lowering pass
+instead, which is why `nn.LogSoftmax` fuses in fp32 and fp16 with no extra step.
 
 Other keyword arguments go to `torch.export.export` (`dynamic_shapes`, `strict`, ...).
 

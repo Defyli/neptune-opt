@@ -31,6 +31,41 @@ def _wants_keepdim(node):
     return len(shape) >= 2
 
 
+def _locate(gm, values=None):
+    """(match, root, keepdim, reason). `reason` is set exactly when the region cannot be replaced.
+
+    Shared by `rewrite` and `would_rewrite` so the two can never disagree about what is
+    replaceable -- a disagreement here is what let a lowering be committed for a region the
+    rewrite then refused.
+    """
+    match, reason = recognize(gm, values)
+    if match is None:
+        return None, None, None, reason
+
+    root = match.region_root
+    if root is None:                       # cannot happen: the matcher requires it
+        return match, None, None, f"{match.skeleton!r} matched but no region root was located"
+
+    keepdim = _wants_keepdim(root)
+    if keepdim is None:
+        return match, root, None, (
+            f"{match.skeleton!r} matched but the operator's output rank is unknown; refusing "
+            "rather than guessing (broadcasting depends on it)")
+    return match, root, keepdim, None
+
+
+def would_rewrite(gm, values=None) -> tuple[bool, str]:
+    """Can `rewrite` replace a region in this graph? (Yes/no, skeleton-or-reason).
+
+    Pure Python: no kernel source is generated and no Triton is imported, so this is usable on a
+    CPU-only machine and inside the lowering trial.
+    """
+    match, _root, _keepdim, reason = _locate(gm, values)
+    if reason is not None:
+        return False, reason
+    return True, match.skeleton
+
+
 def rewrite(gm, values=None, ops=None, lib="neptune"):
     """Replace a recognised operator with ONE call to its generated kernel.
 
@@ -41,18 +76,9 @@ def rewrite(gm, values=None, ops=None, lib="neptune"):
 
     import neptune_codegen as CG
 
-    match, reason = recognize(gm, values)
-    if match is None:
+    match, root, keepdim, reason = _locate(gm, values)
+    if reason is not None:
         return gm, None, reason
-
-    root = match.region_root
-    if root is None:                       # cannot happen: the matcher requires it
-        return gm, None, f"{match.skeleton!r} matched but no region root was located"
-
-    keepdim = _wants_keepdim(root)
-    if keepdim is None:
-        return gm, None, (f"{match.skeleton!r} matched but the operator's output rank is "
-                          "unknown; refusing rather than guessing (broadcasting depends on it)")
 
     graph = gm.graph
     op = CG.op_handle(match.skeleton, params=match.params or None, lib=lib, keepdim=keepdim)

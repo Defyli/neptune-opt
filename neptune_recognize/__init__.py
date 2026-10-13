@@ -36,7 +36,7 @@ from __future__ import annotations
 from neptune_recognize.interp import S_RESULT, _BINARY, _UNARY, _REDUCTIONS, _MEANS, _IGNORED, _last_dim_of, _op, _as_expr, _flatten_nodes, Candidate, interpret  # noqa: F401
 from neptune_recognize.params import _respects, _infer_numerically, _solve_for  # noqa: F401
 from neptune_recognize.match import _producer_pattern, _solve_params, _find_region_root, Match, _match_candidate, recognize, region_root  # noqa: F401
-from neptune_recognize.rewrite import _wants_keepdim, rewrite  # noqa: F401
+from neptune_recognize.rewrite import _wants_keepdim, rewrite, would_rewrite  # noqa: F401
 
 __all__ = [
     "Candidate",
@@ -63,4 +63,5 @@ __all__ = [
     "recognize",
     "region_root",
     "rewrite",
+    "would_rewrite",
 ]

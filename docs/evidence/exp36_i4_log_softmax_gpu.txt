@@ -1,0 +1,101 @@
+# Raw GPU log for iteration I4: experiments/gpu_m21_i4_log_softmax.py
+# RTX 5090 D v2, torch 2.11.0+cu128, triton 3.6.0
+# produced by: python experiments/gpu_m21_i4_log_softmax.py   (exit 0, 37 passed / 0 failed)
+# REDACTED: 0 line(s) carrying an absolute path or host name (verify: 0 left)
+
+/usr/local/python-3.12.11/lib/python3.12/site-packages/torch/_inductor/lowering.py:7836: UserWarning:
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/usr/local/python-3.12.11/lib/python3.12/site-packages/torch/_inductor/lowering.py:7836: UserWarning:
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/usr/local/python-3.12.11/lib/python3.12/site-packages/torch/_inductor/lowering.py:7836: UserWarning:
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/usr/local/python-3.12.11/lib/python3.12/site-packages/torch/_inductor/lowering.py:7836: UserWarning:
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+torch 2.11.0+cu128  triton 3.6.0  NVIDIA GeForce RTX 5090 D v2
+================================================================================================================
+[1] REACH: what does log_softmax export as, and can anything see inside it?
+================================================================================================================
+    exported: ['aten.log_softmax.int']
+    get_decompositions([aten.log_softmax.int]) -> 0 entries
+    get_decompositions([aten._log_softmax.default]) -> 1 entries
+    run_decompositions(): ['aten._log_softmax.default']
+    [PASS] core decompositions do NOT expose the log-sum-exp inside log_softmax -- became ['aten._log_softmax.default']
+    [PASS] the decomposed graph is NOT recognised without the lowering -- unfamiliar op 'aten._log_softmax.default' -- if this is a high-level a
+    [PASS] and it is not rewritable either -- unfamiliar op 'aten._log_softmax.default' -- if this is a high-level a
+    [PASS] with lower=False the very same graph is NOT fused
+    [PASS] lower_compound expands exactly one op -- expanded 1
+    [PASS] the lowered graph is recognised -- logsumexp
+    [PASS] region root metadata says keepdim -- shape=(64, 1)
+    lowered graph: ['amax', 'sub', 'exp', 'sum', 'log', 'add', 'sub']
+    [PASS] after neptune_opt.apply the same graph IS fused -- fusions=['logsumexp']
+    [PASS] and the rewritten graph calls exactly one generated op
+
+================================================================================================================
+[2] END TO END: package both ways, load, compare numbers and latency
+================================================================================================================
+    latency on (256, 16384), launches pipelined; CPU reference checked too
+    [PASS] nn.LogSoftmax(dim=-1) [torch.float32] fused (logsumexp) -- verified=True
+    [PASS] nn.LogSoftmax(dim=-1) [torch.float32] generated kernel is in the fused .pt2 -- mentions=41
+    [PASS] nn.LogSoftmax(dim=-1) [torch.float32] baseline has no such kernel -- mentions=0
+    [PASS] nn.LogSoftmax(dim=-1) [torch.float32] numbers unchanged -- max|diff|=1.907e-06 < bound=8.315e-06
+                             plain 0.0317 ms -> fused 0.0271 ms = 1.17x
+    [PASS] nn.LogSoftmax(dim=-1) [torch.float16] fused (logsumexp) -- verified=True
+    [PASS] nn.LogSoftmax(dim=-1) [torch.float16] generated kernel is in the fused .pt2 -- mentions=41
+    [PASS] nn.LogSoftmax(dim=-1) [torch.float16] baseline has no such kernel -- mentions=0
+    [PASS] nn.LogSoftmax(dim=-1) [torch.float16] numbers unchanged -- max|diff|=7.812e-03 < bound=5.994e-02
+                             plain 0.0305 ms -> fused 0.0241 ms = 1.27x
+    [PASS] F.log_softmax [torch.float32] fused (logsumexp) -- verified=True
+    [PASS] F.log_softmax [torch.float32] generated kernel is in the fused .pt2 -- mentions=41
+    [PASS] F.log_softmax [torch.float32] baseline has no such kernel -- mentions=0
+    [PASS] F.log_softmax [torch.float32] numbers unchanged -- max|diff|=1.907e-06 < bound=8.315e-06
+                             plain 0.0318 ms -> fused 0.0285 ms = 1.11x
+    [PASS] F.log_softmax [torch.float16] fused (logsumexp) -- verified=True
+    [PASS] F.log_softmax [torch.float16] generated kernel is in the fused .pt2 -- mentions=41
+    [PASS] F.log_softmax [torch.float16] baseline has no such kernel -- mentions=0
+    [PASS] F.log_softmax [torch.float16] numbers unchanged -- max|diff|=7.812e-03 < bound=5.994e-02
+                             plain 0.0330 ms -> fused 0.0232 ms = 1.42x
+    [PASS] log_softmax by hand [torch.float32] fused (logsumexp) -- verified=True
+    [PASS] log_softmax by hand [torch.float32] generated kernel is in the fused .pt2 -- mentions=41
+    [PASS] log_softmax by hand [torch.float32] baseline has no such kernel -- mentions=0
+    [PASS] log_softmax by hand [torch.float32] numbers unchanged -- max|diff|=1.907e-06 < bound=8.315e-06
+                             plain 0.0321 ms -> fused 0.0266 ms = 1.21x
+    [PASS] log_softmax by hand [torch.float16] refused as documented, graph untouched -- skipped : no-fusion: unfamiliar op 'aten._to_copy.default' -- if this is a high-level aten
+    [PASS] log_softmax by hand [torch.float16] the refusal is not a silence
+    [PASS] nn.LogSoftmax(dim=-1) [cpu] lowering committed -- fusions=['logsumexp']
+    [PASS] F.log_softmax [cpu] lowering committed -- fusions=['logsumexp']
+
+================================================================================================================
+[3] NO-OP: the operators m20 EXCLUDED must leave the graph byte-identical
+================================================================================================================
+    softmax 0.59x and layer_norm 0.41x against Inductor's dedicated lowerings, so a
+    pass that touched them would be a pessimisation dressed as added reach.
+    [PASS] softmax: graph byte-identical
+    [PASS] layer_norm: graph byte-identical
+    [PASS] relu (no reduction): graph byte-identical
+    [PASS] log_softmax over dim 0: graph byte-identical
+
+================================================================================================================
+TOTAL: 37 passed, 0 failed
+READING: the lowering is licensed by measurement (m20) and bounded by construction --
+it is committed only when it enables a rewrite, so a graph it cannot help is untouched.
+================================================================================================================

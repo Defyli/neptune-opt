@@ -108,22 +108,80 @@ The accumulation still happens in fp32 whatever the input dtype, and that is pin
 (`test_accumulation_stays_fp32_whatever_the_input_dtype`) because accumulating in bf16 is a
 plausible "optimisation" that would lose catastrophic precision on long rows.
 
-### I4 — reach: expose the reductions that are hidden inside compound ops
+### I4 — reach: expose the reductions hidden inside compound ops  ✅ done
 
-*Deliverable*: a **lowering pre-pass** that expands `aten._softmax` / `aten._log_softmax` /
-`aten.native_layer_norm` into decomposed subgraphs, so the log-sum-exp (and, for layer norm, the
-mean/variance) becomes a real node that the region gate can replace.
+The plan was to expand `aten._softmax` / `aten._log_softmax` / `aten.native_layer_norm` so their
+log-sum-exp (and layer norm's variance) becomes a node the region gate can replace. Before writing
+a graph-mutating pass, `experiments/gpu_m20_i4_ceiling.py` measured its **ceiling**: build by hand
+what the lowering would produce, and race it against Inductor's own lowering.
 
-*Why*: these are the most common real ops, and today they are refused because the core
-decomposition table does not expand them. This is the single biggest reach increase available
-without changing the architecture.
+```
+    variant                        ms   vs torch's own
+    softmax (torch)            0.0583   --
+    softmax via our LSE        0.0985   0.59x   <- 2x SLOWER
+    log_softmax (torch)        0.0588   --
+    log_softmax via our LSE    0.0417   1.41x   <- a real win
+    layer_norm (torch)         0.0498   --
+    mean + our variance        0.1221   0.41x   <- 2.4x SLOWER
+```
 
-*Risk*: **high** — it mutates the graph before recognition, so it must be semantics-preserving and
-must only fire when it actually enables a fusion, with a numeric self-check. Expect a dedicated
-adversarial test set (masked logits, `-inf` rows, `keepdim`, non-trailing dims).
+**So I4 is `_log_softmax` alone**, and the other two are recorded as out of scope with the reason:
+Inductor has a dedicated *persistent* lowering for last-dim softmax and for layer norm, and fusing
+the reduction ourselves means splitting one good kernel into our kernel plus elementwise work.
+Reach is not value, and this is the measurement that distinguishes them.
 
-*Exit criterion*: `nn.Softmax`/`nn.LogSoftmax` models gain the generated kernel in the `.pt2`, with
-numbers unchanged, **and** a model where the expansion would not fuse is left byte-identical.
+Shipped as `neptune_recognize/lowering.py`, wired into `apply(lower=True)` — which is now the
+default, so `neptune_opt.export(...)` and `neptune_opt.apply(ep)` both get it, while
+`apply(ep, lower=False)` remains the control. Three decisions in it are load-bearing, and each was
+wrong once:
+
+* **the inserted nodes carry metadata, produced by running the same expansion on the input's fake
+  tensor** (one spec, two interpreters: FX nodes and FakeTensors). The first version inserted bare
+  nodes, so the recogniser could not tell whether the operator keeps the reduced dimension, and
+  every single rewrite was refused with *"matched but the operator's output rank is unknown"*. The
+  hand-written shape arithmetic that replaced it was replaced in turn — it is what got the edge
+  case wrong.
+* **the expansion has to be ours.** `get_decompositions([aten.log_softmax.int])` returns an
+  **empty table** — and that is the overload `torch.export` actually produces — while
+  `aten._log_softmax.default` has one entry. On torch 2.11 `ep.run_decompositions()` merely
+  RENAMES `log_softmax.int` to `_log_softmax.default` and stops (`gpu_m21` §1 prints all three
+  facts). No amount of calling the core decompositions exposes the log-sum-exp.
+* **the commit gate is rewritability, not recognition** (`would_rewrite`, not `recognize`). A
+  region can be recognised and still refused by the rewrite; a lowering gated on recognition alone
+  would then be committed and fuse nothing, leaving the model with more kernels than the operator
+  it replaced. `tests/test_lowering.py::test_gate_rejects_a_lowering_that_does_not_rewrite`
+  reproduces exactly that bug against the gate.
+
+*Verified*: `experiments/gpu_m21_i4_log_softmax.py`, **37 checks, 0 failed, exit 0** — raw log in
+[evidence/exp36_i4_log_softmax_gpu.txt](evidence/exp36_i4_log_softmax_gpu.txt). End to end
+(`torch.export` → AOTI package → load → run, 256x16384, launches pipelined), the generated kernel
+appears **41 times** in the fused `.pt2` and **0** times in the baseline:
+
+| spelling | fp32 | fp16 |
+|---|---|---|
+| `torch.log_softmax` | 1.17x | 1.27x |
+| `F.log_softmax` | 1.11x | 1.42x |
+| `t - logsumexp(t, keepdim=True)` (fused before this iteration) | 1.21x | refused (see below) |
+
+Numbers match Inductor's own lowering to a few ULPs (fp32 `1.9e-06` against a `8.3e-06` bound;
+fp16 `7.8e-03` against `6.0e-02`).
+
+Two honest readings of that table. The win is **1.11x–1.42x**, not the 1.41x the ceiling
+experiment reported: that number was a hand-built best case, and it is the top of this range, not
+its middle. And the mechanism is visible in the GPU log, because Inductor says so itself —
+*"Online softmax is disabled on the fly since Inductor decides to split the reduction"* — which is
+also the reason this frame wins here and loses on tall-thin shapes (see I6).
+
+*New limit found while verifying, recorded rather than papered over*: the hand-written spelling in
+**fp16** does not fuse. `torch.logsumexp`'s core decomposition inserts an explicit fp32 upcast
+(`aten._to_copy`) for half precision, and the symbolic interpreter refuses an op it cannot model
+instead of matching through it. The refusal is pinned as an expectation in `gpu_m21`, so if the
+interpreter later learns to see through a pure dtype cast the experiment fails and points here.
+This is a refusal, not a wrong answer, and it does not affect the operators this iteration serves.
+
+*Risk*: was medium, is now low — one operator, the ceiling measured first, the pass committed only
+when it enables a rewrite. *Exit criterion*: met, and `nn.LogSoftmax`, `F.log_softmax` and
+`torch.log_softmax` all carry the generated kernel in the `.pt2` in both fp32 and fp16.
 
 ### I5 — packaging  ✅ done
 
@@ -164,3 +222,17 @@ survivable. I3 before I4 because a reach increase in a dtype nobody uses is not 
 the biggest single value item and the riskiest, so it goes after the cheap ones. I5 is cheap and
 makes the thing installable while I4 is being worked. I6 last, because performance work on a
 narrow reach is not worth much.
+
+## Backlog: measured, deliberately not scheduled
+
+Each of these has a number or a reproduction behind it, and each is recorded so that "not done" is
+a decision rather than an oversight. None of them is in the frame of a single iteration above.
+
+| item | state of the evidence | what would settle it |
+|---|---|---|
+| `aten._to_copy` transparency | fp16 `torch.logsumexp` decomposes with an explicit fp32 upcast and is refused as an unfamiliar op (`gpu_m21` §2, pinned there). The cast is pure algebra; seeing through it is a small change *plus* a decision about casts that narrow precision mid-region | one experiment over casts that widen, narrow and change device, with the dtype of the result pinned |
+| `prod + ratio` | refused as `f-needs-carried-count`: the repair needs a count carried across the reduction, which is a different program shape, not more algebra. 26 of 28 probed families are served | a skeleton whose repair carries a second accumulator, and a measurement that it beats two passes |
+| `torch.compile` backend | the rewrite lands and is numerically right, but searching the Inductor cache finds the generated kernel **0** times, against **41** through AOTI. Cause unknown; the entry point is gated behind `experimental=True` until it is understood | a diagnostic that shows where the op is dropped on the Dynamo route (the AOTI route is verified and is the documented one) |
+| operator as the graph output | measured 3 times at 0x — the operator is rewritten, and the result is not faster. Unexplained | a profile of that shape |
+| one region per graph | the pass rewrites the first recognisable region and stops; a model with two such operators is not covered | a loop over regions, with the interaction between them measured |
+| fp8 / integer dtypes | not supported; fp32, bf16 and fp16 are (I3) | the accumulation story for fp8 has to be decided first — this is not a dtype table entry |

@@ -95,17 +95,115 @@ rather than a missing pattern:
 | `nn.RMSNorm`, `nn.LayerNorm`, softmax's normalisation | **out of frame** — one reduction |
 | a `mul` consumer (`prod + ratio`) | refused — needs a carried count |
 
-End to end on real modules (256×16384, both sides packaged with AOTI and loaded):
-**1.19–1.57x** for `torch.logsumexp`, `logsumexp(t/8)`, `rmsnorm_max`, `stable_l2` and a
-hand-written `log_softmax`. At small shapes (64×4096) the same comparison is 0.9–1.05x, because
-the kernel is no longer the bottleneck — the win needs rows long enough to matter. Both numbers,
-and the two measurement bugs that produced the misleading one, are in
+End to end on real modules: **1.11–1.57x**, and the whole picture — including where it loses — is
+the benchmark section below. At small shapes (64×4096) the same comparison is 0.9–1.05x, because the
+kernel is no longer the bottleneck — the win needs rows long enough to matter. Both numbers, and the
+two measurement bugs that produced the misleading one, are in
 [docs/evidence/exp33_real_modules.md](docs/evidence/exp33_real_modules.md).
 
 Real models also export as one high-level aten op per module, so they must be decomposed first:
 `neptune_opt.export(model, args)` does that by default, and on an existing `ExportedProgram`,
 `ep = ep.run_decompositions()` comes first. `experiments/real_modules.py` measures all of this
 against real modules and prints the reason for every refusal.
+
+## Benchmarks: AOTI's own lowering vs neptune
+
+**What is compared.** Both columns come from the same flow and the same shapes; the only difference
+is one line:
+
+```python
+ep = torch.export.export(model, args).run_decompositions()   # both sides
+# neptune_opt.apply(ep)                                      # the fused side only
+torch._inductor.aoti_compile_and_package(ep, package_path="m.pt2")
+torch._inductor.aoti_load_package("m.pt2")
+```
+
+* **plain** is AOTI's own generated code for the unfused graph — Inductor's lowering, not eager
+  torch. That is the thing being beaten.
+* **fused** is the same package plus the generated kernel. In every packaging row below, the fused
+  `.pt2` contains the kernel's name **41 times** and the baseline **0 times**, so the delta is
+  attributable to the fusion and not to a compile difference. That check is part of the experiment,
+  not a claim here: a comparison whose baseline already contained the kernel would be meaningless.
+* Latency is per call with the launches PIPELINED. A single call takes ~0.03 ms, the same order as
+  Python dispatch plus one launch, so timing single calls measures the harness.
+
+Machine: RTX 5090 D v2, torch 2.11.0+cu128, Triton 3.6.0. Rows come from the run named in the last
+column; each evidence file is a raw log.
+
+### Fusing two reductions into one kernel — 256×16384, fp32
+
+| model | AOTI plain | neptune | speedup | max \|err\| | log |
+|---|---|---|---|---|---|
+| `torch.logsumexp` | 0.0281 ms | 0.0183 ms | **1.54x** | 9.4e-08 | [exp33](docs/evidence/exp33_real_modules_gpu.txt) |
+| `logsumexp(t/8)` (attention LSE) | 0.0286 ms | 0.0194 ms | **1.47x** | 9.8e-08 | [exp33](docs/evidence/exp33_real_modules_gpu.txt) |
+| RMSNorm + row max | 0.0277 ms | 0.0182 ms | **1.52x** | 4.5e-07 | [exp33](docs/evidence/exp33_real_modules_gpu.txt) |
+| stable L2 norm | 0.0288 ms | 0.0184 ms | **1.57x** | 9.5e-07 | [exp33](docs/evidence/exp33_real_modules_gpu.txt) |
+| log-softmax written by hand | 0.0311 ms | 0.0261 ms | 1.19x | 2.4e-07 | [exp33](docs/evidence/exp33_real_modules_gpu.txt) |
+| `torch.log_softmax` / `nn.LogSoftmax` | 0.0317 ms | 0.0271 ms | 1.17x | 1.9e-06 | [exp36](docs/evidence/exp36_i4_log_softmax_gpu.txt) |
+| `F.log_softmax` | 0.0318 ms | 0.0285 ms | 1.11x | 1.9e-06 | [exp36](docs/evidence/exp36_i4_log_softmax_gpu.txt) |
+| `nn.LogSoftmax`, **fp16** | 0.0305 ms | 0.0241 ms | 1.27x | 7.8e-03 | [exp36](docs/evidence/exp36_i4_log_softmax_gpu.txt) |
+| `F.log_softmax`, **fp16** | 0.0330 ms | 0.0232 ms | 1.42x | 7.8e-03 | [exp36](docs/evidence/exp36_i4_log_softmax_gpu.txt) |
+
+The fp16 errors look large only because a log-probability of −30 has an fp16 ULP of 0.016; the
+experiment's bound is four ULPs of the largest magnitude present (6.0e-02 for that row), and the
+accumulation is fp32 regardless of the input dtype.
+
+### The two-pass plan (no repair exists) — variance, fp32
+
+| shape | AOTI plain | neptune `variance` | speedup | reads of the row | the one-pass `stable_l2` here |
+|---|---|---|---|---|---|
+| (8, 4096) | 0.0347 ms | 0.0228 ms | **1.52x** | 2 (it is a two-pass plan) | 0.0229 ms / 1.52x |
+| (8, 16384) | 0.0563 ms | 0.0272 ms | **2.07x** | 2 | 0.0269 ms / 2.09x |
+| (8, 65536) | 0.0571 ms | 0.0586 ms | 0.97x | 2 | 0.0487 ms / 1.17x |
+| (32, 65536) | 0.0551 ms | 0.0591 ms | 0.93x | 2 | 0.0489 ms / 1.13x |
+| (1, 262144) | 0.0516 ms | 0.1715 ms | **0.30x** | 2 | 0.1332 ms / 0.39x |
+
+The last column is the SAME operator computed by the one-pass frame where that is possible
+(`stable_l2` = `sqrt(sum(x²))`, the same reduction shape): it does not rescue the tall-thin case
+either, which is why §I6 measured split reduction rather than assuming it.
+
+([exp31](docs/evidence/exp31_two_pass_gpu.txt).) This plan reads the row twice by construction —
+that is what "no repair" means — so it wins on long rows with enough of them and is at parity or
+worse elsewhere.
+
+### The launch configuration, at the shape where it decides — `(1, 262144)`
+
+| | latency | vs plain |
+|---|---|---|
+| AOTI plain (default `BLOCK=1024`, 4 warps) | 0.1315 ms | 1.00x |
+| neptune, default launch config | 0.1315 ms | 1.00x |
+| neptune, measured launch config `(8192, 8)` | 0.0481 ms | **2.74x** |
+
+([exp37](docs/evidence/exp37_autotune_gpu.txt).) The third row is the same fused kernel as the second
+with the launch configuration the registry measured for this GPU and shape — why the configuration is
+part of the operator's identity rather than a constant.
+
+### Where it loses, and by decision
+
+| case | result | why | source |
+|---|---|---|---|
+| `softmax` via our LSE | **0.59x** | Inductor's last-dim softmax is a persistent reduction; fusing ours splits one good kernel into a kernel plus elementwise work | [roadmap §I4](docs/roadmap.md), `gpu_m20_i4_ceiling.py` |
+| `layer_norm` via mean + our variance | **0.41x** | same — Inductor has a dedicated lowering | [roadmap §I4](docs/roadmap.md) |
+| small shapes, e.g. 64×4096 | 0.9–1.05x | the kernel is not the bottleneck at that size | [exp33](docs/evidence/exp33_real_modules_gpu.md) |
+| a single very long row, `(1, 262144)` | 0.67x vs Inductor | Inductor SPLITS that reduction across programs; this frame emits one program per row. Split reduction was measured (its ceiling is no faster than our tuned kernel) and deliberately not built | [roadmap §I6](docs/roadmap.md), [exp37](docs/evidence/exp37_autotune_gpu.txt) |
+
+Two of those are the reason the project claims reach rather than universal wins: the operators it
+declines are declined with a number.
+
+**Other GPUs.** Re-measured on an RTX 4090 D the same rows hold within a few percent
+(`(1, 262144)`: 2.57x end to end) while the launch table differs — four deviations from the default on
+the 5090, one on the 4090 D ([exp38](docs/evidence/exp38_cross_gpu_and_old_stack.md)). On a Tesla V100
+(torch 2.0.1 / Triton 2.0.0) the algebra, recognition, gates and launch configuration work and the
+AOTI path does not exist at all.
+
+**Reproduce** (on a CUDA machine):
+
+```bash
+python experiments/real_modules.py            # the 256x16384 end-to-end table
+python experiments/gpu_m17_two_pass.py        # the two-pass numbers
+python experiments/gpu_m21_i4_log_softmax.py  # log_softmax, fp32 and fp16
+python experiments/gpu_m22_autotune.py        # the launch configuration, and the (1,262144) case
+```
 
 ## Install
 

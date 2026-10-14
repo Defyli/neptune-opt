@@ -76,6 +76,37 @@ This is the zero-risk path: no recognition, no graph rewriting — you name the 
 kernel is generated for it. Useful when recognition declines, and as a check on what recognition
 would have chosen.
 
+## Performance fallback
+
+### `compile_best(module, args, *, package_dir=None, margin=0.03, reps=20, rounds=3, verify=True, verbose=True, **export_kwargs) -> Choice`
+
+Every other gate in this package protects **correctness**; this one protects **speed**. It compiles
+the unmodified package AND the fused one, times both on `args`, and returns the faster — because a
+numerically correct fusion can still be slower (measured: the two-pass plan for `var`/`std` is
+**0.30x** at `(1, 262144)`).
+
+```python
+choice = neptune_opt.compile_best(model, (x,))
+print(choice)                  # "shipped the fused package -- the fused package is 1.54x faster"
+ship(choice.package_path)      # or: "shipped the baseline package -- 3.32x SLOWER, so it was dropped"
+```
+
+The price is deliberate and must be paid knowingly: **two AOTI compilations**, example inputs, a CUDA
+device, and static shapes (an AOTI package is specialised to the shapes it was compiled for, and
+those are also the shapes that get timed). It is a separate entry point rather than something
+`apply()` does, because `apply()` runs before any compilation exists and so has nothing to time. When
+the model has nothing to fuse, the second compilation is skipped — the common case pays nothing extra.
+
+The choice rule: ship the fused package only if it beats the baseline by more than `margin` (3%), and
+only after checking that its numbers still match. Slower, tied, numerically different, or failing to
+compile all return the **unmodified baseline** with the measurement in `reason`.
+
+### `Choice`
+
+What the A/B measured: `package_path` (the one to ship), `used_fusion`, `baseline_ms`, `fused_ms`,
+`speedup` (baseline / fused), `reason`, `report` (the `Report` from `apply`), `baseline_package` and
+`fused_package` (both are kept, so the loser stays inspectable). It prints as one line.
+
 ## Legacy / gated
 
 ### `optimize(module, example_inputs, verbose=False)` — legacy

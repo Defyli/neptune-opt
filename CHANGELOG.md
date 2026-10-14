@@ -38,6 +38,13 @@ push.
 
 ### Added
 
+* **A performance fallback, `compile_best(model, args)`.** Every other gate protects correctness; this
+  one protects speed. It compiles the unmodified package AND the fused one, times both on the example
+  inputs (interleaved rounds, minimum kept), and ships the faster — because a numerically correct
+  fusion can still be slower (measured: `x.var(-1)` at `(1, 262144)` is 0.30x). A slower, tied,
+  numerically different or non-compiling fusion returns the **unmodified baseline** with the
+  measurement in `reason`. It costs two compilations, needs a CUDA device and static shapes, and
+  skips the second compilation when there is nothing to fuse.
 * **The launch configuration is a per-GPU registry.** `experiments/measure_launch_configs.py`
   measures one machine, prints every candidate timing, and MERGES its entry, leaving the others
   alone; it needs only torch and Triton, so a machine whose stack is too old for the AOTI path can

@@ -75,6 +75,7 @@ are in [docs/evidence/](docs/evidence/).
 | dtypes | **fp32, bf16, fp16** — the result takes the input's dtype, accumulation stays fp32 |
 | generated kernel present in the `.pt2` | verified (41 kernel occurrences, `cubins ≥ 1`) |
 | launch configuration (`BLOCK`, `num_warps`) | **measured per shape and per GPU**, part of the op's identity; three GPUs measured so far |
+| performance fallback | **`compile_best()`** A/Bs the fused and unmodified packages and ships the faster one |
 | `torch.compile` backend | **does not work** — gated behind `experimental=True` |
 | real `torch.nn` modules | fuse **only after `ep.run_decompositions()`** — see below |
 
@@ -190,6 +191,11 @@ part of the operator's identity rather than a constant.
 Two of those are the reason the project claims reach rather than universal wins: the operators it
 declines are declined with a number.
 
+**This is a 5090 table, and that matters.** The fusion's value is per-GPU: through `compile_best` the
+`logsumexp` row above measured **1.41x on the 5090 and 0.96x on a 4090 D** — i.e. on the 4090 D the
+fusion did not win at that shape and the fallback shipped AOTI's own package
+([exp39](docs/evidence/exp39_ab_fallback_4090d.txt)).
+
 **Other GPUs.** Re-measured on an RTX 4090 D the same rows hold within a few percent
 (`(1, 262144)`: 2.57x end to end) while the launch table differs — four deviations from the default on
 the 5090, one on the 4090 D ([exp38](docs/evidence/exp38_cross_gpu_and_old_stack.md)). On a Tesla V100
@@ -233,10 +239,26 @@ Pick the row that fits how much you want to change.
 | **`apply(ep)`** | one line in an existing AOTI flow | none |
 | `export(model, args, **kw)` | replaces `torch.export.export`; kwargs forwarded | none |
 | `neptune_opt.rmsnorm_max(x, eps=…)` | rename the operation in your model | yes |
+| **`compile_best(model, args)`** | nothing — it compiles both and ships the faster | none |
 | `neptune_opt.backend` | — | **not functional**, see [Status](#status) |
 
 `apply` and `export` never raise: on any failure the graph is left untouched and the reason lands
 in the report. Add the numeric self-check with `apply(ep, verify_with=(model, args))`.
+
+### If the fusion is slower
+
+`apply` protects correctness, not speed: a numerically right fusion can still be slower (measured:
+`x.var(-1)` at `(1, 262144)` is **0.30x**). `compile_best` is the fallback — it compiles the
+unmodified package and the fused one, times both, and ships the faster:
+
+```python
+choice = neptune_opt.compile_best(model, (x,))
+print(choice)     # shipped the baseline package -- the fused package is 3.32x SLOWER, so it was dropped
+torch._inductor.aoti_load_package(choice.package_path)
+```
+
+It costs two AOTI compilations instead of one, needs a CUDA device and static shapes, and skips the
+second compilation entirely when the model has nothing to fuse. See [docs/api.md](docs/api.md).
 
 `neptune_opt.preview(ep)` reports what *would* be fused without generating a kernel, so it needs no
 Triton — handy in CI.

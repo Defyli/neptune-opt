@@ -1,0 +1,40 @@
+# Raw GPU log for I8: experiments/gpu_m23_ab_fallback.py
+# RTX 4090 D, torch 2.11.0+cu128, triton 3.6.0
+# produced by: python experiments/gpu_m23_ab_fallback.py   (exit 0, 11 passed / 0 failed)
+# REDACTED: 0 line(s) checked for absolute paths and host names (0 left)
+
+==============================================================================================================
+I8: THE A/B FALLBACK   torch 2.11.0+cu128  NVIDIA GeForce RTX 4090 D
+==============================================================================================================
+
+[1] MECHANISM: torch.logsumexp, 256x16384 -- an A/B whose direction is the machine's call
+neptune_opt: shipped the baseline package -- the fused package is 1.04x SLOWER, so it was dropped (baseline 0.0247 ms, fused 0.0257 ms, 0.96x)
+  fused   : logsumexp(tiny=0)
+  verified: fused output matches the original on the example inputs
+      -> neptune_opt: shipped the baseline package -- the fused package is 1.04x SLOWER, so it was dropped (baseline 0.0247 ms, fused 0.0257 ms, 0.96x)
+    [PASS] logsumexp: the fused package was built -- fusions=['logsumexp']
+    [PASS] logsumexp: shipped the faster of the two packages -- used_fusion=False, 0.96x, the fused package is 1.04x SLOWER, so it was dropped
+    [PASS] logsumexp: both packages exist
+    [PASS] logsumexp: the shipped package matches eager -- max|diff|=0.00e+00
+
+[2] LOSES: var(unbiased=False) at (1, 262144) -- the measured 0.30x case
+neptune_opt: shipped the baseline package -- the fused package is 5.42x SLOWER, so it was dropped (baseline 0.0319 ms, fused 0.1729 ms, 0.18x)
+  fused   : variance
+  verified: fused output matches the original on the example inputs
+      -> neptune_opt: shipped the baseline package -- the fused package is 5.42x SLOWER, so it was dropped (baseline 0.0319 ms, fused 0.1729 ms, 0.18x)
+    [PASS] var(1, 262144): the fused package was built -- fusions=['variance']
+    [PASS] var(1, 262144): chose the BASELINE package -- used_fusion=False, 0.18x, the fused package is 5.42x SLOWER, so it was dropped
+    [PASS] var(1, 262144): both packages exist
+    [PASS] var(1, 262144): the shipped package matches eager -- max|diff|=1.79e-07
+
+[3] NO-OP: a model with nothing to fuse pays for ONE compilation
+neptune_opt: nothing to fuse (skipped : no-fusion: unfamiliar op 'aten.relu.default' -- if this is a high-level aten op such as softmax/layer_norm, the core decompositions expose its reductions (ep.run_decompositions())), so no A/B was run and only one package was compiled
+    [PASS] no-op: exactly one package was compiled -- ['baseline.pt2']
+    [PASS] no-op: the baseline was shipped
+    [PASS] no-op: nothing was timed
+
+==============================================================================================================
+TOTAL: 11 passed, 0 failed
+READING: the fallback fires in the direction that matters -- a fusion measured 3x slower
+is dropped and the unmodified AOTI package is what ships.
+==============================================================================================================

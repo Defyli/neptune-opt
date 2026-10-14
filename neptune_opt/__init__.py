@@ -78,8 +78,12 @@ if _ilu.find_spec("neptune_codegen") is None:
 
 from neptune_recognize import rewrite as _rewrite, recognize as _recognize
 
+# The A/B fallback lives in its own module (it needs compilation and timing, nothing else here
+# does); it is imported after the definitions above so it can call back into `apply`.
+from neptune_opt.ab import Choice, choose_faster, compile_best  # noqa: E402
+
 __all__ = ["apply", "export", "optimize", "backend", "preview", "Report", "Fusion",
-           "LAST_REPORT", "op_parameters"]
+           "LAST_REPORT", "op_parameters", "compile_best", "Choice"]
 
 # The most recent report produced by any entry point. `backend` has nowhere to return one
 # (torch.compile owns its return value), and a fusion pass that cannot be observed is a

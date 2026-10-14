@@ -42,6 +42,8 @@ Conventions:
 | end to end through AOTI, the generated kernel is in the package and the numbers are unchanged | `experiments/real_modules.py` | 1.19–1.57x on the in-frame rows | `exp33_real_modules_gpu.txt` |
 | `log_softmax` in fp32 and fp16 fuses at 1.11–1.42x, and the excluded operators are byte-identical | `experiments/gpu_m21_i4_log_softmax.py` | 37 checks, exit 0 | `exp36_i4_log_softmax_gpu.txt` |
 | the launch configuration is measured per shape, kept at the default unless it clears the noise margin, and baked into the package's op name | `experiments/gpu_m22_autotune.py` | 40 checks, exit 0; 2.74x end to end at `(1, 262144)` | `exp37_autotune_gpu.txt` |
+| a numerically correct but SLOWER fusion is dropped and the unmodified AOTI package ships | `experiments/gpu_m23_ab_fallback.py` | 11 checks, exit 0 on an RTX 5090 D v2 and an RTX 4090 D: `var` at `(1,262144)` measured 0.14x/0.18x and the baseline was shipped on both; `logsumexp` was taken on the 5090 (1.41x) and dropped on the 4090 D (0.96x) | `exp39_ab_fallback_5090.txt`, `exp39_ab_fallback_4090d.txt` |
+| the fallback's decision logic and every branch around it | `tests/test_ab.py` | 8 tests passed (slower / tied / numbers moved / does not compile / nothing to fuse / CPU-only) | — |
 | the README's limits table is true, and complete in both directions | `tests/test_readme_limits.py` | 3 tests passed (9 limit rows) | — |
 
 ## Integration placement

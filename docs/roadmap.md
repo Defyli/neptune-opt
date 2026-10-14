@@ -301,6 +301,40 @@ the biggest single value item and the riskiest, so it goes after the cheap ones.
 makes the thing installable while I4 is being worked. I6 last, because performance work on a
 narrow reach is not worth much.
 
+### I8 — the performance fallback that was missing  ✅ done
+
+Every other gate in this project protects CORRECTNESS. None protected SPEED, and the measurements said
+that mattered: the two-pass plan for `var`/`std` is 0.30x at `(1, 262144)` (exp31), and 0.67x is what
+a single very long row costs against Inductor (I6). A user calling `apply` on those got a slower model
+and a report saying `fused`.
+
+`neptune_opt.compile_best(model, args)` compiles the unmodified package AND the fused one, times both
+on the example inputs (interleaved rounds, minimum kept — the same reasoning as the launch search), and
+ships the faster. A slower, tied, numerically-different or non-compiling fusion returns the
+**unmodified baseline** with the measurement in `reason`. It is a separate entry point because
+`apply()` runs before any compilation exists and so has nothing to time; when a model has nothing to
+fuse the second compilation is skipped, so the common case pays nothing.
+
+*Verified on two GPUs* — `experiments/gpu_m23_ab_fallback.py`, **11 checks, exit 0 on each**:
+
+| case | 5090 | 4090 D | shipped |
+|---|---|---|---|
+| `torch.logsumexp`, 256x16384 | 0.0264 → 0.0188 ms (**1.41x**) | 0.0247 → 0.0257 ms (0.96x) | fused on the 5090, **baseline on the 4090 D** |
+| `var(unbiased=False)`, (1, 262144) | 0.0221 → 0.1619 ms (**0.14x**) | 0.0319 → 0.1729 ms (**0.18x**) | **baseline on both** |
+| a model with nothing to fuse | — | — | one package compiled, nothing timed |
+
+Logs: [exp39 5090](evidence/exp39_ab_fallback_5090.txt), [exp39 4090 D](evidence/exp39_ab_fallback_4090d.txt).
+
+Two things this run taught, both recorded rather than smoothed over. The `var` case had to be written
+as `unbiased=False`: the DEFAULT `x.var(-1)` is refused by design (its default is the `/(N-1)` form),
+which is the `var-default-is-unbiased` limit, and my first version of the experiment asked for the
+refused spelling. And **the 1.5x `logsumexp` win does not reproduce on the 4090 D** at 256x16384
+(0.96x there), so the benchmark table in the README is a 5090 table and is now labelled as one: the
+fusion's value is per-GPU, which is exactly why the A/B exists instead of a promise.
+
+*Risk*: low now. *Exit criterion*: a fusion measured slower is dropped, the unmodified package ships,
+and the mechanism is shown on two GPUs in both directions.
+
 ## Backlog: measured, deliberately not scheduled
 
 Each of these has a number or a reproduction behind it, and each is recorded so that "not done" is

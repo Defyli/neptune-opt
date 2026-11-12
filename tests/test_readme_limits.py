@@ -1,5 +1,10 @@
 """
-The README's limits table, asserted against the code -- in both directions.
+Historical README limit-key inventory and explicit legacy-mode regressions.
+
+The keys are documentation inventory, NOT a statement of current default capability.
+Default apply now supports multiple regions and selective compound lowering without
+core decomposition. Historical bounded behavior is tested with max_regions=1;
+needs-decomposition is tested as an explicit lower=False no-fusion contract.
 
 A limit that is described wrongly is worse than no limit, because it is believed. The README's
 limits section had already gone stale twice by the time this file was written (it claimed
@@ -7,8 +12,11 @@ limits section had already gone stale twice by the time this file was written (i
 the operator's readout is refused, which was never true of arithmetic *outside* the region). So the
 table in `README.md` carries a machine-readable key per row, and this file is the other half:
 
-  * every key in the README must have a check here (a stale row fails);
-  * every check here must appear in the README (a removed row fails).
+  * every historical key in the README must have an explicit-mode check here;
+  * every inventory check here must appear in the README.
+
+This guards key inventory, not the truth of historical prose about today's defaults;
+additional tests below assert enhanced default behavior directly.
 
 None of it needs a GPU or Triton: what is being asserted is what the pass DECIDES, and it decides
 before any kernel exists.
@@ -17,8 +25,9 @@ The stub-kernel trick
 ---------------------
 Two rows are about what the rewrite does to a graph rather than about what it recognises. Without
 Triton, `rewrite` cannot build a kernel -- but building the kernel is not what those rows are about,
-so `CG.op_handle` is replaced by a plain aten op with the same `(Tensor) -> Tensor` shape. The graph
-transformation is then exercised for real, with a result that is wrong numerically and irrelevant.
+so `CG.op_handle` is replaced by a CPU logsumexp custom op with registered fake metadata.
+The actual graph transformation, export verifier and numerical verification are exercised;
+no GPU kernel, compilation or service is involved.
 
 Run:  python tests/test_readme_limits.py     (or pytest tests/test_readme_limits.py)
 """
@@ -28,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -66,14 +76,24 @@ def _verdict(fn, decompose: bool = True):
     return (match.skeleton if match else None), str(why)
 
 
+@torch.library.custom_op("neptune_readme_test::lse", mutates_args=())
+def _cpu_lse(t: torch.Tensor) -> torch.Tensor:
+    return torch.logsumexp(t, dim=-1)
+
+
+@_cpu_lse.register_fake
+def _cpu_lse_fake(t):
+    return t.new_empty(t.shape[:-1])
+
+
 def _stub_kernel(fn):
-    """Run `fn` with kernel generation replaced by a no-op `(Tensor) -> Tensor` op."""
-    real = CG.op_handle
-    CG.op_handle = lambda *a, **k: torch.ops.aten.clone.default        # noqa: ARG005
-    try:
+    """Exercise real transaction/verification with a correct CPU reduction ABI."""
+    def handle(name, *, keepdim, **kwargs):
+        assert name == "logsumexp" and not keepdim, (name, keepdim)
+        return _cpu_lse._opoverload
+
+    with patch.object(CG, "op_handle", side_effect=handle):
         return fn()
-    finally:
-        CG.op_handle = real
 
 
 # ---------------------------------------------------------------- the checks
@@ -84,8 +104,11 @@ def check_region_is_the_operator():
     assert NR.recognize(outer.graph_module)[0] is not None, (
         "logsumexp * 2 stopped being recognised: the region gate got greedy")
     ep = _graph(lambda t: torch.logsumexp(t, dim=-1) * 2.0)
-    report = _stub_kernel(lambda: NO.apply(ep))
-    assert len(report.fusions) == 1, report.summary()
+    mod = M(lambda t: torch.logsumexp(t, dim=-1) * 2.0)
+    report = _stub_kernel(lambda: NO.apply(ep, verify_with=(mod, (X,))))
+    assert len(report.fusions) == 1 and report.verified, report.summary()
+    ep.validate()
+    torch.testing.assert_close(ep.module()(X), mod(X))
     ops = [str(n.target) for n in ep.graph_module.graph.nodes if n.op == "call_function"]
     assert any("mul" in o for o in ops), (
         f"the `* 2` was deleted by the rewrite, not preserved: {ops}")
@@ -101,20 +124,19 @@ def check_region_is_the_operator():
 
 
 def check_one_operator_per_graph():
-    def operator(t):
-        m = t.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
-        return (m * torch.sqrt(((t / m) ** 2).sum(dim=-1, keepdim=True))).squeeze(-1)
-
+    """Historical key now means opt-in bounded mode, not a default capability limit."""
     def two(t):
-        return operator(t) + operator(t)          # two in-frame operators, one graph
+        return torch.logsumexp(t, dim=-1) + torch.logsumexp(torch.sin(t), dim=-1)
 
-    ep = _graph(two)
-    report = _stub_kernel(lambda: NO.apply(ep))
-    assert len(report.fusions) == 1, (
-        f"expected exactly one fused region, got {[f.skeleton for f in report.fusions]}")
-    # and the OTHER operator is still there: this limit is about reach, not about deleting work
-    ops = [str(n.target) for n in ep.graph_module.graph.nodes if n.op == "call_function"]
-    assert any("sqrt" in o for o in ops), f"the second operator was deleted as well: {ops}"
+    ep = _graph(two, decompose=False)
+    report = _stub_kernel(lambda: NO.apply(ep, max_regions=1, verify_with=(M(two), (X,))))
+    assert len(report.fusions) == 1 and report.verified, report.summary()
+    targets = [n.target for n in ep.graph_module.graph.nodes if n.op == "call_function"]
+    assert targets.count(_cpu_lse._opoverload) == 1
+    # The unused compound must remain unexpanded, not merely remain numerically correct.
+    assert targets.count(torch.ops.aten.logsumexp.default) == 1
+    ep.validate()
+    torch.testing.assert_close(ep.module()(X), two(X))
 
 
 def check_row_reductions_only():
@@ -168,10 +190,15 @@ def check_softmax_internals_not_lowered():
 
 def check_needs_decomposition():
     ep = _graph(lambda t: torch.logsumexp(t, dim=-1), decompose=False)
-    report = NO.apply(ep)
-    reasons = [r for r, _d in report.skipped]
-    assert "needs-decomposition" in reasons, (
-        f"a non-decomposed graph no longer says so: {report.summary()}")
+    before = (ep.graph_module, ep.graph_module.graph, ep.graph_module.code, ep.graph_signature)
+    with patch.object(CG, "op_handle", side_effect=AssertionError("lower=False must not generate")):
+        report = NO.apply(ep, lower=False)
+    assert not report.fusions and not report.graph_changed and not report.verified
+    assert report.skipped and all(reason != "needs-decomposition" for reason, _ in report.skipped)
+    assert any(reason == "no-fusion" and detail for reason, detail in report.skipped), report.summary()
+    assert ep.graph_module is before[0] and ep.graph_module.graph is before[1]
+    assert ep.graph_module.code == before[2] and ep.graph_signature is before[3]
+    ep.validate()
 
 
 def check_prod_ratio_needs_a_count():
@@ -220,13 +247,30 @@ def test_every_check_is_in_the_readme():
     assert not extra, f"checks that the README does not document: {sorted(extra)}"
 
 
-def test_every_limit_holds():
-    """Each check is a measurement; a failure here is a false claim in the README."""
+def test_every_historical_key_has_a_valid_explicit_mode_check():
+    """Keep historical inventory without claiming those limits apply to defaults."""
     for key, fn in sorted(CHECKS.items()):
         try:
             fn()
         except AssertionError as e:
-            raise AssertionError(f"README limit {key!r} is false: {e}") from None
+            raise AssertionError(f"historical README key {key!r} regression failed: {e}") from None
+
+
+def test_default_apply_selectively_lowers_multiple_regions_without_core_decomposition():
+    def two(t):
+        return {"first": torch.logsumexp(t, dim=-1),
+                "second": torch.logsumexp(torch.sin(t), dim=-1)}
+
+    ep = _graph(two, decompose=False)
+    assert sum(n.target == torch.ops.aten.logsumexp.default
+               for n in ep.graph_module.graph.nodes) == 2
+    report = _stub_kernel(lambda: NO.apply(ep, verify_with=(M(two), (X,))))
+    assert len(report.fusions) == 2 and report.verified and report.graph_changed, report.summary()
+    targets = [n.target for n in ep.graph_module.graph.nodes if n.op == "call_function"]
+    assert targets.count(_cpu_lse._opoverload) == 2
+    assert torch.ops.aten.logsumexp.default not in targets
+    ep.validate()
+    torch.testing.assert_close(ep.module()(X), two(X))
 
 
 def main():

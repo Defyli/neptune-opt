@@ -3,18 +3,10 @@ Exposing a generated kernel to torch.compile / AOTInductor.
 """
 from __future__ import annotations
 
-import dataclasses
-import importlib.util
-import os
-import random
-import sys
-import tempfile
-
-import sympy as sp
-
 from neptune_codegen import autotune
-from neptune_codegen.skeleton import SKELETONS
-from neptune_codegen.template import compile_skeleton
+from neptune_codegen.skeleton import param_defaults
+from neptune_codegen.template import (compile_skeleton, _row_last_layout, _validate_row_last,
+    launch_reduction, validate_plan, split_launch_shape)
 
 
 # ---------------------------------------------------------------- compiler entry point
@@ -22,7 +14,7 @@ _TRITON_OPS: dict[str, object] = {}
 
 
 def as_triton_op(name: str, block: int | None = None, num_warps: int | None = None,
-                 lib: str = "neptune", params: dict | None = None, keepdim: bool = False):
+                 lib: str = "neptune", params: dict | None = None, keepdim: bool = False, plan: str = "serial"):
     """Expose one generated kernel to torch.compile / AOTInductor as a custom op.
 
     This is the bridge that makes the generated source part of the compiled artifact
@@ -44,7 +36,18 @@ def as_triton_op(name: str, block: int | None = None, num_warps: int | None = No
     # must not share a name. When the configuration is not known (the explicit operator library has
     # no shape), the body resolves it per call instead and it stays out of the name -- correct
     # either way. `autotune.op_key` is shared with the tests so this cannot drift from the claim.
+    validate_plan(plan)
+    if plan == "split":
+        # Serial launch evidence does not tune a two-kernel split plan.
+        block = 1024 if block is None else block
+        num_warps = 4 if num_warps is None else num_warps
+    params = {**param_defaults(name), **(params or {})}
     key = autotune.op_key(lib, name, params, keepdim, block, num_warps)
+    if plan != "serial":
+        key += "_plan_split"
+        from neptune_codegen.algebra import derive_merge_certificate
+        from neptune_codegen.skeleton import SKELETONS
+        derive_merge_certificate(SKELETONS[name], params)
     if key in _TRITON_OPS:
         return _TRITON_OPS[key]
 
@@ -59,7 +62,8 @@ def as_triton_op(name: str, block: int | None = None, num_warps: int | None = No
     # "Unsupported type annotation torch.Tensor".
     globals().setdefault("torch", torch)
 
-    kernel = compile_skeleton(name, params)
+    kernel = (compile_skeleton(name, params) if plan == "serial" else
+              compile_skeleton(name, params, plan=plan))
     # The registered name IS the key: one place computes it (`autotune.op_key`), so the name a graph
     # carries and the name the op is registered under cannot drift apart. They did once -- a
     # refactor left a stale local behind, and every registration raised NameError while the CPU
@@ -72,32 +76,47 @@ def as_triton_op(name: str, block: int | None = None, num_warps: int | None = No
     # inference cannot resolve it (torch is a function-local import here).
     @triton_op(op_name, mutates_args={}, schema="(Tensor x) -> Tensor")
     def _impl(x: torch.Tensor) -> torch.Tensor:
-        # x is (rows, ncols); the generated kernel reduces the last dimension.
-        rows = x.shape[0]
-        ncols = x.numel() // rows
+        _validate_row_last(x)
+        x2, rows, ncols = _row_last_layout(x)
+        shape = x.shape[:-1] + ((1,) if keepdim else ())
+        out = torch.empty(shape, device=x.device, dtype=x.dtype)
+        # A concrete empty batch is valid. Dynamic batches retain a symbolic grid; the
+        # kernel's row guard remains applicable without int(rows) or a batch-size guard.
+        if isinstance(rows, int) and rows == 0:
+            return out
         cfg = (block, num_warps)
         if block is None or num_warps is None:
             chosen = autotune.best_config(rows, ncols, x.dtype, x.device)
             cfg = (chosen[0] if block is None else block, chosen[1] if num_warps is None else num_warps)
         # A `(rows, 1)` and a `(rows,)` result broadcast differently against the rest of a
         # model, so the rank is part of the operator, not a detail of the caller.
-        shape = (rows, 1) if keepdim else (rows,)
         # The result takes the INPUT's dtype, which is what torch's own reductions do
         # (`torch.logsumexp(bf16)` is bf16): the graph downstream is typed, and returning fp32
         # from a bf16 node is a dtype mismatch rather than a precision improvement. The
         # ACCUMULATION still happens in fp32 inside the kernel -- only the result is narrowed.
-        out = torch.empty(shape, device=x.device, dtype=x.dtype)
-        wrap_triton(kernel)[(rows,)](x, out, rows, ncols, x.stride(0), BLOCK=cfg[0],
-                                     num_warps=cfg[1])
+        launch_reduction(kernel, plan, x2, out, rows, ncols, cfg[0], cfg[1], wrapper=wrap_triton)
         return out
 
-    _impl.__name__ = f"neptune_{impl_name}"
+    # Export/Fake needs only metadata, not a CUDA launch or the physical device's tuning
+    # table. Override triton_op's default fake implementation, but keep the real body fully
+    # traceable so functional decomposition still exposes reshape/copy and the Triton HOP.
+    def _fake(x):
+        _validate_row_last(x, metadata=True)
+        if plan == "split":
+            split_launch_shape(x.shape[-1], block if block is not None else 1024)
+        shape = x.shape[:-1] + ((1,) if keepdim else ())
+        return torch.empty(shape, device=x.device, dtype=x.dtype)
+
+    if hasattr(_impl, "register_fake"):
+        _impl.register_fake(_fake)
+    _impl.__name__ = f"{lib}_{impl_name}"
     _TRITON_OPS[key] = _impl
     return _impl
 
 
 def op_handle(name: str, params: dict | None = None, lib: str = "neptune",
-              keepdim: bool = False, block: int | None = None, num_warps: int | None = None):
+              keepdim: bool = False, block: int | None = None, num_warps: int | None = None,
+              plan: str = "serial"):
     """The OpOverload for a compiled skeleton, for building graph nodes.
 
     Registration tags the op with its parameter values and output rank (see `as_triton_op`),
@@ -106,7 +125,7 @@ def op_handle(name: str, params: dict | None = None, lib: str = "neptune",
     import torch
 
     impl = as_triton_op(name, block=block, num_warps=num_warps, params=params, lib=lib,
-                        keepdim=keepdim)
+                        keepdim=keepdim, plan=plan)
     packet = getattr(getattr(torch.ops, lib), impl.__name__[len(lib) + 1:])
     # Return the OVERLOAD, not the packet: an FX graph carries `torch.ops.aten.amax.default`,
     # not `torch.ops.aten.amax`, and Inductor's post-grad graph rejects a packet outright

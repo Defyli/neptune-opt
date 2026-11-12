@@ -4,11 +4,6 @@ The skeleton spec and its registry.
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
-import os
-import random
-import sys
-import tempfile
 
 import sympy as sp
 
@@ -96,6 +91,9 @@ class Skeleton:
     # What `check_supported` requires instead is that the term READS the producer (or pass 1
     # is dead work) and that `producer_expr` says what the graph reduces.
     two_pass: bool = False
+    # Reachable RAW producer domain. "auto" derives it from the producer operand;
+    # explicit domains are checked, not used to assert an unproved sign.
+    producer_domain: str = "auto"  # "auto" | "real" | "nonnegative"
     # NB: there is deliberately no `producer_finalize`. A first version had one, to turn the
     # raw reduction into the value the term reads (e.g. a mean). That was redundant, and worse,
     # it made the operator UNRECOGNISABLE: `producer_expr` is already the per-element operand
@@ -109,6 +107,9 @@ SKELETONS: dict[str, Skeleton] = {}
 
 
 def register(sk: Skeleton) -> Skeleton:
+    previous = SKELETONS.get(sk.name)
+    if previous is not None and previous != sk:
+        raise ValueError(f"skeleton {sk.name!r} is already registered with different algebra; use a new name")
     SKELETONS[sk.name] = sk
     return sk
 

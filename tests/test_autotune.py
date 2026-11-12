@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import types
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -209,12 +210,13 @@ def test_run_fills_the_skeletons_declared_defaults():
         seen["params"] = params
         return _Recorder()
 
-    real = T.compile_skeleton
-    T.compile_skeleton = fake_compile
-    try:
+    # Only execution is stubbed: validate the real shape/dtype contract, bypassing the
+    # CUDA-only device requirement for this CPU launch recorder.
+    validate = T._validate_row_last
+    with mock.patch.object(T, "compile_skeleton", fake_compile), mock.patch.object(
+        T, "_validate_row_last", side_effect=lambda x, **kw: validate(x, metadata=True)
+    ):
         T.run("logsumexp", torch.randn(4, 8))
-    finally:
-        T.compile_skeleton = real
     assert "launched" in seen, "the kernel was never launched"
     assert seen["params"], "no parameters reached the generator"
 
@@ -255,6 +257,7 @@ def test_op_registration_uses_the_shared_key():
     registered = {}
     real_triton_op = torch.library.triton_op
     real_compile = TO.compile_skeleton
+    saved_ops = dict(TO._TRITON_OPS)
 
     def fake_triton_op(name, **kwargs):
         def decorate(fn):
@@ -266,12 +269,282 @@ def test_op_registration_uses_the_shared_key():
     TO.compile_skeleton = lambda name, params=None: object()
     try:
         TO.as_triton_op("logsumexp", block=8192, num_warps=8, lib="neptune",
-                        params={"T": 2.0}, keepdim=True)
+                        params={"tiny": 0.0}, keepdim=True)
     finally:
         torch.library.triton_op = real_triton_op
         TO.compile_skeleton = real_compile
-    assert registered["name"] == "neptune::logsumexp_keep_T2_b8192w8", registered
-    assert registered["name"] == autotune.op_key("neptune", "logsumexp", {"T": 2.0}, True, 8192, 8)
+        TO._TRITON_OPS.clear()
+        TO._TRITON_OPS.update(saved_ops)
+    assert registered["name"] == "neptune::logsumexp_keep_tiny0_b8192w8", registered
+    assert registered["name"] == autotune.op_key("neptune", "logsumexp", {"tiny": 0.0}, True, 8192, 8)
+
+
+def test_exact_scalar_keys_paths_and_compile_cache():
+    import neptune_codegen.template as T
+
+    values = [1.0, 1.0000001, 1.0000002, -0.0, 0.0, 1e-8, 1e8]
+    keys = [autotune.op_key("neptune", "softcap_lse", {"beta": v}, False) for v in values]
+    paths = [T.generated_path("softcap_lse", {"beta": v}) for v in values]
+    assert len(set(keys)) == len(values)
+    assert len(set(paths)) == len(values)
+    assert autotune.op_key("neptune", "logsumexp", {"T": 2.0}, True) == "neptune::logsumexp_keep_T2"
+    assert all(key.split("::")[1].isidentifier() for key in keys)
+    a = {"alpha": 1.0000001, "beta": 2.0}
+    b = dict(reversed(list(a.items())))
+    assert autotune.parameter_identity(a) == autotune.parameter_identity(b)
+    assert autotune.parameter_tag(a) == autotune.parameter_tag(b)
+    assert autotune.parameter_tag({"a": 1, "b": 2}) != autotune.parameter_tag({"a1_b": 2})
+    assert autotune.parameter_tag({"a1": 2}) != autotune.parameter_tag({"a": 12})
+
+    # Exercise the real cache and importer without importing or executing Triton.
+    counter = []
+
+    def load(mod):
+        mod.softcap_lse = object()
+        counter.append(mod.softcap_lse)
+
+    spec = types.SimpleNamespace(loader=types.SimpleNamespace(exec_module=load))
+    saved = dict(T._CACHE)
+    module_names = ["neptune_gen_softcap_lse" + autotune.parameter_tag({"beta": v, "tiny": 0.0})
+                    for v in (1.0000001, 1.0000002)]
+    modules = {name: sys.modules.get(name) for name in module_names}
+    try:
+        T._CACHE.clear()
+        with mock.patch("builtins.open", mock.mock_open()), mock.patch.object(
+            T.importlib.util, "spec_from_file_location", return_value=spec
+        ), mock.patch.object(T.importlib.util, "module_from_spec", side_effect=lambda _: types.ModuleType("stub")):
+            first = T.compile_skeleton("softcap_lse", {"beta": 1.0000001, "tiny": 0.0})
+            second = T.compile_skeleton("softcap_lse", {"beta": 1.0000002, "tiny": 0.0})
+            assert first is not second
+            assert T.compile_skeleton("softcap_lse", {"beta": 1.0000001, "tiny": 0.0}) is first
+            assert T.compile_skeleton("softcap_lse", {"beta": 1.0000001, "tiny": 0.0}, force=True) is not first
+            assert len(counter) == 3
+    finally:
+        T._CACHE.clear()
+        T._CACHE.update(saved)
+        for name, module in modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def test_symbolic_config_never_concretises_even_hinted_rows():
+    import torch
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    class Hinted:
+        def __int__(self):
+            raise AssertionError("must not specialise hinted symbolic shapes")
+
+    registry = {"test-gpu": {"table": {("many", 4096): (4096, 4)}}}
+    with fake_registry(TABLES=registry):
+        assert autotune.best_config(Hinted(), 4096, device_name="test-gpu") == autotune.DEFAULT
+        assert autotune.best_config(32, Hinted(), device_name="test-gpu") == autotune.DEFAULT
+        env = ShapeEnv()
+        symbolic = env.create_unbacked_symint()
+        assert isinstance(symbolic, torch.SymInt)
+        assert autotune.best_config(symbolic, 4096, device_name="test-gpu") == autotune.DEFAULT
+        assert autotune.rows_class(symbolic) == "many"
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from neptune_codegen.template import _row_last_layout
+        with FakeTensorMode(shape_env=env):
+            x = torch.empty(symbolic, 3, 4096)
+            flat, rows, width = _row_last_layout(x)
+            assert isinstance(rows, torch.SymInt)
+            assert flat.shape == (symbolic * 3, 4096)
+            assert width == 4096
+            assert autotune.best_config(rows, width, device_name="test-gpu") == autotune.DEFAULT
+
+
+def test_cpu_config_never_queries_cuda_and_device_selection_is_explicit():
+    import torch
+
+    with mock.patch.object(torch.cuda, "get_device_name", side_effect=AssertionError("no CUDA query")):
+        assert autotune.best_config(1, 4096, device="cpu") == autotune.DEFAULT
+        assert autotune.best_config(1, 4096) == autotune.DEFAULT
+        assert autotune.device_name_of(torch.device("cpu")) is None
+    with mock.patch.object(torch.cuda, "get_device_name", return_value="Test GPU") as query:
+        assert autotune.device_name_of(torch.device("cuda:3")) == "Test GPU"
+        query.assert_called_with(torch.device("cuda:3"))
+        assert autotune.device_name_of(torch.device("cuda")) == "Test GPU"
+        query.assert_called_with(torch.device("cuda"))
+
+
+def test_all_template_loads_use_column_stride_and_source_is_deterministic():
+    import ast
+    import neptune_codegen.template as T
+    from neptune_codegen.skeleton import SKELETONS, param_defaults, supported
+
+    plans = set()
+    for name in supported():
+        sk = SKELETONS[name]
+        params = param_defaults(name)
+        src = T.emit_kernel_source(sk, params)
+        assert src == T.emit_kernel_source(sk, dict(reversed(list(params.items()))))
+        tree = ast.parse(src)
+        fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
+        assert [arg.arg for arg in fn.args.args][-2:] == ["stride_col", "BLOCK"]
+        loads = [node for node in ast.walk(fn) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == "load"]
+        assert len(loads) == (2 if sk.two_pass else 1)
+        assert all("idx * stride_col" in ast.unparse(load.args[0]) for load in loads)
+        assert "tl.exp(tl.maximum(tl.minimum(" not in src
+        plans.add(sk.two_pass)
+    assert plans == {False, True}
+
+
+def test_true_exp_preserves_underflow_and_positive_overflow():
+    import numpy as np
+    import sympy as sp
+    from neptune_codegen.sym_to_triton import to_triton
+
+    symbol = sp.Symbol("x", real=True)
+    source = to_triton(sp.exp(symbol), {symbol: "x"})
+    assert source == "tl.exp(x)"
+    x = np.array([-100.0, 85.0, 100.0], dtype=np.float32)
+    with np.errstate(over="ignore", under="ignore"):
+        actual = eval(source, {"tl": types.SimpleNamespace(exp=np.exp), "x": x})
+        expected = np.exp(x)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual[0] < np.exp(np.float32(-80))
+    assert actual[1] > np.exp(np.float32(80))
+    assert np.isposinf(actual[2])
+    # Repair must compose even when shifted logits are below -80. Hidden clipping
+    # destroys this identity: clipped exp(-90) * exp(-10) != clipped exp(-100).
+    c, old, fresh = sp.symbols("c old fresh", real=True)
+    term = to_triton(sp.exp(c - old), {c: "c", old: "old"})
+    repair = to_triton(sp.exp(old - fresh), {old: "old", fresh: "fresh"})
+    target = to_triton(sp.exp(c - fresh), {c: "c", fresh: "fresh"})
+    bindings = {"tl": types.SimpleNamespace(exp=np.exp), "c": -90.0, "old": 0.0, "fresh": 10.0}
+    np.testing.assert_allclose(eval(term, bindings) * eval(repair, bindings),
+                               eval(target, bindings), rtol=1e-14, atol=0)
+
+
+def test_row_last_runtime_shapes_strides_copies_and_zero_rows():
+    import torch
+    import neptune_codegen.template as T
+    import neptune_codegen.torch_op as TO
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def __getitem__(self, grid):
+            def launch(x, out, rows, width, stride_row, stride_col, **kwargs):
+                assert grid == (rows,)
+                assert x.shape == (rows, width)
+                assert x.stride() == (stride_row, stride_col)
+                self.calls.append(x)
+                out.copy_(torch.logsumexp(x, dim=-1).reshape(out.shape))
+            return launch
+
+    recorder = Recorder()
+    validate = T._validate_row_last
+    # All CPU tensors still run real validation for rank/layout/dtype/width; only device
+    # execution is substituted, and the recorder checks every argument of the real launch.
+    with mock.patch.object(T, "compile_skeleton", return_value=recorder), mock.patch.object(
+        TO, "compile_skeleton", return_value=recorder
+    ), mock.patch.object(T, "_validate_row_last", side_effect=lambda x, **kw: validate(x, metadata=True)), mock.patch.object(
+        TO, "_validate_row_last", side_effect=lambda x, **kw: validate(x, metadata=True)
+    ), mock.patch.object(torch.library, "triton_op", side_effect=lambda *a, **kw: lambda fn: fn), mock.patch.object(
+        torch.library, "wrap_triton", side_effect=lambda kernel: kernel
+    ), mock.patch.dict(TO._TRITON_OPS, {}, clear=True):
+        base = torch.randn(4, 6, 8)
+        inputs = [torch.randn(8), torch.randn(3, 8), torch.randn(2, 3, 8),
+                  torch.randn(2, 3, 4, 8), torch.randn(3, 16)[:, ::2],
+                  torch.randn(8, 3).t(), torch.randn(3, 1).expand(3, 8),
+                  base[:, :, ::2], base.transpose(0, 1)]
+        for keep in (False, True):
+            op = TO.as_triton_op("logsumexp", lib="cpu_recorder", keepdim=keep)
+            for x in inputs:
+                expected = torch.logsumexp(x, dim=-1, keepdim=keep)
+                for call in (lambda: T.run("logsumexp", x, keepdim=keep), lambda: op(x)):
+                    actual = call()
+                    assert actual.shape == expected.shape
+                    assert actual.dtype == x.dtype
+                    torch.testing.assert_close(actual, expected)
+                    flattened = recorder.calls[-1]
+                    if x.ndim <= 2 or x is inputs[-2]:
+                        assert flattened.data_ptr() == x.data_ptr(), "unnecessary contiguous copy"
+                    if x is inputs[-1]:
+                        assert flattened.data_ptr() != x.data_ptr(), "non-viewable leading dims must copy"
+            count = len(recorder.calls)
+            for shape in ((0, 8), (2, 0, 8)):
+                x = torch.empty(shape)
+                assert T.run("logsumexp", x, keepdim=keep).shape == shape[:-1] + ((1,) if keep else ())
+                assert op(x).shape == shape[:-1] + ((1,) if keep else ())
+            assert len(recorder.calls) == count, "zero rows launched a kernel"
+
+
+def test_runtime_rejects_unsupported_inputs_but_meta_infers_shapes():
+    import torch
+    import neptune_codegen.template as T
+
+    cases = [(torch.empty(2, 8), ValueError, "device"),
+             (torch.empty((), device="meta"), ValueError, "rank"),
+             (torch.empty(2, 0, device="meta"), RuntimeError, "width"),
+             (torch.empty(2, 8, device="meta", dtype=torch.float64), TypeError, "dtype"),
+             (torch.empty(2, 8, device="meta", dtype=torch.int32), TypeError, "dtype")]
+    for x, error, message in cases:
+        try:
+            T.run("logsumexp", x)
+        except error as exc:
+            assert message in str(exc)
+        else:
+            raise AssertionError(f"unsupported input accepted: {x.shape} {x.dtype} {x.device}")
+    with mock.patch.object(T, "compile_skeleton", side_effect=AssertionError("metadata compiled Triton")):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for shape in ((8,), (2, 3, 8), (2, 0, 8)):
+                for keep in (False, True):
+                    out = T.run("logsumexp", torch.empty(shape, device="meta", dtype=dtype), keepdim=keep)
+                    assert out.shape == shape[:-1] + ((1,) if keep else ())
+                    assert out.dtype == dtype
+
+
+def test_real_op_fake_and_dynamic_export_without_gpu_launch():
+    import torch
+    import neptune_codegen.torch_op as TO
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    if not hasattr(torch.library, "triton_op"):
+        return
+    with mock.patch.object(TO, "compile_skeleton", return_value=object()):
+        op = TO.as_triton_op("logsumexp", lib="neptune_cpu_metadata", keepdim=True)
+        handle = TO.op_handle("logsumexp", lib="neptune_cpu_metadata", keepdim=True)
+    assert handle is not None
+    with FakeTensorMode():
+        for shape in ((8,), (2, 3, 8), (0, 3, 8)):
+            x = torch.empty(shape, dtype=torch.bfloat16)
+            out = op(x)
+            assert out.shape == shape[:-1] + (1,)
+            assert out.dtype == torch.bfloat16
+
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return op(x)
+
+    exported = torch.export.export(Model(), (torch.empty(2, 3, 8),),
+                                   dynamic_shapes={"x": {0: torch.export.Dim("batch", min=1, max=16)}})
+    node = next(n for n in exported.graph.nodes if n.op == "call_function")
+    assert node.meta["val"].shape[0] == next(n for n in exported.graph.nodes if n.op == "placeholder").meta["val"].shape[0]
+    assert isinstance(node.meta["val"].shape[0], torch.SymInt)
+
+
+def test_generated_directory_is_owned_and_released_at_exit():
+    # Child process keeps this process's live Triton sources untouched. No helper file.
+    result = subprocess.run([sys.executable, "-c",
+        "import neptune_codegen.template as t; print(t._GEN_DIR, flush=True)"],
+        check=True, capture_output=True, text=True)
+    path = result.stdout.strip()
+    assert path and not os.path.exists(path), "TemporaryDirectory leaked at interpreter exit"
+    result = subprocess.run([sys.executable, "-c",
+        "import neptune_codegen.template as t; t._release_generated_dir(); t._release_generated_dir(); "
+        "\ntry: t.generated_path('logsumexp')"
+        "\nexcept RuntimeError: pass"
+        "\nelse: raise AssertionError('released owner accepted new source')"],
+        check=True, capture_output=True, text=True)
+    assert result.returncode == 0
 
 
 def main():

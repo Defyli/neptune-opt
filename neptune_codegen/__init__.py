@@ -65,6 +65,9 @@ from neptune_codegen.skeleton import NEGATIVE_CONTROLS, Skeleton, SKELETONS, reg
 from neptune_codegen.algebra import _BRANCH_CUT, _simplify, repair_factor, repair_bias, repair_pair, vanishes, _numerically_zero, _marked, term_expr, _as_quotient_power  # noqa: F401
 from neptune_codegen.emitters import check_supported, derived_producer_expr, producer_nonneg, producer_init, consumer_init, producer_operand, guard_value, denominator_expr, _bindings, param_bindings, producer_update, consumer_update, scale_source, bias_source, bias_line, term_source, finalize_source, consumer_fold_no_repair  # noqa: F401
 from neptune_codegen.template import _GEN_DIR, _CACHE, _TEMPLATE, emit_kernel_source, generated_path, compile_skeleton, run  # noqa: F401
+from neptune_codegen.algebra import MergeCertificate, derive_merge_certificate, reachable_producer_domain, coordinate_needs_floor
+from neptune_codegen.emitters import effective_producer_source, emit_state_helpers, state_finalize_source
+from neptune_codegen.template import split_launch_shape, MAX_SPLIT_PARTS
 from neptune_codegen import autotune  # noqa: F401
 from neptune_codegen.torch_op import _TRITON_OPS, as_triton_op, op_handle, triton_op_name  # noqa: F401
 from neptune_codegen.references import reference, graph_reference  # noqa: F401
@@ -78,6 +81,15 @@ from neptune_codegen import sym_to_triton  # noqa: F401,E402
 from neptune_codegen.sym_to_triton import TranslationError, _Q, to_triton  # noqa: F401
 
 __all__ = [
+    "MergeCertificate",
+    "derive_merge_certificate",
+    "reachable_producer_domain",
+    "coordinate_needs_floor",
+    "effective_producer_source",
+    "emit_state_helpers",
+    "state_finalize_source",
+    "split_launch_shape",
+    "MAX_SPLIT_PARTS",
     "NEGATIVE_CONTROLS",
     "SKELETONS",
     "Skeleton",

@@ -1,6 +1,11 @@
 """
 Tests for the neptune_opt integration layer.
 
+The transaction regressions mock kernel generation with CPU reference custom ops and
+registered fake metadata, never launching a GPU or contacting a service. Historical
+inline-fold source goldens below describe their correction to shared state semantics;
+algebraic repair goldens and numerical bounds remain unchanged.
+
 Most of these run on CPU with NO Triton installed, on purpose: the safety gates are the
 part that must never be wrong, and they decide before any kernel is generated. A test suite
 that can only run on the deployment machine is a test suite that gets skipped.
@@ -11,7 +16,9 @@ from __future__ import annotations
 
 import os
 import sys
+from unittest.mock import patch
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -346,14 +353,23 @@ def test_multiplicative_repairs_are_unchanged_by_the_affine_generalisation():
         # ("ALiBi-biased logsumexp") is copied into the generated header.
         assert "bias = tl.where" not in src, f"{name}: emitted an unexpected bias line"
         assert "+ bias" not in src, f"{name}: emitted an unexpected bias term"
-        assert "acc * scale +" in src or "acc * scale," in src
+        # Historical inline-fold golden is obsolete: serial now shares the certified
+        # chunk/merge state with split. Preserve the repair expressions above, while
+        # requiring explicit occupancy/status and eager-safe transport, not m == 0.
+        assert f"def {name}_chunk(" in src and f"def {name}_merge_state(" in src
+        assert "m, acc, seen, status = " + name + "_merge_state(" in src
+        assert "both = (vA != 0) & (vB != 0)" in src
+        assert "oldA = tl.where(both, mA, 1.0)" in src
+        assert "oldB = tl.where(both, mB, 1.0)" in src
+        assert "fresh = tl.where(both, combined_m, 1.0)" in src
+        assert "safeA = tl.where(both, aA, 0.0)" in src
+        assert "safeB = tl.where(both, aB, 0.0)" in src
+        assert "return m, acc, vA | vB, statusA | statusB" in src
+        assert "m ==" not in src
 
-    # Pin the exact fold of the paper's own operator. The affine generalisation must have
-    # added an OPTION to the emitted statement, not changed the statement itself -- the
-    # max-consumer shape and the guarded scale are both load-bearing.
     src = CG.emit_kernel_source(CG.SKELETONS["rmsnorm_max"], {"eps": 1e-6})
-    assert "scale = tl.where(m == 0.0, 1.0, " in src, src
-    assert "acc = tl.maximum(acc * scale, tl.max(" in src, src
+    assert "combined_a = tl.maximum(safeA * (" in src, src
+    assert "safeB * (" in src and "1e-30" not in src, src
 
 
 def test_affine_repair_is_derived_for_a_max_consumer():
@@ -374,7 +390,9 @@ def test_affine_repair_is_derived_for_a_max_consumer():
     assert "+ bias" in CG.consumer_update(sk, {}), CG.consumer_update(sk, {})
     assert CG.bias_line(sk, {}) != "", "bias must be emitted for an affine repair"
     # and the bias must be zeroed on the first block, or the identity is broken there
-    assert "tl.where(m == " in CG.bias_line(sk, {})
+    # A legitimate producer zero is not an empty-state sentinel.
+    assert "bias = tl.where(seen, " in CG.bias_line(sk, {})
+    assert "m ==" not in CG.bias_line(sk, {})
 
 
 def test_bias_is_refused_for_an_additive_consumer():
@@ -468,8 +486,9 @@ def test_producer_floor_is_applied_only_where_the_source_divides():
     import neptune_codegen as CG
     from neptune_codegen.symbols import c_sym, s_sym, s2_sym  # noqa: F401
 
-    # divides by the producer -> floored
-    assert CG.denominator_expr(CG.SKELETONS["rmsnorm_max"]) == "tl.maximum(m_new, 1e-30)"
+    # Historical 'any denominator mentions s' predicate over-floored RMS: positive
+    # eps already removes the zero singularity. A bare ratio still needs its floor.
+    assert CG.denominator_expr(CG.SKELETONS["rmsnorm_max"]) == "m_new"
     assert CG.denominator_expr(CG.SKELETONS["linear_attn"]) == "tl.maximum(m_new, 1e-30)"
     # no division by the producer -> raw (the exponential folds, and now the affine ones)
     assert CG.denominator_expr(CG.SKELETONS["logsumexp"]) == "m_new"
@@ -531,8 +550,8 @@ def test_two_pass_plan_emits_two_loops_and_no_repair():
         # because that is how the graph spells a mean and `producer_expr` is what the
         # recogniser compares against -- see the declaration in neptune_codegen/library.py.
         lines = src.splitlines()
-        pass1 = next(i for i, l in enumerate(lines) if "pass 1" in l)
-        den = next(i for i, l in enumerate(lines) if l.strip() == "den = m")
+        pass1 = next(i for i, line in enumerate(lines) if "pass 1" in line)
+        den = next(i for i, line in enumerate(lines) if line.strip() == "den = m")
         assert "v * ((1.0 / (ncols)))" in src, src
         assert pass1 < den, src
         assert "den = m_new" not in src, src
@@ -591,7 +610,7 @@ def test_two_pass_refuses_a_term_that_ignores_the_producer():
     """
     import sympy as sp
     import neptune_codegen as CG
-    from neptune_codegen.symbols import _PARAM_N, c_sym, s_sym
+    from neptune_codegen.symbols import _PARAM_N, c_sym
 
     dead = CG.Skeleton(name="dead_pass", g=sp.exp(c_sym - sp.Abs(c_sym)),
                        finalize=CG._FINAL_ACC, producer="signed", producer_reducer="sum",
@@ -749,3 +768,674 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# Merge tests are intentionally appended: run with pytest (the legacy script main
+# above runs before these definitions). No Triton import, compilation, or GPU launch.
+def test_merge_exact_certificates_for_nine_single_pass_skeletons():
+    import neptune_codegen as CG
+    singles = [sk for sk in CG.SKELETONS.values() if not sk.two_pass]
+    assert len(singles) == 9
+    for sk in singles:
+        cert = CG.derive_merge_certificate(sk, CG.param_defaults(sk.name))
+        assert cert.proof_kind == "exact-symbolic"
+        assert cert.requires_finite
+        assert cert.assumptions
+    assert CG.derive_merge_certificate(CG.SKELETONS["rmsnorm_max"], {"eps": 1e-6}).producer_domain == "nonnegative"
+
+
+def test_merge_refuses_two_pass_unknown_reducers_and_unproved_signed_max():
+    import dataclasses
+    import pytest
+    import sympy as sp
+    import neptune_codegen as CG
+    for name in ("variance", "std"):
+        with pytest.raises(NotImplementedError, match="two_pass"):
+            CG.emit_kernel_source(CG.SKELETONS[name], {}, plan="split")
+    base = CG.SKELETONS["linear_attn"]
+    for field in ("producer_reducer", "consumer_reducer"):
+        with pytest.raises(NotImplementedError, match="unknown"):
+            CG.derive_merge_certificate(dataclasses.replace(base, **{field: "mul"}))
+    signed = dataclasses.replace(base, producer="signed", consumer_reducer="max")
+    with pytest.raises(NotImplementedError, match="strictly positive"):
+        CG.derive_merge_certificate(signed)
+    false_domain = dataclasses.replace(signed, producer_domain="nonnegative")
+    with pytest.raises(NotImplementedError, match="not proved"):
+        CG.derive_merge_certificate(false_domain)
+    shifted = CG.Skeleton("affine_max", CG.c_sym - CG.s_sym, CG._FINAL_ACC,
+                          producer="signed", consumer_reducer="max")
+    cert = CG.derive_merge_certificate(shifted)
+    assert cert.factor == 1 and sp.simplify(cert.bias - CG.s_sym + CG.s2_sym) == 0
+
+
+def test_merge_certificate_never_uses_numeric_proof_and_checks_params(monkeypatch):
+    import pytest
+    import neptune_codegen as CG
+    import neptune_codegen.algebra as algebra
+    # Even the legacy derivation's validation must stay on its symbolic branch here.
+    def forbidden(*args, **kwargs):
+        raise AssertionError("numeric sampling is not a proof")
+    monkeypatch.setattr(algebra, "_numerically_zero", forbidden)
+    for sk in CG.SKELETONS.values():
+        if not sk.two_pass:
+            CG.derive_merge_certificate(sk, CG.param_defaults(sk.name))
+    for value in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(NotImplementedError):
+            CG.derive_merge_certificate(CG.SKELETONS["rmsnorm_max"], {"eps": value})
+
+
+def test_merge_floor_coordinates_only_for_zero_singular_nonnegative_max():
+    import neptune_codegen as CG
+    for name in ("stable_l2", "linear_attn", "sumsq_div"):
+        sk = CG.SKELETONS[name]
+        assert CG.coordinate_needs_floor(sk)
+        src = CG.emit_kernel_source(sk, CG.param_defaults(name), plan="split")
+        assert "qA = tl.maximum(oldA, 1e-30)" in src
+        assert "qB = tl.maximum(oldB, 1e-30)" in src
+        assert "qNew = tl.maximum(fresh, 1e-30)" in src
+    for name in ("decay_renorm", "rmsnorm_max", "logsumexp"):
+        sk = CG.SKELETONS[name]
+        assert not CG.coordinate_needs_floor(sk)
+        assert "1e-30" not in CG.emit_kernel_source(sk, CG.param_defaults(name))
+    assert "tl.maximum(m, 1e-30)" in CG.finalize_source(CG.SKELETONS["stable_l2"])
+
+
+def _merge_cpu_generated_helpers(sk, params, width, block):
+    """Execute the actual generated chunk/combiner source against NumPy tl primitives.
+
+    This validates source semantics, not Triton typing/codegen or GPU numerics.
+    """
+    import ast
+    import types
+    import numpy as np
+    import neptune_codegen as CG
+
+    class Pointer:
+        def __init__(self, data, offset=0):
+            self.data, self.offset = data, offset
+        def __add__(self, offset):
+            return Pointer(self.data, self.offset + offset)
+
+    def load(ptr, mask, other):
+        offsets = np.asarray(ptr.offset)
+        safe = np.where(mask, offsets, 0)
+        return np.where(mask, ptr.data[safe], other)
+
+    tl = types.SimpleNamespace(
+        float32=np.float32, int32=np.int32, constexpr=int,
+        arange=np.arange, load=load, where=np.where, abs=np.abs,
+        maximum=np.maximum, minimum=np.minimum, sqrt=np.sqrt,
+        log=np.log, exp=np.exp, sigmoid=lambda x: 1 / (1 + np.exp(-x)),
+        sum=lambda x, axis: np.asarray(np.sum(x, axis=axis)),
+        max=lambda x, axis: np.asarray(np.max(x, axis=axis)),
+        full=lambda shape, value, dtype: np.full(shape, value, dtype),
+    )
+    # Triton tensor.to is NumPy's astype for this CPU semantic replay.
+    tree = ast.parse(CG.emit_state_helpers(sk, params))
+    class ToNumpy(ast.NodeTransformer):
+        def visit_Attribute(self, node):
+            self.generic_visit(node)
+            if node.attr == "to":
+                node.attr = "astype"
+            return node
+    tree = ToNumpy().visit(tree)
+    for fn in tree.body:
+        fn.decorator_list = []
+        for arg in fn.args.args:
+            arg.annotation = None
+    namespace = {"tl": tl, "ncols": width}
+    exec(compile(ast.fix_missing_locations(tree), "<merge-source-cpu>", "exec"), namespace)
+    chunk = namespace[sk.name + "_chunk"]
+    merge = namespace[sk.name + "_merge_state"]
+    def partial(data, off):
+        return chunk(Pointer(np.asarray(data, np.float32)), 0, off, width, width, 1, block)
+    return partial, merge
+
+
+def test_merge_generated_source_partition_tree_zero_floor_and_global_n():
+    import numpy as np
+    import neptune_codegen as CG
+    for name, sk in CG.SKELETONS.items():
+        if sk.two_pass:
+            continue
+        data = np.array([-3., 0., 2., 1., -1., 0., 5.], np.float32)
+        params = CG.param_defaults(name)
+        partial, merge = _merge_cpu_generated_helpers(sk, params, len(data), 2)
+        states = [partial(data, off) for off in range(0, len(data), 2)]
+        left = states[0]
+        for state in states[1:]:
+            left = merge(*left, *state)
+        balanced = merge(*merge(*states[0], *states[1]), *merge(*states[2], *states[3]))
+        whole, _ = _merge_cpu_generated_helpers(sk, params, len(data), 8)
+        expected = whole(data, 0)
+        np.testing.assert_allclose(left[:2], expected[:2], rtol=2e-6, atol=1e-6)
+        np.testing.assert_allclose(balanced[:2], expected[:2], rtol=2e-6, atol=1e-6)
+        empty = (np.float32(0), np.float32(0), np.int32(0), np.int32(0))
+        np.testing.assert_allclose(merge(*empty, *left)[:2], left[:2])
+        np.testing.assert_allclose(merge(*left, *empty)[:2], left[:2])
+    for name in ("stable_l2", "linear_attn", "sumsq_div"):
+        sk = CG.SKELETONS[name]
+        partial, merge = _merge_cpu_generated_helpers(sk, {}, 3, 1)
+        data = np.array([0., 0.5e-30, 0.5e-30], np.float32)
+        states = [partial(data, i) for i in range(3)]
+        merged = merge(*merge(*states[0], *states[1]), *states[2])
+        whole, _ = _merge_cpu_generated_helpers(sk, {}, 3, 4)
+        np.testing.assert_allclose(merged[:2], whole(data, 0)[:2], rtol=2e-6, atol=0)
+
+
+def test_merge_log_nonfinite_status_and_unclipped_transport():
+    import numpy as np
+    import neptune_codegen as CG
+    sk = CG.SKELETONS["logsumexp"]
+    for data, status, seen in (([-np.inf, -np.inf], 0, 0),
+                                ([np.inf, 1.], 2, 1),
+                                ([np.nan, np.inf], 3, 0),
+                                ([-np.inf, 1.], 0, 1)):
+        partial, merge = _merge_cpu_generated_helpers(sk, {"tiny": 0.0}, 2, 1)
+        with np.errstate(invalid="raise", divide="raise"):
+            result = merge(*partial(data, 0), *partial(data, 1))
+        assert result[2] == seen and result[3] == status
+        assert not np.isnan(result[1])
+    source = CG.emit_kernel_source(sk, {"tiny": 0.0}, plan="split")
+    assert "safe_phi" in source and "finite_mask" in source
+    assert "-80.0" not in source and "80.0" not in source
+    assert "(status & 1)" in source and "(status & 2)" in source
+
+
+def test_merge_plan_capacity_dynamic_width_and_source_identity():
+    import ast
+    import pytest
+    import neptune_codegen as CG
+    assert CG.split_launch_shape(1025, 1024) == (2, 2)
+    assert CG.split_launch_shape(4096, 1) == (4096, 4096)
+    with pytest.raises(NotImplementedError, match="capacity"):
+        CG.split_launch_shape(4097, 1)
+    class SymbolicWidth:
+        def __int__(self):
+            raise AssertionError("must not concretise symbolic width")
+    with pytest.raises(NotImplementedError, match="concrete width"):
+        CG.split_launch_shape(SymbolicWidth(), 1024)
+    with pytest.raises(ValueError, match="power of two"):
+        CG.split_launch_shape(32, 3)
+    for sk in CG.SKELETONS.values():
+        params = CG.param_defaults(sk.name)
+        ast.parse(CG.emit_kernel_source(sk, params))
+        if not sk.two_pass:
+            src = CG.emit_kernel_source(sk, params, plan="split")
+            ast.parse(src)
+            assert "tl.reduce((m, acc, seen, status)" in src
+            assert "idx * stride_col" in src
+            assert "row * stride_row" in src
+            assert "m ==" not in src
+            assert "plan='split'" in src
+    p1, p2 = {"tiny": 1.23456701}, {"tiny": 1.23456702}
+    assert CG.generated_path("logsumexp", p1) != CG.generated_path("logsumexp", p2)
+    assert CG.generated_path("logsumexp", p1) != CG.generated_path("logsumexp", p1, plan="split")
+
+
+def test_merge_log_finalizer_whole_math_nonfinite_and_large_range():
+    import math
+    import numpy as np
+    import neptune_codegen as CG
+    from neptune_codegen.emitters import state_finalize_source
+    import types
+    tl = types.SimpleNamespace(where=np.where, log=np.log, maximum=np.maximum)
+    for name, sk in CG.SKELETONS.items():
+        if not sk.is_log:
+            continue
+        params = CG.param_defaults(name)
+        data_cases = ([np.nan, np.inf, 1.], [np.inf, -np.inf, 1.],
+                      [-np.inf, -np.inf, -np.inf], [0., -100., -200.])
+        for data in data_cases:
+            partial, merge = _merge_cpu_generated_helpers(sk, params, 3, 1)
+            with np.errstate(invalid="ignore", over="ignore", divide="raise"):
+                states = [partial(data, i) for i in range(3)]
+                m, acc, seen, status = merge(*merge(*states[0], *states[1]), *states[2])
+                result = eval(state_finalize_source(sk, params), {"tl": tl},
+                              {"m": m, "acc": acc, "seen": seen, "status": status})
+            x = torch.tensor([data], dtype=torch.float32)
+            expected = float(CG.reference(name, x, **params)[0])
+            if math.isnan(expected):
+                assert math.isnan(float(result))
+            elif math.isinf(expected):
+                assert float(result) == expected
+            else:
+                np.testing.assert_allclose(result, expected, rtol=2e-6, atol=1e-6)
+
+
+def test_merge_normalizer_singular_domain_is_not_certified():
+    import pytest
+    import sympy as sp
+    import neptune_codegen as CG
+    # A real signed sum can hit zero; no amount of positive-only sampling proves it safe.
+    sk = CG.Skeleton("signed_sum_ratio", CG.c_sym / CG.s_sym, CG._FINAL_ACC,
+                     producer="signed", producer_reducer="sum", producer_expr=CG.c_sym)
+    with pytest.raises(NotImplementedError, match="nonzero"):
+        CG.derive_merge_certificate(sk)
+    # A nonnegative sum also cannot borrow the max-coordinate floor extension.
+    sk = CG.Skeleton("zero_sum_ratio", CG.c_sym / CG.s_sym, CG._FINAL_ACC,
+                     producer_reducer="sum", producer_expr=sp.Abs(CG.c_sym))
+    with pytest.raises(NotImplementedError, match="nonzero"):
+        CG.derive_merge_certificate(sk)
+
+
+def test_merge_meta_api_shapes_and_fp32_scratch_launch_abi():
+    import neptune_codegen as CG
+    from neptune_codegen.template import launch_reduction
+    for shape in ((17,), (3, 17), (2, 3, 17)):
+        x = torch.empty(shape, device="meta", dtype=torch.bfloat16)
+        for plan in ("serial", "split"):
+            for keep in (False, True):
+                out = CG.run("stable_l2", x, block=8, keepdim=keep, plan=plan)
+                assert out.shape == shape[:-1] + ((1,) if keep else ())
+                assert out.dtype == x.dtype
+    records = []
+    class RecordingKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                records.append((grid, args, kwargs))
+            return launch
+    x = torch.empty((2, 17), dtype=torch.bfloat16)[:, ::2]
+    out = torch.empty((2,), dtype=x.dtype)
+    launch_reduction((RecordingKernel(), RecordingKernel()), "split", x, out, 2, 9, 4, 1)
+    assert len(records) == 2
+    grid, args, kwargs = records[0]
+    assert grid == (2, 3)
+    assert args[1].shape == (2, 3) and args[1].dtype == torch.float32
+    assert args[2].dtype == torch.float32
+    assert args[3].dtype == args[4].dtype == torch.int32
+    assert args[7:10] == (x.stride(0), x.stride(1), 3)
+    assert records[1][1][-3:] == (2, 9, 3)
+    assert records[1][2]["MERGE_BLOCK"] == 4
+
+
+# Transaction tests use a real dispatcher op with CPU reference and fake metadata.
+# Unlike aten.clone, it has the reduction ABI and passes ExportedProgram.validate().
+@torch.library.custom_op("neptune_test::transaction_lse", mutates_args=())
+def _transaction_lse(x: torch.Tensor, keepdim: bool) -> torch.Tensor:
+    return torch.logsumexp(x, dim=-1, keepdim=keepdim)
+
+
+@_transaction_lse.register_fake
+def _transaction_lse_fake(x, keepdim):
+    return x.new_empty(x.shape[:-1] + ((1,) if keepdim else ()))
+
+
+@pytest.fixture
+def cpu_lse_handle():
+    import neptune_codegen as CG
+
+    requests = []
+
+    def handle(name, *, params, keepdim, **kwargs):
+        assert name == "logsumexp", name
+        assert params == {"tiny": 0.0}, params
+        requests.append((name, keepdim, kwargs))
+        # The FX target must be an OpOverload, not an arbitrary Python closure.
+        return (_transaction_lse_keep if keepdim else _transaction_lse_drop)._opoverload
+
+    with patch.object(CG, "op_handle", side_effect=handle):
+        yield requests
+
+
+@torch.library.custom_op("neptune_test::transaction_lse_keep", mutates_args=())
+def _transaction_lse_keep(x: torch.Tensor) -> torch.Tensor:
+    return _transaction_lse(x, True)
+
+
+@_transaction_lse_keep.register_fake
+def _transaction_lse_keep_fake(x):
+    return _transaction_lse_fake(x, True)
+
+
+@torch.library.custom_op("neptune_test::transaction_lse_drop", mutates_args=())
+def _transaction_lse_drop(x: torch.Tensor) -> torch.Tensor:
+    return _transaction_lse(x, False)
+
+
+@_transaction_lse_drop.register_fake
+def _transaction_lse_drop_fake(x):
+    return _transaction_lse_fake(x, False)
+
+
+class _TransactionModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.linspace(0.5, 1.5, 32))
+        self.register_buffer("offset", torch.tensor(0.25))
+
+    def forward(self, x):
+        data = x * self.weight + self.offset
+        return {"lse": torch.logsumexp(data, dim=-1),
+                "aux": (x > 0, torch.full((x.shape[0],), 2**55 + 1,
+                                          dtype=torch.int64, device=x.device))}
+
+
+class _TwoTransactionRegions(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.eye(32))
+
+    def forward(self, x):
+        projected = x @ self.weight
+        left = torch.logsumexp(projected, dim=-1, keepdim=True)
+        # sin is an opaque region boundary: both candidates are plain LSE, not
+        # the separately supported lse_biased(x, alpha) spelling of LSE(x + c).
+        right = torch.logsumexp(torch.sin(x), dim=-1, keepdim=True)
+        return (projected + x + left + right).clamp(-3.0, 4.0)
+
+
+def _transaction_snapshot(ep):
+    import copy
+
+    return {"module": ep.graph_module, "graph": ep.graph_module.graph,
+            "nodes": tuple(ep.graph_module.graph.nodes), "code": ep.graph_module.code,
+            "signature": ep.graph_signature, "signature_value": copy.deepcopy(ep.graph_signature),
+            "calls": ep.module_call_graph, "calls_value": copy.deepcopy(ep.module_call_graph),
+            "state": ep.state_dict,
+            "tensors": {key: (value, value.data_ptr(), value.detach().clone())
+                        for key, value in ep.state_dict.items()}}
+
+
+def _assert_transaction_unchanged(ep, before):
+    assert ep.graph_module is before["module"]
+    assert ep.graph_module.graph is before["graph"]
+    assert tuple(ep.graph_module.graph.nodes) == before["nodes"]
+    assert ep.graph_module.code == before["code"]
+    assert ep.graph_signature is before["signature"]
+    assert ep.graph_signature == before["signature_value"]
+    assert ep.module_call_graph is before["calls"]
+    assert ep.module_call_graph == before["calls_value"]
+    assert ep.state_dict is before["state"]
+    assert set(ep.state_dict) == set(before["tensors"])
+    for key, (tensor, pointer, value) in before["tensors"].items():
+        assert ep.state_dict[key] is tensor
+        assert ep.state_dict[key].data_ptr() == pointer
+        torch.testing.assert_close(ep.state_dict[key], value, rtol=0, atol=0)
+    ep.validate()
+
+
+def test_apply_transaction_generation_exception_rolls_back_after_first_region(cpu_lse_handle):
+    import neptune_codegen as CG
+
+    mod = _TwoTransactionRegions().eval()
+    ep = torch.export.export(mod, (X,))
+    before = _transaction_snapshot(ep)
+    original_handle = CG.op_handle
+
+    def fail_second(*args, **kwargs):
+        if cpu_lse_handle:
+            raise RuntimeError("injected second-region generation failure")
+        return original_handle(*args, **kwargs)
+
+    with patch.object(CG, "op_handle", side_effect=fail_second):
+        report = NO.apply(ep)
+    assert len(cpu_lse_handle) == 1, "exercise rollback after a successful candidate rewrite"
+    assert not report.fusions and not report.graph_changed and not report.verified
+    assert report.skipped[0][0] == "rewrite-failed"
+    assert "injected second-region" in report.skipped[0][1]
+    _assert_transaction_unchanged(ep, before)
+    torch.testing.assert_close(ep.module()(X), mod(X))
+
+
+def test_apply_transaction_verify_failure_never_publishes(cpu_lse_handle):
+    mod = _TransactionModel().eval()
+    ep = torch.export.export(mod, (X,))
+    before = _transaction_snapshot(ep)
+    candidates = []
+
+    def reject(reference, candidate, args):
+        candidates.append(candidate)
+        assert reference is mod
+        assert candidate is not ep.graph_module
+        torch.testing.assert_close(candidate(*args), reference(*args))
+        return False, "injected verification failure"
+
+    with patch.object(NO, "_verify", side_effect=reject):
+        report = NO.apply(ep, verify_with=(mod, (X,)))
+    assert cpu_lse_handle and len(candidates) == 1
+    assert not report.fusions and not report.graph_changed and not report.verified
+    assert report.verification_cases == 1
+    assert report.skipped == [("verify-failed", "case 0: injected verification failure")]
+    _assert_transaction_unchanged(ep, before)
+
+
+def test_apply_transaction_verified_binds_parameters_and_dict_pytree(cpu_lse_handle):
+    mod = _TransactionModel().eval()
+    ep = torch.export.export(mod, (X,))
+    state = {key: (value, value.data_ptr(), value.detach().clone())
+             for key, value in ep.state_dict.items()}
+    probe = X.flip(-1) * 0.5
+    report = NO.apply(ep, verify_with=(mod, (X,)), verification_inputs=[(probe,)])
+    assert len(cpu_lse_handle) == len(report.fusions) == 1, report.summary()
+    assert report.verified and report.graph_changed and report.verification_cases == 2
+    for data in (X, probe):
+        actual = ep.module()(data)
+        torch.testing.assert_close(actual, mod(data), rtol=0, atol=0)
+        assert actual["lse"].shape == (8,) and actual["lse"].dtype == X.dtype
+        assert actual["aux"][0].dtype == torch.bool
+        assert actual["aux"][1].dtype == torch.int64
+        assert torch.equal(actual["aux"][1], torch.full((8,), 2**55 + 1, dtype=torch.int64))
+    for key, (tensor, pointer, value) in state.items():
+        assert ep.state_dict[key] is tensor and tensor.data_ptr() == pointer
+        torch.testing.assert_close(tensor, value, rtol=0, atol=0)
+    ep.validate()
+
+
+def test_apply_transaction_verification_reference_cannot_mutate_original_state(cpu_lse_handle):
+    """Shared trial storage must not let verification corrupt the caller's parameters.
+
+    A read-only exported graph does not imply a supplied reference is read-only;
+    rejecting or isolating that execution must leave both the EP and module intact.
+    """
+    mod = _TransactionModel().eval()
+    ep = torch.export.export(mod, (X,))
+    before = _transaction_snapshot(ep)
+
+    def mutating_reference(x):
+        mod.weight.add_(1.0)
+        return mod(x)
+
+    report = NO.apply(ep, verify_with=(M(mutating_reference), (X,)))
+    assert cpu_lse_handle, "verification must reach a generated CPU candidate"
+    torch.testing.assert_close(mod.weight, before["tensors"]["weight"][2], rtol=0, atol=0,
+                               msg="verification mutated the original module's shared parameter")
+    _assert_transaction_unchanged(ep, before)
+    assert not report.fusions and not report.verified and not report.graph_changed
+    assert any(reason == "verify-failed" for reason, _ in report.skipped), report.summary()
+
+
+def test_apply_transaction_commit_rebinds_output_specs_to_new_nodes(cpu_lse_handle):
+    mod = M(lambda x: torch.logsumexp(x, dim=-1)).eval()
+    ep = torch.export.export(mod, (X,))
+    old_root = ep.graph_signature.output_specs[0].arg.name
+    old_graph = ep.graph_module.graph
+    report = NO.apply(ep, verify_with=(mod, (X,)))
+    assert report.verified and len(report.fusions) == 1, report.summary()
+    assert ep.graph_module.graph is not old_graph
+    output = next(node for node in ep.graph_module.graph.nodes if node.op == "output")
+    root = output.args[0][0]
+    assert root.op == "call_function"
+    assert root.target == _transaction_lse_drop._opoverload
+    assert root.name != old_root
+    assert ep.graph_signature.output_specs[0].arg.name == root.name
+    assert old_root not in {node.name for node in ep.graph_module.graph.nodes}
+    for entry in ep.module_call_graph:
+        if entry.signature:
+            assert all(getattr(arg, "name", None) != old_root for arg in entry.signature.outputs)
+    ep.graph_module.graph.lint()
+    ep.validate()
+    torch.testing.assert_close(ep.module()(X), mod(X))
+
+
+@pytest.mark.parametrize("max_regions, expected", [(None, 2), (1, 1)])
+def test_apply_transaction_multi_region_preserves_gemm_residual_clamp(
+        cpu_lse_handle, max_regions, expected):
+    mod = _TwoTransactionRegions().eval()
+    ep = torch.export.export(mod, (X,))
+    unsaturated = X * 0.05 - 1.5
+    report = NO.apply(ep, max_regions=max_regions, verify_with=(mod, (X,)),
+                      verification_inputs=[(unsaturated,)])
+    assert len(report.fusions) == len(cpu_lse_handle) == expected, report.summary()
+    assert report.verified and report.graph_changed and report.verification_cases == 2
+    targets = [node.target for node in ep.graph_module.graph.nodes if node.op == "call_function"]
+    assert targets.count(_transaction_lse_keep._opoverload) == expected
+    assert torch.ops.aten.matmul.default in targets
+    assert torch.ops.aten.clamp.default in targets
+    assert targets.count(torch.ops.aten.add.Tensor) >= 3, "residual additions must survive"
+    assert torch.ops.aten.sin.default in targets, "the second region input boundary must survive"
+    # The bounded mode must leave the unused compound INTACT, not expand its internals.
+    assert targets.count(torch.ops.aten.logsumexp.default) == 2 - expected
+    ep.validate()
+    torch.testing.assert_close(ep.module()(X), mod(X), rtol=1e-5, atol=1e-6)
+
+
+def test_apply_no_fusion_keeps_state_storage_and_does_not_verify():
+    class NoRegion(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(32))
+            self.register_buffer("offset", torch.zeros(32))
+
+        def forward(self, x):
+            return torch.sin(x * self.weight) + self.offset
+
+    mod = NoRegion().eval()
+    ep = torch.export.export(mod, (X,))
+    before = _transaction_snapshot(ep)
+    with patch.object(NO, "_verify", side_effect=AssertionError("no fusion must not verify")) as verify, \
+            patch.object(torch.Tensor, "__deepcopy__", side_effect=AssertionError("no state copy")) as deepcopy:
+        report = NO.apply(ep, verify_with=(mod, (X,)))
+    verify.assert_not_called()
+    deepcopy.assert_not_called()
+    assert not report.fusions and not report.graph_changed and not report.verified
+    assert report.verification_cases == 0 and report.skipped
+    assert all(reason != "rewrite-failed" for reason, _ in report.skipped), report.summary()
+    _assert_transaction_unchanged(ep, before)
+
+
+@pytest.mark.parametrize("reference,candidate,detail", [
+    ({"x": torch.tensor([float("inf")])}, {"x": torch.tensor([-float("inf")])}, "output"),
+    ({"x": torch.tensor([float("inf")])}, {"x": torch.tensor([0.])}, "finite classification"),
+    ({"x": torch.tensor([float("nan")])}, {"x": torch.tensor([float("inf")])}, "NaN classification"),
+    ({"x": torch.tensor([2**55 + 1])}, {"x": torch.tensor([2**55])}, "integer/bool"),
+    ({"x": torch.tensor([True])}, {"x": torch.tensor([False])}, "integer/bool"),
+    ({"x": torch.ones(2)}, {"x": torch.ones(1, 2)}, "shape/dtype/device"),
+    ({"x": torch.ones(2)}, {"x": torch.ones(2, dtype=torch.float64)}, "shape/dtype/device"),
+    ({"x": (torch.ones(2),)}, {"x": [torch.ones(2)]}, "pytree structure"),
+    ({"x": torch.ones(2)}, {"other": torch.ones(2)}, "pytree structure"),
+    ({"x": 1}, {"x": True}, "non-tensor"),
+])
+def test_compare_trees_rejects_ieee_integer_dtype_and_structure_errors(reference, candidate, detail):
+    ok, reason = NO._compare_trees(reference, candidate)
+    assert ok is False and detail in reason, reason
+
+
+def test_compare_trees_accepts_matching_nonfinite_and_exact_large_integers():
+    value = {"float": torch.tensor([float("nan"), float("inf"), -float("inf"), 1.0]),
+             "aux": (torch.tensor([True, False]), torch.tensor([2**55 + 1]), 2**55 + 1)}
+    assert NO._compare_trees(value, NO._clone_inputs(value)) == (True, "")
+
+
+def test_verify_direct_handles_bound_parameter_pytree_and_exact_integer_bool():
+    mod = _TransactionModel().eval()
+    ep = torch.export.export(mod, (X,))
+    assert NO._verify(mod, ep.module(), (X,)) == (True, "")
+    for leaf in ("integer", "bool", "shape", "dtype", "structure"):
+        def wrong(x):
+            result = mod(x)
+            if leaf == "integer":
+                result["aux"] = (result["aux"][0], result["aux"][1] - 1)
+            elif leaf == "bool":
+                result["aux"] = (~result["aux"][0], result["aux"][1])
+            elif leaf == "shape":
+                result["lse"] = result["lse"].unsqueeze(-1)
+            elif leaf == "dtype":
+                result["lse"] = result["lse"].double()
+            else:
+                result["aux"] = list(result["aux"])
+            return result
+
+        ok, detail = NO._verify(mod, M(wrong), (X,))
+        assert ok is False and detail, leaf
+
+
+@pytest.mark.parametrize("mutating_side", ["reference", "candidate"])
+def test_verify_direct_detects_input_mutation_without_mutating_caller(mutating_side):
+    args = ({"x": X.clone(), "aux": [torch.tensor([2**55 + 1])]},)
+    pristine = NO._clone_inputs(args)
+
+    def read(data):
+        return data["x"] * 2
+
+    def mutate(data):
+        output = read(data)
+        data["aux"][0].add_(1)
+        return output
+
+    reference = M(mutate if mutating_side == "reference" else read)
+    candidate = M(mutate if mutating_side == "candidate" else read)
+    ok, detail = NO._verify(reference, candidate, args)
+    assert ok is False and "inputs mutated" in detail, detail
+    assert NO._compare_trees(args, pristine, rtol=0, atol=0) == (True, "")
+
+
+def test_explicit_ulp_policy_is_opt_in_and_preserves_nonfinite_signs():
+    value = torch.tensor([10.0], dtype=torch.bfloat16)
+    adjacent = torch.nextafter(value, torch.full_like(value, float("inf")))
+    two_steps = torch.nextafter(adjacent, torch.full_like(adjacent, float("inf")))
+    assert not NO._compare_trees(value, adjacent)[0]
+    assert NO._compare_trees(value, adjacent, max_ulps=1)[0]
+    assert not NO._compare_trees(value, two_steps, max_ulps=1)[0]
+    positive = torch.tensor([float("inf"), 10.0], dtype=torch.bfloat16)
+    wrong = torch.tensor([-float("inf"), adjacent.item()], dtype=torch.bfloat16)
+    assert not NO._compare_trees(positive, wrong, max_ulps=1)[0]
+
+
+def test_skeleton_registration_cannot_reuse_a_name_for_different_algebra():
+    import dataclasses
+    import neptune_codegen as CG
+
+    original = CG.SKELETONS["logsumexp"]
+    assert CG.register(original) is original
+    with pytest.raises(ValueError, match="different algebra"):
+        CG.register(dataclasses.replace(original, finalize=original.finalize + 1))
+    assert CG.SKELETONS["logsumexp"] is original
+
+
+def test_bounded_fusion_does_not_expand_a_later_unused_compound(cpu_lse_handle):
+    def fn(x):
+        maximum = x.amax(-1, keepdim=True)
+        first = maximum + (x - maximum).exp().sum(-1, keepdim=True).log()
+        return first.squeeze(-1), torch.logsumexp(torch.sin(x), -1)
+
+    mod = M(fn).eval()
+    ep = torch.export.export(mod, (X,))
+    report = NO.apply(ep, max_regions=1, verify_with=(mod, (X,)))
+    assert report.verified and len(report.fusions) == 1
+    assert sum(node.target == torch.ops.aten.logsumexp.default for node in ep.graph.nodes) == 1
+    assert not any(node.meta.get("neptune_lowering") for node in ep.graph.nodes)
+
+
+def test_default_lowering_declines_unstable_log_softmax(cpu_lse_handle):
+    mod = M(lambda x: torch.log_softmax(x, -1)).eval()
+    ep = torch.export.export(mod, (X,))
+    before = _transaction_snapshot(ep)
+    assert not NO.preview(ep)[0]
+    report = NO.apply(ep)
+    assert not report.fusions and not report.graph_changed
+    _assert_transaction_unchanged(ep, before)
+    explicit = NO.apply(ep, experimental_log_softmax=True, verify_with=(mod, (X,)))
+    assert explicit.verified and len(explicit.fusions) == 1
+
+
+def test_verify_direct_read_only_reference_does_not_mutate_original_parameters():
+    mod = _TransactionModel().eval()
+    candidate = torch.export.export(mod, (X,)).module()
+    before = {key: (value.data_ptr(), value.detach().clone())
+              for key, value in mod.state_dict().items()}
+    assert NO._verify(mod, candidate, (X,)) == (True, "")
+    for key, value in mod.state_dict().items():
+        pointer, pristine = before[key]
+        assert value.data_ptr() == pointer
+        torch.testing.assert_close(value, pristine, rtol=0, atol=0)

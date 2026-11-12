@@ -32,6 +32,7 @@ its own shape, instead of whichever model registered first deciding for both.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import math
 import os
 
@@ -112,8 +113,11 @@ def device_name_of(device) -> str | None:
         return None
     torch = sys.modules["torch"]
     try:
-        index = getattr(device, "index", None)
-        return torch.cuda.get_device_name(index if index is not None else 0)
+        device = torch.device(device)
+        if device.type != "cuda":
+            return None
+        # An unindexed CUDA device means the current device, NOT device zero.
+        return torch.cuda.get_device_name(device)
     except Exception:  # noqa: BLE001 -- no CUDA, or a fake device: the default applies
         return None
 
@@ -121,7 +125,9 @@ def device_name_of(device) -> str | None:
 # ---------------------------------------------------------------- shape bucketing
 def ncols_bucket(ncols) -> int:
     """The row length rounded UP to a power of two, clamped to the measured range."""
-    n = max(1, int(ncols))
+    if not isinstance(ncols, int):
+        raise ValueError("a measured width bucket requires a static integer width")
+    n = max(1, ncols)
     return max(MIN_BUCKET, min(MAX_BUCKET, 1 << (n - 1).bit_length()))
 
 
@@ -130,14 +136,12 @@ def rows_class(rows) -> str:
 
     One row is its own class because a single program has to find all of its parallelism inside the
     block, and the measurement says it wants a different block from four rows of the same length.
-    A symbolic row count is treated as "many": a dynamic row count is a model whose batch varies,
-    which is not the single-row case this class exists for, and guessing "single" would apply the
-    wrong configuration to every real batch.
+    Symbolic counts are labelled "many" for reporting only. `best_config` uses DEFAULT for
+    symbolic shapes; int(SymInt) would specialise a hinted dynamic batch during export.
     """
-    try:
-        n = int(rows)
-    except Exception:  # noqa: BLE001 -- a SymInt without a concrete value
+    if not isinstance(rows, int):
         return "many"
+    n = rows
     if n <= 1:
         return "single"
     return "few" if n <= THIN_ROWS else "many"
@@ -219,10 +223,15 @@ def best_config(rows, ncols, dtype=None, device=None, device_name=None,
                 verbose: bool = False) -> tuple:
     """`(BLOCK, num_warps)` for a row length on this machine: measured entry, else `DEFAULT`.
 
-    `dtype` is accepted and unused: the search measured fp32/bf16/fp16 and the dtype did not change
-    the winner for any shape. It stays in the signature because that is where the answer would live
-    if a future measurement says otherwise -- which would be a measurement, not a guess.
+    The current table has no dtype axis; `dtype` is reserved for future dtype-specific evidence,
+    not a claim that one winner is optimal for all dtypes. Runtime dtype support is validated by
+    the launch wrapper. Symbolic rows OR width use DEFAULT without concretising SymInts, even
+    when width alone is static. CPU/unspecified devices never query the current CUDA device.
     """
+    if not isinstance(rows, int) or not isinstance(ncols, int):
+        return DEFAULT
+    if device is not None and str(device).split(":", 1)[0] != "cuda":
+        return DEFAULT
     if device_name is None:
         device_name = device_name_of(device)
     machine = machine_key(device_name) if device_name else ""
@@ -380,6 +389,35 @@ def write_tables(path: str, all_tables: dict, noise: float = NOISE) -> None:
         f.write(render_tables(all_tables, noise))
 
 
+def parameter_identity(params: dict | None) -> tuple:
+    """Exact identity of the binary64 scalars that the emitter bakes into source."""
+    return tuple((key, float(value).hex()) for key, value in sorted((params or {}).items()))
+
+
+def parameter_tag(params: dict | None) -> str:
+    """Identifier-safe exact tags, preserving ordinary single-parameter legacy names.
+
+    A legacy :g tag is retained only if it round-trips bit-for-bit. Otherwise the full hex
+    value is encoded (not just a hash). Multi-parameter tags additionally encode the entire
+    identity's digest to disambiguate parameter-name/value boundaries.
+    """
+    identity = parameter_identity(params)
+    tags = []
+    for key, exact in identity:
+        value = float.fromhex(exact)
+        short = f"{value:g}"
+        tag = short.replace(".", "p").replace("-", "m").replace("+", "a")
+        if not math.isfinite(value) or float(short).hex() != exact:
+            tag += "_h" + exact.replace("-", "m").replace("+", "a").replace(".", "p")
+        tags.append("_" + key + tag)
+    # Names containing digits/underscores can otherwise merge with the value suffix
+    # (a1=2 and a=12 both spelled a12 in the legacy scheme).
+    if len(identity) > 1 or any(not key.isalpha() for key, _ in identity):
+        encoded = repr(identity).encode()
+        tags.append("_h" + hashlib.sha256(encoded).hexdigest()[:16])
+    return "".join(tags)
+
+
 def op_key(lib: str, name: str, params: dict | None, keepdim: bool,
            block: int | None = None, num_warps: int | None = None) -> str:
     """The registered name of a generated op, including its parameters, rank and launch config.
@@ -388,8 +426,7 @@ def op_key(lib: str, name: str, params: dict | None, keepdim: bool,
     part of the operator's identity" can be checked without a GPU.
     """
     tag = "_keep" if keepdim else ""
-    for arg_name, val in sorted((params or {}).items()):
-        tag += "_" + arg_name + f"{float(val):g}".replace(".", "p").replace("-", "m")
+    tag += parameter_tag(params)
     if block is not None or num_warps is not None:
         tag += f"_b{block}w{num_warps}"
     return f"{lib}::{name}{tag}"
@@ -446,7 +483,8 @@ def search(kernel_name: str, rows: int, ncols: int, dtype=None, device: str = "c
             continue
 
         def launch(kernel=kernel, block=block, warps=warps):
-            kernel[(rows,)](x, out, rows, ncols, x.stride(0), BLOCK=block, num_warps=warps)
+            kernel[(rows,)](x, out, rows, ncols, x.stride(0), x.stride(1),
+                             BLOCK=block, num_warps=warps)
 
         try:
             for _ in range(warmup):

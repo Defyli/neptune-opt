@@ -35,10 +35,9 @@ class TranslationError(NotImplementedError):
     """Raised when an expression cannot be lowered, instead of emitting wrong code."""
 
 
-# Triton's f32 limits: exp underflows below ~-87 and overflows above ~88. Both clamps are
-# applied where the argument is an expression we do not control.
-_EXP_LO, _EXP_HI = -80.0, 80.0
-
+# Emit true exp: clipping changes g and its derived repair, so the repair identity no
+# longer holds. Natural fp32 underflow/positive overflow is part of the original math;
+# stability must come from the skeleton's producer/repair, not from a hidden saturation.
 _BINOPS = {sp.Add: "+", sp.Mul: "*"}
 # functions rendered as-is when Triton provides them
 _DIRECT_FUNCS = {sp.sqrt: "tl.sqrt", sp.exp: "tl.exp", sp.log: "tl.log", sp.Abs: "tl.abs"}
@@ -194,7 +193,7 @@ def to_triton(expr, names: dict, *, indent: int = 0) -> str:
 
     if isinstance(expr, sp.exp):
         arg = to_triton(expr.args[0], names, indent=indent)
-        return f"tl.exp(tl.maximum(tl.minimum({arg}, {_EXP_HI}), {_EXP_LO}))"
+        return f"tl.exp({arg})"
 
     if isinstance(expr, sp.log):
         arg = to_triton(expr.args[0], names, indent=indent)

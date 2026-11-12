@@ -68,7 +68,7 @@ def _check_distributes(sk: Skeleton, a: sp.Expr) -> None:
 # "may be called thousands of times due to the autotuner replaying traces". The expensive part is
 # the `simplify` calls, which is exactly what this avoids repeating.
 @functools.lru_cache(maxsize=None)
-def repair_pair(sk: Skeleton) -> tuple[sp.Expr, sp.Expr]:
+def repair_pair(sk: Skeleton, *, exact: bool = False) -> tuple[sp.Expr, sp.Expr]:
     """Derive (a, b) with  acc_new = a(s,s') * acc_old + b(s,s').
 
     Two separations are attempted, in this order, and this is the whole derivation:
@@ -133,7 +133,7 @@ def repair_pair(sk: Skeleton) -> tuple[sp.Expr, sp.Expr]:
     if not a.has(c_sym):
         # `_simplify` must not have changed the function while separating it: if it had,
         # the kernel would be wrong in a way the cancellation test cannot see.
-        if not vanishes(a - raw):
+        if not (_simplify(a - raw) == 0 if exact else vanishes(a - raw)):
             raise NotImplementedError(
                 f"skeleton {sk.name!r}: separating g changed its value, so the derived "
                 f"repair is not g(s',c)/g(s,c); got {sp.simplify(a)}"
@@ -263,6 +263,144 @@ def term_expr(sk: Skeleton) -> sp.Expr:
     the translator lower it to `2*sigmoid(2x) - 1`.
     """
     return sp.simplify(sk.g.xreplace({s_sym: s2_sym}))
+
+
+@dataclasses.dataclass(frozen=True)
+class MergeCertificate:
+    """Exact real-algebra certificate, NOT an IEEE associativity guarantee.
+
+    Non-log folds require finite inputs AND finite reachable intermediates. Log folds
+    additionally have a separately emitted NaN/infinity status extension.
+    """
+
+    factor: sp.Expr
+    bias: sp.Expr
+    producer_domain: str
+    coordinate_floor: bool
+    assumptions: tuple[str, ...]
+    proof_kind: str = "exact-symbolic"
+    requires_finite: bool = True
+
+
+def _parameter_substitutions(sk: Skeleton, values: dict | None) -> dict:
+    """Check declared sign assumptions before using them in a proof/lowering."""
+    import math
+
+    out = {}
+    for sym, name in sk.params:
+        if values is None:
+            continue
+        if name not in values:
+            raise KeyError(f"skeleton {sk.name!r}: missing parameter {name!r}")
+        value = float(values[name])
+        if not math.isfinite(value):
+            raise NotImplementedError(f"parameter {name!r} must be finite")
+        if sym.is_positive is True and value <= 0:
+            raise NotImplementedError(f"parameter {name!r} must be positive")
+        if sym.is_nonnegative is True and value < 0:
+            raise NotImplementedError(f"parameter {name!r} must be nonnegative")
+        out[sym] = sp.Rational(str(value))
+    return out
+
+
+def reachable_producer_domain(sk: Skeleton, values: dict | None = None) -> str:
+    """Infer raw producer sign, including positive shape intrinsics such as ncols."""
+    from neptune_codegen.emitters import derived_producer_expr
+
+    if sk.producer_domain not in ("auto", "real", "nonnegative"):
+        raise NotImplementedError(f"unknown producer domain {sk.producer_domain!r}")
+    phi = derived_producer_expr(sk)
+    if phi is None:
+        phi = sp.Abs(c_sym) if sk.producer == "abs" else c_sym
+    if phi.has(s_sym, s2_sym, u_sym, _FINAL_ACC, _FINAL_M):
+        raise NotImplementedError("producer operand must be independent of state")
+    intrinsic = {}
+    for sym, name in sk.intrinsic_params:
+        if name != "ncols":
+            raise NotImplementedError(f"merge cannot prove intrinsic domain for {name!r}")
+        intrinsic[sym] = sp.Symbol("merge_width", positive=True)
+    phi = sp.simplify(phi.xreplace(_parameter_substitutions(sk, values)).xreplace(intrinsic))
+    nonnegative = phi.is_nonnegative is True
+    if sk.producer_domain == "nonnegative" and not nonnegative:
+        raise NotImplementedError("declared nonnegative producer domain is not proved")
+    return "nonnegative" if nonnegative and sk.producer_domain != "real" else "real"
+
+
+@functools.lru_cache(maxsize=None)
+def coordinate_needs_floor(sk: Skeleton) -> bool:
+    """Floor only a genuinely zero-singular nonnegative MAX coordinate.
+
+    sqrt(s+eps) and N+s are nonsingular at zero under their positive parameter
+    assumptions. Sum producers keep their raw identity and are never floored.
+    """
+    if sk.two_pass or sk.producer_reducer != "max":
+        return False
+    if reachable_producer_domain(sk) != "nonnegative":
+        return False
+    rho, beta = repair_pair(sk, exact=True)
+    for expr in (term_expr(sk), rho, beta):
+        denominator = sp.fraction(sp.together(expr))[1]
+        if sp.simplify(denominator.subs(s2_sym, 0)) == 0:
+            return True
+    return False
+
+
+def derive_merge_certificate(sk: Skeleton, values: dict | None = None) -> MergeCertificate:
+    """Prove affine repair and its cocycle without numerical sampling.
+
+    max preservation uses the theorem that a strictly positive finite affine slope
+    preserves max (including its -infinity identity). Unknown signs are refused.
+    Parameters omitted here retain their DECLARED assumptions: the returned certificate
+    is conditional; emit/compile supplies and validates concrete parameter values.
+    """
+    if sk.two_pass:
+        raise NotImplementedError("two_pass needs extended carried state; pair merge refused")
+    if sk.producer_reducer not in ("max", "sum"):
+        raise NotImplementedError("unknown producer reducer")
+    if sk.consumer_reducer not in ("sum", "max"):
+        raise NotImplementedError("unknown consumer reducer")
+    if sk.producer not in ("signed", "abs"):
+        raise NotImplementedError("unknown producer mode")
+    domain = reachable_producer_domain(sk, values)
+    floor = coordinate_needs_floor(sk)
+    rho, beta = repair_pair(sk, exact=True)
+    params = _parameter_substitutions(sk, values)
+    kwargs = {"positive": True} if floor else ({"nonnegative": True} if domain == "nonnegative" else {"real": True})
+    p, q, r = (sp.Symbol(n, **kwargs) for n in ("merge_p", "merge_q", "merge_r"))
+    substitutions = {s_sym: p, s2_sym: q, **params}
+    a = rho.xreplace(substitutions)
+    b = beta.xreplace(substitutions)
+    g = sk.g.xreplace(params)
+    residual = a * g.xreplace({s_sym: p}) + b - g.xreplace({s_sym: q})
+    if _simplify(residual) != 0:
+        raise NotImplementedError("repair condition (3) lacks an exact symbolic proof")
+    if sk.consumer_reducer == "sum":
+        if _simplify(b) != 0:
+            raise NotImplementedError("sum consumer requires zero affine bias")
+    elif sp.simplify(a).is_positive is not True:
+        raise NotImplementedError("max consumer slope is not proved strictly positive on reachable domain")
+    a_qr, b_qr = a.xreplace({p: q, q: r}), b.xreplace({p: q, q: r})
+    a_pr, b_pr = a.xreplace({q: r}), b.xreplace({q: r})
+    residuals = (a_qr * a - a_pr, a_qr * b + b_qr - b_pr,
+                 a.xreplace({q: p}) - 1, b.xreplace({q: p}))
+    if any(_simplify(e) != 0 for e in residuals):
+        raise NotImplementedError("repair cocycle/identity lacks an exact symbolic proof")
+    # Denominators must be nonzero over the WHOLE certified reachable coordinate
+    # domain, not just the positive samples used by the legacy classifier.
+    for expr in (g.xreplace({s_sym: p}), a, b):
+        denominator = sp.fraction(sp.together(expr))[1]
+        if denominator.is_nonzero is not True:
+            raise NotImplementedError("normalizer is not proved nonzero on reachable producer domain")
+    # A shape-free callback may not reference runtime width. Such algebras need a
+    # different closure/ABI, not an unbound symbol in a tl.reduce callback.
+    intrinsic_symbols = {sym for sym, _ in sk.intrinsic_params}
+    if (rho.free_symbols | beta.free_symbols) & intrinsic_symbols:
+        raise NotImplementedError("merge repair cannot depend on runtime shape intrinsics")
+    assumptions = ["finite real inputs and finite reachable arithmetic", "ncols > 0"]
+    assumptions.extend(f"{sym}: {sym.assumptions0}" for sym, _ in sk.params)
+    if floor:
+        assumptions.append("effective producer = max(raw producer, 1e-30) on BOTH repair endpoints")
+    return MergeCertificate(rho, beta, domain, floor, tuple(assumptions))
 
 
 def _as_quotient_power(expr: sp.Expr) -> sp.Expr:

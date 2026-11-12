@@ -181,7 +181,7 @@ def section_check(measured: list, body: dict) -> None:
         kernel = CG.compile_skeleton("logsumexp", CG.param_defaults("logsumexp"))
 
         def launch(block, warps):
-            kernel[(rows,)](x, out, rows, ncols, x.stride(0), BLOCK=block, num_warps=warps)
+            kernel[(rows,)](x, out, rows, ncols, x.stride(0), x.stride(1), BLOCK=block, num_warps=warps)
 
         fixed = _batch_ms(lambda: launch(*autotune.DEFAULT))
         tuned = _batch_ms(lambda: launch(*picked))
@@ -273,7 +273,7 @@ def section_split() -> dict:
     b, w = autotune.best_config(rows, ncols, torch.float32, "cuda")
 
     def unsplit():
-        kernel[(rows,)](x, out, rows, ncols, x.stride(0), BLOCK=b, num_warps=w)
+        kernel[(rows,)](x, out, rows, ncols, x.stride(0), x.stride(1), BLOCK=b, num_warps=w)
 
     ms_unsplit = _batch_ms(unsplit, reps=200)
     unsplit()
@@ -293,7 +293,7 @@ def section_split() -> dict:
         state = {}
 
         def split():
-            kernel[(k,)](xc, part, k, chunk, xc.stride(0), BLOCK=cs, num_warps=cw)
+            kernel[(k,)](xc, part, k, chunk, xc.stride(0), xc.stride(1), BLOCK=cs, num_warps=cw)
             m = part.max()
             state["p"] = m + (part - m).exp().sum().log()
 

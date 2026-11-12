@@ -4,15 +4,14 @@ Which registered skeleton does this graph implement? Decided by comparing expres
 from __future__ import annotations
 
 import dataclasses
-import random
 
 import sympy as sp
 
 import neptune_codegen as CG
 from neptune_codegen import c_sym, vanishes
-from neptune_recognize.interp import (Candidate, NCOLS_SYM, S_RESULT, _INTRINSIC_SYMBOLS,
-                                      interpret)
-from neptune_recognize.params import _infer_numerically, _respects, _solve_for
+from neptune_recognize.interp import (S_RESULT, _INTRINSIC_SYMBOLS, _IGNORED,
+                                      interpret, region_inputs, _tensor_value, _flatten_nodes, _op)
+from neptune_recognize.params import _solve_for
 
 
 def _intrinsic_substitution(sk):
@@ -63,7 +62,7 @@ def _solve_params(sk, target, expr, solved, supplied):
     return local
 
 
-def _find_region_root(gm, env, sk, cand, solved, supplied):
+def _find_region_root(gm, env, sk, cand, solved, supplied, *, exact=False):
     """Locate the node computing the skeleton's `finalize`, i.e. the operator's edge.
 
     This is what makes the pass usable inside a real model, and it is also a correctness fix:
@@ -82,6 +81,9 @@ def _find_region_root(gm, env, sk, cand, solved, supplied):
     target = (sk.finalize.xreplace({_FINAL_ACC: cand.consumer_sym,
                                     _FINAL_M: cand.producer_sym})
               .subs(_intrinsic_substitution(sk)).subs(solved))
+    # Supplied parameters are part of the finalize too, not just phi/psi.
+    target = target.subs({sym: sp.Rational(str(float(supplied[arg])))
+                         for sym, arg in sk.params if arg in (supplied or {})})
     best = None
     for node in gm.graph.nodes:
         expr = env.get(node)
@@ -90,7 +92,8 @@ def _find_region_root(gm, env, sk, cand, solved, supplied):
         local = _solve_params(sk, target, expr, solved, supplied)
         if local is None:
             continue
-        if vanishes(target.subs(local) - expr):
+        residual = target.subs(local) - expr
+        if sp.simplify(residual) == 0 if exact else vanishes(residual):
             best = (node, local)
     return best if best else (None, None)
 
@@ -119,6 +122,9 @@ class Match:
     # rather than the graph output, keeps whatever the surrounding model does with the
     # result.
     region_root: object = None
+    region_nodes: tuple = ()
+    proof_kind: str = "legacy-symbolic-or-numeric-filter"
+    domain_assumptions: tuple = ()
 
     def __repr__(self) -> str:
         extra = f" params={self.params}" + (f" (inferred: {', '.join(self.inferred)})"
@@ -126,14 +132,15 @@ class Match:
         return f"<{self.skeleton}{extra}>"
 
 
-def _match_candidate(gm, input_node, cand, values, env):
+def _match_candidate(gm, input_node, cand, values, env, *, exact=False):
     phi, psi = cand.phi, cand.psi
     prod_kind, cons_kind = cand.prod_kind, cand.cons_kind
     consumer_node = cand.consumer_node
 
+    equivalent = (lambda expression: sp.simplify(expression) == 0) if exact else vanishes
     tried = []
     matches = []
-    for name, sk in sorted(CG.SKELETONS.items()):
+    for name, sk in sorted(CG.SKELETONS.items(), key=lambda entry: (len(entry[1].params), entry[0])):
         if name in CG.NEGATIVE_CONTROLS:
             continue
         if sk.producer_reducer != prod_kind or sk.consumer_reducer != cons_kind:
@@ -146,7 +153,7 @@ def _match_candidate(gm, input_node, cand, values, env):
 
         # (a) substitute whatever the caller supplied
         known_args = {arg: float(vals[arg]) for sym, arg in sk.params if arg in vals}
-        known = {sym: sp.Float(vals[arg]) for sym, arg in sk.params if arg in vals}
+        known = {sym: sp.Rational(str(float(vals[arg]))) for sym, arg in sk.params if arg in vals}
         unknown = [sym for sym, arg in sk.params
                    if arg not in vals and sym not in intrinsic]
         phi_pat = phi_pat.subs(known)
@@ -200,10 +207,16 @@ def _match_candidate(gm, input_node, cand, values, env):
             phi_pat = phi_pat.subs(solved)
             psi_pat = psi_pat.subs(solved)
 
-        if vanishes(phi_pat - phi) and vanishes(psi_pat - psi):
+        if equivalent(phi_pat - phi) and equivalent(psi_pat - psi):
+            # A zero-singular power kernel uses the documented guarded coordinate. Do
+            # not introduce that guard into an unguarded division or erase another clamp.
+            if CG.coordinate_needs_floor(sk) != cand.producer_guarded:
+                tried.append(f"{name}(producer-coordinate-contract-differs)")
+                continue
             # The tail must equal the declared `finalize`; otherwise this is not the
             # operator. This gate runs BEFORE the match is accepted.
-            root, tail_solved = _find_region_root(gm, env, sk, cand, solved, known_args)
+            root, tail_solved = _find_region_root(gm, env, sk, cand, solved, known_args,
+                                                  exact=exact)
             if root is None:
                 tried.append(f"{name}(no-finalize)")
                 continue
@@ -211,6 +224,25 @@ def _match_candidate(gm, input_node, cand, values, env):
             merged = {**known_args, **{arg: float(val) for sym, arg in sk.params
                                        for key, val in all_solved.items() if key == sym}}
             inferred = tuple(sorted(arg for sym, arg in sk.params if sym in all_solved))
+            if exact:
+                # The emitted scalar is a Python float literal. Certify THAT binding,
+                # not a higher-precision root which is subsequently rounded away.
+                bindings = {sym: sp.Rational(str(merged[arg])) for sym, arg in sk.params
+                            if arg in merged}
+                if len(bindings) != len(sk.params):
+                    continue
+                if not equivalent(_producer_pattern(sk).subs(intrinsic).subs(bindings) - phi):
+                    continue
+                if not equivalent(CG.term_expr(sk).xreplace({CG.s2_sym: S_RESULT}).subs(intrinsic).subs(bindings) - psi):
+                    continue
+                actual_tail = sk.finalize.xreplace({CG._FINAL_ACC: cand.consumer_sym,
+                                                    CG._FINAL_M: cand.producer_sym})
+                if not equivalent(actual_tail.subs(intrinsic).subs(bindings) - env[root]):
+                    continue
+                # Any exact legal skeleton implements this same region. Prefer the
+                # first minimal-parameter one instead of solving all unrelated families.
+                return Match(input_node, name, merged, inferred, consumer_node,
+                             cand.consumer_sym, cand.producer_sym, root), "matched"
             matches.append((len(unknown), name, merged, inferred, root))
 
     if matches:
@@ -222,6 +254,98 @@ def _match_candidate(gm, input_node, cand, values, env):
                      cand.consumer_sym, cand.producer_sym, root), "matched"
 
     return None, "no registered skeleton matches (tried: " + ", ".join(tried) + ")"
+
+
+def _region_nodes(root, anchor):
+    """Collect the full dependency closure up to one tensor boundary.
+
+    Nothing outside the closure is erased, and other tensor/parameter inputs cannot
+    masquerade as scalar constants. Opaque computation before anchor remains intact.
+    """
+    region, frontier = set(), [root]
+    while frontier:
+        node = frontier.pop()
+        if node is anchor or node in region:
+            continue
+        if node.op in ("placeholder", "get_attr", "output"):
+            return None
+        region.add(node)
+        frontier.extend(node.all_input_nodes)
+    return tuple(region)
+
+
+def recognize_regions(gm, values=None):
+    """Discover exact single-row regions inside a multi-input/opaque surrounding DAG.
+
+    All primitive semantics are shared with strict interpretation. Unknown nodes are
+    boundaries, never identity operations. A candidate remains one data symbol, even
+    when its preserved producer is a GEMM or combines several model inputs.
+    """
+    values = values or {}
+    by_root = {}
+    reasons = []
+    order = {node: index for index, node in enumerate(gm.graph.nodes)}
+    anchors = region_inputs(gm)
+    pair_count = 0
+    for anchor in anchors:
+        why = []
+        info = interpret(gm, why=why, input_node=anchor, local=True)
+        if info is None:
+            reasons.extend(why)
+            continue
+        _, candidates, env = info
+        pair_count += len(candidates)
+        for candidate in candidates:
+            if not candidate.phi.has(c_sym) or not candidate.psi.has(c_sym):
+                continue
+            match, reason = _match_candidate(gm, anchor, candidate, values, env, exact=True)
+            if match is None:
+                reasons.append(reason)
+                continue
+            root = match.region_root
+            closure = _region_nodes(root, anchor)
+            if closure is None:
+                reasons.append("a matched region has more than one data boundary")
+                continue
+            if candidate.producer_node not in closure or candidate.consumer_node not in closure:
+                continue
+            # Removing low-precision intermediate rounding needs separate, explicit
+            # certification. Casts are boundaries; genuine fp32 regions are discoverable
+            # inside a bf16 graph without silently deleting those casts.
+            source_value = _tensor_value(anchor)
+            region_values = [_tensor_value(node) for node in closure]
+            if source_value is not None:
+                if any(value is not None and hasattr(value, "dtype") and value.is_floating_point()
+                       and value.dtype != source_value.dtype for value in region_values):
+                    reasons.append("mixed-dtype arithmetic remains a region boundary")
+                    continue
+            params = {**CG.param_defaults(match.skeleton), **match.params}
+            try:
+                if not CG.SKELETONS[match.skeleton].two_pass:
+                    certificate = CG.derive_merge_certificate(CG.SKELETONS[match.skeleton], params)
+                    assumptions = certificate.assumptions
+                else:
+                    assumptions = ("finite real inputs and finite reachable arithmetic", "ncols > 0")
+            except (NotImplementedError, KeyError, ValueError) as error:
+                reasons.append(str(error))
+                continue
+            match.region_nodes = tuple(sorted(closure, key=order.__getitem__))
+            match.proof_kind = "exact-symbolic-real-algebra"
+            match.domain_assumptions = assumptions
+            previous = by_root.get(root)
+            if previous is None or len(match.region_nodes) > len(previous.region_nodes):
+                by_root[root] = match
+    matches = sorted(by_root.values(), key=lambda match: order[match.region_root])
+    if matches:
+        return matches, f"matched {len(matches)} local reduction region(s)"
+    detail = reasons[-1] if reasons else "no dependent reduction pair"
+    compounds = sorted({str(node.target) for node in gm.graph.nodes if node.op == "call_function"
+                        and str(node.target).startswith(("aten.logsumexp.", "aten.log_softmax.",
+                                                         "aten._log_softmax."))})
+    if compounds:
+        detail += "; compound operations require targeted lowering: " + ", ".join(compounds)
+    return [], (f"no certified local region: analyzed {len(anchors)} row-data boundaries, "
+                f"{pair_count} dependent pair(s); {detail}")
 
 
 def recognize(gm, values=None):
@@ -242,8 +366,6 @@ def recognize(gm, values=None):
         m, why = _match_candidate(gm, input_node, cand, values, env)
         if m is not None:
             return m, "matched"
-        if why:
-            last_reason = why
     return None, "no registered skeleton matches (" + str(len(candidates)) + " candidate pair(s))"
 
 

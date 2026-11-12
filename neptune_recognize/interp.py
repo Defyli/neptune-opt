@@ -4,7 +4,7 @@ Interpreting an FX graph symbolically: the graph becomes the pair the algebra ta
 from __future__ import annotations
 
 import dataclasses
-import random
+import math
 
 import sympy as sp
 
@@ -54,7 +54,7 @@ _UNARY = {
 NCOLS_SYM = sp.Symbol("$ncols", positive=True)
 _INTRINSIC_SYMBOLS = {"ncols": NCOLS_SYM, "rows": sp.Symbol("$rows", positive=True)}
 
-_REDUCTIONS = ("amax", "sum", "max", "min")
+_REDUCTIONS = ("amax", "sum", "max")
 
 
 _MEANS = ("mean",)
@@ -64,7 +64,7 @@ _MEANS = ("mean",)
 _VAR_STD = ("var", "std")
 
 
-_IGNORED = ("clamp_min", "clamp", "squeeze", "unsqueeze", "getitem", "detach", "alias")
+_IGNORED = ("squeeze", "unsqueeze", "getitem", "detach", "alias")
 
 # Allocation and literal-tensor construction. An exported module materialises its parameters
 # (weight, bias, eps) through these, and they carry no data path: `empty` produces a buffer, and
@@ -138,13 +138,17 @@ def _logsumexp_inf_guard(gm) -> dict:
         cond, low, high = node.args[:3]
         if not _is_zero(low) or getattr(cond, "op", None) != "call_function":
             continue
-        # cond must be `eq(abs(m), inf)`
-        if not str(cond.target).startswith("aten.eq") or not cond.args:
+        # Check the entire guard, not merely the names of its first two operations.
+        if not str(cond.target).startswith("aten.eq") or len(cond.args) != 2:
             continue
-        inner = cond.args[0]
+        inner, infinity = cond.args
+        if not _positive_infinity(infinity):
+            continue
         if getattr(inner, "op", None) != "call_function":
             continue
-        if not str(inner.target).startswith("aten.abs"):
+        if not str(inner.target).startswith("aten.abs") or inner.args != (high,):
+            continue
+        if getattr(high, "op", None) != "call_function" or _op(high) != "amax":
             continue
         table[node] = high
         for structural in (cond, low):
@@ -154,6 +158,55 @@ def _logsumexp_inf_guard(gm) -> dict:
                     if getattr(sub, "op", None) == "call_function":
                         table[sub] = None
     return table
+
+
+def _positive_infinity(value) -> bool:
+    if isinstance(value, float):
+        return value == float("inf")
+    if getattr(value, "op", None) == "call_function" and _op(value) == "scalar_tensor":
+        return bool(value.args) and _positive_infinity(value.args[0])
+    return False
+
+
+def _tensor_value(node):
+    value = node.meta.get("val") if hasattr(node, "meta") else None
+    return node.meta.get("example_value") if value is None and hasattr(node, "meta") else value
+
+
+def _same_shape(a, b) -> bool:
+    # Symbol names/expressions are compared without truth-testing or concretising SymInts.
+    return len(a) == len(b) and all(str(x) == str(y) for x, y in zip(a, b))
+
+
+def _argument(node, name, default=None):
+    if name in node.kwargs:
+        return node.kwargs[name]
+    schema = getattr(node.target, "_schema", None)
+    if schema is not None:
+        for index, argument in enumerate(schema.arguments):
+            if argument.name == name and index < len(node.args):
+                return node.args[index]
+    positions = {"dim": 1, "keepdim": 2, "min": 1, "max": 2}
+    index = positions.get(name)
+    return node.args[index] if index is not None and index < len(node.args) else default
+
+
+def _exact_floor_guard(node, env) -> bool:
+    if _op(node) not in ("clamp", "clamp_min") or not node.args:
+        return False
+    lower = _argument(node, "min")
+    upper = _argument(node, "max") if _op(node) == "clamp" else None
+    if not isinstance(lower, (int, float)) or lower != 1e-30 or upper is not None:
+        return False
+    source = node.args[0]
+    expr = env.get(source)
+    if expr is None or not getattr(expr, "is_Symbol", False):
+        return False
+    # Only the documented max(abs(x)) zero guard is interpreted as a coordinate guard.
+    if getattr(source, "op", None) != "call_function" or _op(source) != "amax":
+        return False
+    operand = source.args[0] if source.args else None
+    return env.get(operand) == sp.Abs(c_sym)
 
 
 def _rank_of(node):
@@ -174,7 +227,8 @@ def _var_is_biased(node) -> bool:
     different number, which is precisely the failure this project refuses rather than ships.
     """
     if "correction" in node.kwargs:
-        return float(node.kwargs["correction"]) == 0.0
+        correction = node.kwargs["correction"]
+        return isinstance(correction, (int, float)) and correction == 0
     if "unbiased" in node.kwargs:
         return node.kwargs["unbiased"] is False
     # positional: (self, dim, unbiased[, keepdim])
@@ -207,7 +261,7 @@ def _is_row_flatten(node, env, rank) -> bool:
     shape = getattr(value, "shape", None)
     if shape is None or len(shape) != 2:
         return False
-    return int(shape[0]) == first
+    return isinstance(shape[0], int) and shape[0] == first
 
 
 def _reduces_last_dim_only(node, rank):
@@ -285,6 +339,10 @@ def _op(node) -> str:
     return name if name else str(tgt)
 
 
+def _scalar_expr(value):
+    return sp.Rational(str(value)) if isinstance(value, float) and math.isfinite(value) else sp.sympify(value)
+
+
 def _as_expr(a, env):
     """Symbolic value of one operand, or (None, False) if it is not a value operand."""
     if hasattr(a, "op"):
@@ -294,7 +352,7 @@ def _as_expr(a, env):
     if isinstance(a, int):
         return sp.Integer(a), True
     if isinstance(a, float):
-        return sp.Float(a), True
+        return _scalar_expr(a), True
     return None, False          # dims, keepdim, lists: not values
 
 
@@ -322,184 +380,232 @@ class Candidate:
     consumer_node: object
     consumer_sym: object = None
     producer_sym: object = None
+    producer_guarded: bool = False
 
 
-def interpret(gm, why: list | None = None):
-    """Symbolically evaluate `gm`.
+class _Refusal(ValueError):
+    """An unsupported semantic boundary, not an optimization failure."""
 
-    Returns (input_node, phi, psi) or None:
-        phi  the expression the max-like reduction reduces over (in c)
-        psi  the expression the sum-like reduction reduces over (in c and S_RESULT)
+
+def _value_operand(node, env, index=0):
+    value, is_value = _as_expr(node.args[index], env) if len(node.args) > index else (None, False)
+    if not is_value or value is None:
+        raise _Refusal(f"a value operand could not be interpreted at {str(node.target)!r}")
+    return value
+
+
+def _check_binary_broadcast(node, env):
+    operands = [(arg, env.get(arg)) for arg in node.args[:2] if hasattr(arg, "op")]
+    data = [arg for arg, expr in operands if expr is not None and expr.has(c_sym)]
+    for arg, expr in operands:
+        if expr is None or expr.has(c_sym) or not expr.free_symbols or not data:
+            continue
+        data_value, reduced_value = _tensor_value(data[0]), _tensor_value(arg)
+        if data_value is None or reduced_value is None:
+            raise _Refusal("reduction broadcast metadata is unknown")
+        expected = data_value.shape[:-1] + (1,)
+        scalar_row = len(data_value.shape) == 1 and len(reduced_value.shape) == 0
+        if not scalar_row and not _same_shape(reduced_value.shape, expected):
+            raise _Refusal("a reduction is broadcast across columns instead of its own row")
+
+
+def _check_data_shape(node, env, anchor):
+    expr = env.get(node)
+    if expr is None or not expr.has(c_sym):
+        return
+    source, output = _tensor_value(anchor), _tensor_value(node)
+    if source is not None and output is not None and hasattr(output, "shape"):
+        if not _same_shape(output.shape, source.shape):
+            raise _Refusal("pointwise broadcasting changes row shape; preserve it as a boundary")
+
+
+def _interpret_node(node, env, reductions, guarded, rank):
+    name = _op(node)
+    schema = getattr(node.target, "_schema", None)
+    if schema is not None and (schema.is_mutable or not schema.name.startswith("aten::")):
+        raise _Refusal(f"unsupported or mutable operation {node.target!s}")
+    if name in _ALLOC or name in _WRAPPERS:
+        return
+    if name in ("view", "reshape"):
+        source = node.args[0] if node.args else None
+        before, after = _tensor_value(source), _tensor_value(node)
+        identical = (before is not None and after is not None
+                     and _same_shape(before.shape, after.shape))
+        if not identical and not _is_row_flatten(node, env, rank):
+            raise _Refusal(f"a {name} changes the row structure")
+        env[node] = _value_operand(node, env)
+        return
+    if name in _CONST_FILL:
+        fill = 0.0 if name.startswith("zeros") else 1.0 if name.startswith("ones") else None
+        if fill is None:
+            position = 0 if name == "scalar_tensor" else 1
+            fill = node.args[position] if len(node.args) > position else None
+        if not isinstance(fill, (int, float)) or isinstance(fill, bool):
+            raise _Refusal("a fill value is not a scalar constant")
+        env[node] = _scalar_expr(fill)
+        return
+    if name in ("clamp", "clamp_min"):
+        if not _exact_floor_guard(node, env):
+            raise _Refusal("a clamp is real computation, not the exact max-abs zero guard")
+        value = _value_operand(node, env)
+        guarded[value] = sp.Max(value, _scalar_expr(1e-30))
+        env[node] = guarded[value]
+        return
+    if name in _IGNORED:
+        if name == "getitem":
+            source = node.args[0] if node.args else None
+            if (len(node.args) != 2 or node.args[1] != 0
+                    or getattr(source, "op", None) != "call_function" or _op(source) != "max"):
+                raise _Refusal("getitem may select data or reduction indices")
+        value = _value_operand(node, env)
+        if name in ("squeeze", "unsqueeze") and value.has(c_sym):
+            before, after = _tensor_value(node.args[0]), _tensor_value(node)
+            if before is None or after is None or not _same_shape(before.shape, after.shape):
+                raise _Refusal("a data reshape changes the row structure")
+        env[node] = value
+        return
+    if name in (*_MEANS, *_VAR_STD, *_REDUCTIONS):
+        value = _value_operand(node, env)
+        source = node.args[0]
+        source_rank = _rank_of(source)
+        if not _reduces_last_dim_only(node, source_rank if source_rank is not None else rank):
+            raise _Refusal("only a last-dimension row reduction is supported")
+        requested_dtype = _argument(node, "dtype")
+        source_value = _tensor_value(source)
+        if requested_dtype is not None and (source_value is None or requested_dtype != source_value.dtype):
+            raise _Refusal("a reduction changes dtype; preserve the conversion as a region boundary")
+        if name in _VAR_STD:
+            if not _var_is_biased(node):
+                raise _Refusal("unbiased variance/std requires a carried count")
+            producer = sp.Symbol(f"$r{len(reductions)}", real=True)
+            reductions.append(("sum", value / NCOLS_SYM, producer, node))
+            consumer = sp.Symbol(f"$r{len(reductions)}", real=True)
+            reductions.append(("sum", (value - producer) ** 2 / NCOLS_SYM, consumer, node))
+            env[node] = sp.sqrt(consumer) if name == "std" else consumer
+        else:
+            symbol = sp.Symbol(f"$r{len(reductions)}", real=True)
+            kind = "max" if name in ("amax", "max") else "sum"
+            operand = value / NCOLS_SYM if name in _MEANS else value
+            reductions.append((kind, operand, symbol, node))
+            env[node] = symbol
+        return
+    if name in _BINARY:
+        left, right = _value_operand(node, env), _value_operand(node, env, 1)
+        if name in ("add", "sub"):
+            alpha = _argument(node, "alpha", 1)
+            if not isinstance(alpha, (int, float)) or not math.isfinite(alpha):
+                raise _Refusal("alpha is not a finite scalar constant")
+            right *= _scalar_expr(alpha)
+        if name in ("div", "truediv") and _argument(node, "rounding_mode") is not None:
+            raise _Refusal("rounded division is not real division")
+        _check_binary_broadcast(node, env)
+        env[node] = _BINARY[name](left, right)
+        return
+    if name in _UNARY:
+        env[node] = _UNARY[name](_value_operand(node, env))
+        return
+    raise _Refusal(f"unfamiliar op {str(node.target)!r}; compound reductions may need lowering/decomposition")
+
+
+def interpret(gm, why: list | None = None, *, input_node=None, local=False):
+    """Interpret one row-data boundary.
+
+    Strict mode retains the original diagnostic API. Local mode stops each unsupported
+    dataflow branch without ignoring the operation: its output may be a DIFFERENT boundary
+    in a later invocation, so GEMMs, casts, clamps, masks and other inputs stay in the graph.
     """
-    env: dict = {}
-    input_node = None
-    rank = None
-    reductions: list = []
+    env, reductions, guarded = {}, [], {}
+    anchor, rank = input_node, _rank_of(input_node) if input_node is not None else None
     guard_table = _logsumexp_inf_guard(gm)
-
+    # A functionalized graph has an explicit effect/data dependency contract. Without
+    # that guarantee, a write can invalidate any aliased region input at a different time.
     for node in gm.graph.nodes:
-        if node in guard_table:
-            guarded = guard_table[node]
-            if guarded is not None:
-                gv, g_is_val = _as_expr(guarded, env)
-                if not g_is_val or gv is None:
-                    return None
-                env[node] = gv
+        schema = getattr(node.target, "_schema", None)
+        mutable = schema is not None and schema.is_mutable
+        mutable = mutable or (node.op == "call_method" and str(node.target).endswith("_"))
+        if mutable:
+            if why is not None:
+                why.append("mutable graph must be functionalized before reduction fusion")
+            return None
+    for node in gm.graph.nodes:
+        if node is anchor:
+            env[node] = c_sym
             continue
         if node.op == "placeholder":
-            if input_node is None:
-                input_node = node
-                rank = _rank_of(node)
+            if anchor is None:
+                anchor, rank = node, _rank_of(node)
                 env[node] = c_sym
             continue
         if node.op not in ("call_function", "call_method"):
             continue
-        name = _op(node)
-
-        if name in _ALLOC or name in _WRAPPERS:
-            continue                       # a buffer / a tracing wrapper; no data path
-
-        if name in ("view", "reshape"):
-            if not _is_row_flatten(node, env, rank):
+        try:
+            if node in guard_table:
+                source = guard_table[node]
+                if source is not None:
+                    value, known = _as_expr(source, env)
+                    if not known or value is None:
+                        raise _Refusal("infinity guard source is outside the region")
+                    env[node] = value
+                continue
+            _interpret_node(node, env, reductions, guarded, rank)
+            _check_data_shape(node, env, anchor)
+        except _Refusal as error:
+            env.pop(node, None)
+            if not local:
                 if why is not None:
-                    why.append(
-                        f"a {name} that changes the row structure: only a 2-D "
-                        f"`x.reshape(x.shape[0], -1)` can be treated as the identity, because "
-                        f"any other reshape changes which elements share a row"
-                    )
+                    why.append(str(error))
                 return None
-            v, is_val = _as_expr(node.args[0], env)
-            if not is_val or v is None:
-                return None
-            env[node] = v
-            continue
-
-        if name in _CONST_FILL:
-            # `full_like(x, v)` (and friends) is the constant v. `zeros_like`/`ones_like` fill
-            # with 0/1, which is what makes an epsilon or a bias appear in a graph as a symbol.
-            fill = 0.0 if name.startswith("zeros") else 1.0 if name.startswith("ones") else None
-            if fill is None:
-                for a in node.args[1:]:
-                    if isinstance(a, (int, float, bool)):
-                        fill = float(a)
-                        break
-            if fill is None:
-                return None
-            env[node] = sp.Float(fill)
-            continue
-
-        if name in _IGNORED:
-            # pass through the first value operand (squeeze/getitem/clamp_min)
-            for a in node.args:
-                v, is_val = _as_expr(a, env)
-                if is_val and v is not None:
-                    env[node] = v
-                    break
-            continue
-
-        if name in _MEANS:
-            v, is_val = _as_expr(node.args[0], env) if node.args else (None, False)
-            if not is_val or v is None or not _reduces_last_dim_only(node, rank):
-                return None
-            sym = sp.Symbol(f"$r{len(reductions)}", real=True)
-            # A mean is a sum over ncols, and ncols is a RUNTIME value: using the canonical
-            # symbol (rather than a number read off the shape) is what lets the same match
-            # work for static and symbolic shapes alike.
-            reductions.append(("sum", v / NCOLS_SYM, sym, node))
-            env[node] = sym
-            continue
-
-        if name in _VAR_STD:
-            # Expanded into the pair the algebra needs: a mean of c, then a mean of the
-            # CENTERED squares. Both are `sum(operand)` with the mean's 1/ncols in the operand,
-            # so the symbols this produces are exactly the ones a decomposed graph yields --
-            # which is why recognition needs no special case beyond this expansion.
-            v, is_val = _as_expr(node.args[0], env) if node.args else (None, False)
-            if not is_val or v is None or not _reduces_last_dim_only(node, rank):
-                return None
-            if not _var_is_biased(node):
-                return None                # /(N-1): a different operator, refuse
-            prod_sym = sp.Symbol(f"$r{len(reductions)}", real=True)
-            reductions.append(("sum", v / NCOLS_SYM, prod_sym, node))
-            cons_sym = sp.Symbol(f"$r{len(reductions)}", real=True)
-            reductions.append(("sum", (v - prod_sym) ** 2 / NCOLS_SYM, cons_sym, node))
-            env[node] = sp.sqrt(cons_sym) if name == "std" else cons_sym
-            continue
-
-        if name in _REDUCTIONS:
-            v, is_val = _as_expr(node.args[0], env) if node.args else (None, False)
-            if not is_val or v is None or not _reduces_last_dim_only(node, rank):
-                return None
-            kind = "max" if name in ("amax", "max") else "sum"
-            sym = sp.Symbol(f"$r{len(reductions)}", real=True)
-            reductions.append((kind, v, sym, node))
-            env[node] = sym
-            continue
-
-        if name in _BINARY:
-            vals = []
-            for a in node.args[:2]:
-                v, is_val = _as_expr(a, env)
-                if not is_val:
-                    _no_value(node, why, "a binary operand")
-                    return None
-                vals.append(v)
-            if None in vals:
-                return None
-            env[node] = _BINARY[name](vals[0], vals[1])
-            continue
-
-        if name in _UNARY:
-            v, is_val = _as_expr(node.args[0], env) if node.args else (None, False)
-            if not is_val or v is None:
-                _no_value(node, why, "a unary operand")
-                return None
-            env[node] = _UNARY[name](v)
-            continue
-
-        # Unknown op: refuse rather than guess -- and NAME it. "not a producer/consumer
-        # reduction pair" is what a user sees otherwise, which says nothing about the fact that
-        # their graph contains `aten.softmax.int` and would be understood after the core-aten
-        # decompositions (`ep.run_decompositions()`). The refusal is the same; only the
-        # explanation improves.
-        if why is not None:
-            why.append(f"unfamiliar op {str(node.target)!r} -- if this is a high-level aten op "
-                       f"such as softmax/layer_norm, the core decompositions expose its "
-                       f"reductions (ep.run_decompositions())")
-        return None
-
-    if input_node is None:
+    if anchor is None:
         if why is not None:
             why.append("no input placeholder found")
         return None
     if len(reductions) < 2:
         if why is not None:
-            why.append(
-                f"only {len(reductions)} reduction(s) found: this frame fuses a PRODUCER and a "
-                f"CONSUMER reduction, so a single reduction with elementwise work around it "
-                f"(RMSNorm, LayerNorm, softmax's normalisation) is outside it"
-            )
+            why.append(f"only {len(reductions)} reduction(s) found; a dependent reduction pair is required")
         return None
-
-    # Which reduction is the PRODUCER is decided by DEPENDENCY, not by order in the graph.
-    # A repair pair has one reduction whose result is consumed inside the other's operand:
-    # for logsumexp it is the max that feeds the sum, for RMSNorm+max it is the sum that
-    # feeds the max. Assuming "max first" silently mislabelled the second case.
-    syms = [r[2] for r in reductions]
+    symbols = [r[2] for r in reductions]
     candidates = []
-    for i, (ki, vi, si, ni) in enumerate(reductions):
-        for j, (kj, vj, sj, nj) in enumerate(reductions):
-            if i == j or not vj.has(si) or vi.has(sj):
+    for i, (kind_p, phi, producer, pnode) in enumerate(reductions):
+        for j, (kind_c, operand, consumer, cnode) in enumerate(reductions):
+            if i == j or not operand.has(producer) or phi.has(consumer):
                 continue
-            if any(vi.has(other) for other in syms) or any(vj.has(other) for other in syms
-                                                          if other is not si):
+            if any(phi.has(other) for other in symbols) or any(
+                    operand.has(other) for other in symbols if other != producer):
                 continue
-            psi = vj.subs({si: S_RESULT})
-            if not psi.has(S_RESULT):
-                continue
-            candidates.append(Candidate(vi, psi, ki, kj, ni, nj, sj, si))
+            coordinate = guarded.get(producer)
+            uses_guard = coordinate is not None and operand.has(coordinate)
+            coordinate = coordinate if uses_guard else producer
+            psi = operand.subs({coordinate: S_RESULT})
+            if psi.has(S_RESULT) and not psi.has(producer):
+                candidates.append(Candidate(phi, psi, kind_p, kind_c, pnode, cnode,
+                                            consumer, coordinate, uses_guard))
     if not candidates:
         if why is not None:
             why.append(f"{len(reductions)} reductions found, but none depends on another")
         return None
-    return input_node, candidates, env
+    return anchor, candidates, env
+
+
+def region_inputs(gm):
+    """Bound analysis by reduction ancestors, not by every node times every other node."""
+    known_data = set(_BINARY) | set(_UNARY) | {"view", "reshape", "detach", "alias"}
+    anchors = set()
+    for node in gm.graph.nodes:
+        if node.op not in ("call_function", "call_method") or _op(node) not in (*_REDUCTIONS, *_MEANS, *_VAR_STD):
+            continue
+        frontier = list(node.args[:1])
+        visited = set()
+        while frontier:
+            value = frontier.pop()
+            if not hasattr(value, "op") or value in visited:
+                continue
+            visited.add(value)
+            meta = _tensor_value(value)
+            if meta is None or not hasattr(meta, "shape") or not meta.is_floating_point() or len(meta.shape) < 1:
+                continue
+            anchors.add(value)
+            # Unknown operators are kept as opaque tensor-producing boundaries. In
+            # particular do not symbolically erase casts, clamps, GEMMs or other inputs.
+            if value.op in ("call_function", "call_method") and _op(value) in known_data:
+                frontier.extend(value.all_input_nodes)
+    return [node for node in gm.graph.nodes if node in anchors]

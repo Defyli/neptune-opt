@@ -13,7 +13,8 @@ import tempfile
 
 import sympy as sp
 
-from neptune_codegen.algebra import _marked, repair_bias, repair_factor, term_expr
+from neptune_codegen.algebra import (_marked, repair_bias, repair_factor, term_expr,
+    coordinate_needs_floor, derive_merge_certificate)
 from neptune_codegen.skeleton import Skeleton
 from neptune_codegen.symbols import *  # noqa: F401,F403
 from neptune_codegen.sym_to_triton import TranslationError, to_triton
@@ -203,8 +204,7 @@ def _needs_denominator_floor(sk: Skeleton) -> bool:
         return False
     # Memoized on the (frozen, hashable) skeleton: `sp.together` is not free, and this is
     # called from every emit, which the autotuner replays.
-    return any(_producer_in_denominator(e) for e in
-               (term_expr(sk), repair_factor(sk), repair_bias(sk)))
+    return coordinate_needs_floor(sk)
 
 
 def denominator_expr(sk: Skeleton) -> str:
@@ -224,7 +224,7 @@ def denominator_expr(sk: Skeleton) -> str:
     """
     if sk.two_pass:
         return "m"
-    return "tl.maximum(m_new, 1e-30)" if _needs_denominator_floor(sk) else "m_new"
+    return effective_producer_source(sk, "m_new")
 
 
 def _bindings(sk: Skeleton, values: dict | None = None) -> dict:
@@ -234,7 +234,7 @@ def _bindings(sk: Skeleton, values: dict | None = None) -> dict:
     be bound in one place and forgotten in another.
     """
     names = {
-        s_sym: "m",          # stale = running value before this block's update
+        s_sym: effective_producer_source(sk, "m"),
         # Fresh producer value. An exponential fold must use the RAW value: flooring a
         # negative max with max(m, 1e-30) destroys it (measured 1e-3 relative error on
         # all-negative rows). Only a fold that divides needs the floor.
@@ -242,7 +242,7 @@ def _bindings(sk: Skeleton, values: dict | None = None) -> dict:
         c_sym: "v",
         u_sym: "acc",
         _FINAL_ACC: "acc",
-        _FINAL_M: "m",
+        _FINAL_M: effective_producer_source(sk, "m"),
     }
     names.update(param_bindings(sk, values))
     return names
@@ -377,8 +377,8 @@ def bias_line(sk: Skeleton, values: dict | None = None) -> str:
     return ("\n            # The affine half of the repair: a max consumer admits a shift\n"
             "            # (max-morphism), an additive one does not, so this line exists only\n"
             "            # for a max consumer and is zero on the first block.\n"
-            f"            bias = tl.where(m == {guard_value(sk)}, 0.0, "
-            f"{bias_source(sk, values)})")
+            f"            bias = tl.where(seen, "
+            f"{bias_source(sk, values)}, 0.0)")
 
 
 def scale_source(sk: Skeleton, values: dict | None = None) -> str:
@@ -402,6 +402,134 @@ def term_source(sk: Skeleton, values: dict | None = None, fill: str = "0.0") -> 
 
 def finalize_source(sk: Skeleton, values: dict | None = None) -> str:
     return to_triton(sk.finalize, _bindings(sk, values))
+
+
+def effective_producer_source(sk: Skeleton, raw: str) -> str:
+    """The coordinate in which the accumulator lives, never a raw reduction state."""
+    return f"tl.maximum({raw}, 1e-30)" if coordinate_needs_floor(sk) else raw
+
+
+def algebra_source(expr, names: dict) -> str:
+    """Render repair algebra without exp clipping, which would break its cocycle.
+
+    IEEE exp underflow/rounding still prevents bitwise associativity. This is not a
+    claim about exact machine arithmetic. Quotient powers retain precision-safe lowering.
+    """
+    expr = _marked(expr)
+    names = dict(names)
+    for index, node in enumerate(sorted(expr.atoms(sp.exp), key=sp.count_ops)):
+        symbol = sp.Dummy(f"unclipped_exp_{index}")
+        arg = node.args[0]
+        names[symbol] = f"tl.exp({algebra_source(arg, names)})"
+        expr = expr.xreplace({node: symbol})
+    return to_triton(expr, names)
+
+
+def reducer_combine_source(reducer: str, lhs: str, rhs: str) -> str:
+    if reducer == "sum":
+        return f"({lhs}) + ({rhs})"
+    if reducer == "max":
+        return f"tl.maximum({lhs}, {rhs})"
+    raise NotImplementedError(f"unknown reducer {reducer!r}")
+
+
+def emit_state_helpers(sk: Skeleton, values: dict | None = None) -> str:
+    """One generic chunk producer and one associative tuple combiner.
+
+    State = (raw producer, fp32 accumulator, seen finite terms, status bits).
+    Log status: bit 0 NaN, bit 1 +inf. All -inf chunks have no finite terms.
+    Non-log states use explicit seen and require the certificate's finite domain.
+    """
+    certificate = derive_merge_certificate(sk, values)
+    bindings = param_bindings(sk, values)
+    rho, beta = certificate.factor, certificate.bias
+    intrinsic_symbols = {sym for sym, _ in sk.intrinsic_params}
+    if (rho.free_symbols | beta.free_symbols) & intrinsic_symbols:
+        raise NotImplementedError("tuple merge repair cannot depend on runtime shape intrinsics")
+    if sk.is_log:
+        phi = derived_producer_expr(sk)
+        readout_offset = sp.simplify(sk.finalize - _FINAL_M)
+        if (readout_offset.func != sp.log
+                or sp.simplify(readout_offset.args[0] - _FINAL_ACC).is_nonnegative is not True):
+            raise NotImplementedError("is_log status finalizer requires m + log(acc + nonnegative constant)")
+        if (phi is None or sk.producer_reducer != "max"
+                or sp.simplify(sk.g - sp.exp(phi - s_sym)) != 0):
+            raise NotImplementedError("is_log extension requires g=exp(phi(c)-s), max/sum")
+        operand = to_triton(phi, {**bindings, c_sym: "v"})
+        prelude = f'''    phi = {operand}
+    nan_lane = mask & (phi != phi)
+    positive_inf = mask & (phi == float("inf"))
+    status = tl.max(nan_lane.to(tl.int32), 0) | (tl.max(positive_inf.to(tl.int32), 0) * 2)
+    finite_mask = mask & (phi == phi) & (tl.abs(phi) != float("inf"))
+    seen = tl.sum(finite_mask.to(tl.int32), 0) != 0
+    m = tl.max(tl.where(finite_mask, phi, -float("inf")), 0)
+    den = tl.where(seen, m, 0.0)
+    safe_phi = tl.where(finite_mask, phi, den)
+    acc = tl.sum(tl.where(finite_mask, tl.exp(safe_phi - den), 0.0), 0)
+'''
+    else:
+        operand = producer_operand(sk, values)
+        abs_line = "    a = tl.abs(v)\n" if operand == "a" else ""
+        reduce_name = "tl.sum" if sk.producer_reducer == "sum" else "tl.max"
+        identity = "0.0" if sk.producer_reducer == "sum" else '-float("inf")'
+        term = algebra_source(term_expr(sk), {**bindings, c_sym: "v", s2_sym: "den"})
+        cons_reduce = "tl.sum" if sk.consumer_reducer == "sum" else "tl.max"
+        prelude = (abs_line + "    seen = tl.sum(mask.to(tl.int32), 0) != 0\n"
+                   "    status = tl.full((), 0, tl.int32)\n"
+                   f"    m = {reduce_name}(tl.where(mask, {operand}, {identity}), 0)\n"
+                   "    m = tl.where(seen, m, 0.0)\n"
+                   f"    den = {effective_producer_source(sk, 'm')}\n"
+                   f"    acc = {cons_reduce}(tl.where(mask, {term}, {consumer_init(sk)}), 0)\n")
+    chunk = f'''@triton.jit
+def {sk.name}_chunk(x_ptr, row, off, ncols, stride_row, stride_col, BLOCK: tl.constexpr):
+    idx = off + tl.arange(0, BLOCK)
+    mask = idx < ncols
+    v = tl.load(x_ptr + row * stride_row + idx * stride_col, mask=mask, other=0.0).to(tl.float32)
+{prelude}    return m, acc, seen.to(tl.int32), status
+
+'''
+    merge_m = reducer_combine_source(sk.producer_reducer, "mA", "mB")
+    def transport(acc, old):
+        names = {**bindings, s_sym: old, s2_sym: "qNew"}
+        factor = algebra_source(rho, names)
+        result = f"{acc} * ({factor})"
+        if beta != 0:
+            result += f" + ({algebra_source(beta, names)})"
+        return result
+    merged_acc = reducer_combine_source(sk.consumer_reducer, transport("safeA", "qA"), transport("safeB", "qB"))
+    merge = f'''@triton.jit
+def {sk.name}_merge_state(mA, aA, vA, statusA, mB, aB, vB, statusB):
+    both = (vA != 0) & (vB != 0)
+    combined_m = {merge_m}
+    # Sanitize BEFORE evaluating repair: tl.where is not lazy.
+    oldA = tl.where(both, mA, 1.0)
+    oldB = tl.where(both, mB, 1.0)
+    fresh = tl.where(both, combined_m, 1.0)
+    qA = {effective_producer_source(sk, 'oldA')}
+    qB = {effective_producer_source(sk, 'oldB')}
+    qNew = {effective_producer_source(sk, 'fresh')}
+    safeA = tl.where(both, aA, 0.0)
+    safeB = tl.where(both, aB, 0.0)
+    combined_a = {merged_acc}
+    m = tl.where(vA != 0, tl.where(vB != 0, combined_m, mA), mB)
+    acc = tl.where(vA != 0, tl.where(vB != 0, combined_a, aA), aB)
+    return m, acc, vA | vB, statusA | statusB
+
+'''
+    return chunk + merge
+
+
+def state_finalize_source(sk: Skeleton, values: dict | None = None) -> str:
+    """Final cast occurs only at the output store; partials are never finalized."""
+    if not sk.is_log:
+        return finalize_source(sk, values)
+    names = _bindings(sk, values)
+    names[_FINAL_M] = "tl.where(seen != 0, m, 0.0)"
+    names[_FINAL_ACC] = "tl.where(seen != 0, acc, 1.0)"
+    finite_result = to_triton(sk.finalize, names)
+    return (f'tl.where((status & 1) != 0, float("nan"), '
+            f'tl.where((status & 2) != 0, float("inf"), '
+            f'tl.where(seen != 0, {finite_result}, -float("inf"))))')
 
 
 # ---------------------------------------------------------------- two-pass plan

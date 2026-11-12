@@ -29,6 +29,18 @@ import neptune_recognize as NR  # noqa: E402
 X = torch.randn(8, 32)
 
 
+def _validate_exported(program):
+    # Torch 2.4 exposes the same full verifier without the public validate method.
+    if hasattr(program, "validate"):
+        program.validate()
+    else:
+        program.verifier().check(program)
+
+
+def _export_verifiers(program):
+    return tuple(program.verifiers) if hasattr(program, "verifiers") else (program.verifier,)
+
+
 # ---------------------------------------------------------------- models
 def _l2(t):
     m = t.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
@@ -1051,7 +1063,8 @@ def test_merge_meta_api_shapes_and_fp32_scratch_launch_abi():
 
 # Transaction tests use a real dispatcher op with CPU reference and fake metadata.
 # Unlike aten.clone, it has the reduction ABI and passes ExportedProgram.validate().
-@torch.library.custom_op("neptune_test::transaction_lse", mutates_args=())
+@torch.library.custom_op("neptune_test::transaction_lse", mutates_args=(),
+                         schema="(Tensor x, bool keepdim) -> Tensor")
 def _transaction_lse(x: torch.Tensor, keepdim: bool) -> torch.Tensor:
     return torch.logsumexp(x, dim=-1, keepdim=keepdim)
 
@@ -1078,7 +1091,8 @@ def cpu_lse_handle():
         yield requests
 
 
-@torch.library.custom_op("neptune_test::transaction_lse_keep", mutates_args=())
+@torch.library.custom_op("neptune_test::transaction_lse_keep", mutates_args=(),
+                         schema="(Tensor x) -> Tensor")
 def _transaction_lse_keep(x: torch.Tensor) -> torch.Tensor:
     return _transaction_lse(x, True)
 
@@ -1088,7 +1102,8 @@ def _transaction_lse_keep_fake(x):
     return _transaction_lse_fake(x, True)
 
 
-@torch.library.custom_op("neptune_test::transaction_lse_drop", mutates_args=())
+@torch.library.custom_op("neptune_test::transaction_lse_drop", mutates_args=(),
+                         schema="(Tensor x) -> Tensor")
 def _transaction_lse_drop(x: torch.Tensor) -> torch.Tensor:
     return _transaction_lse(x, False)
 
@@ -1152,7 +1167,7 @@ def _assert_transaction_unchanged(ep, before):
         assert ep.state_dict[key] is tensor
         assert ep.state_dict[key].data_ptr() == pointer
         torch.testing.assert_close(ep.state_dict[key], value, rtol=0, atol=0)
-    ep.validate()
+    _validate_exported(ep)
 
 
 def test_apply_transaction_generation_exception_rolls_back_after_first_region(cpu_lse_handle):
@@ -1219,7 +1234,7 @@ def test_apply_transaction_verified_binds_parameters_and_dict_pytree(cpu_lse_han
     for key, (tensor, pointer, value) in state.items():
         assert ep.state_dict[key] is tensor and tensor.data_ptr() == pointer
         torch.testing.assert_close(tensor, value, rtol=0, atol=0)
-    ep.validate()
+    _validate_exported(ep)
 
 
 def test_apply_transaction_verification_reference_cannot_mutate_original_state(cpu_lse_handle):
@@ -1264,7 +1279,7 @@ def test_apply_transaction_commit_rebinds_output_specs_to_new_nodes(cpu_lse_hand
         if entry.signature:
             assert all(getattr(arg, "name", None) != old_root for arg in entry.signature.outputs)
     ep.graph_module.graph.lint()
-    ep.validate()
+    _validate_exported(ep)
     torch.testing.assert_close(ep.module()(X), mod(X))
 
 
@@ -1286,7 +1301,7 @@ def test_apply_transaction_multi_region_preserves_gemm_residual_clamp(
     assert torch.ops.aten.sin.default in targets, "the second region input boundary must survive"
     # The bounded mode must leave the unused compound INTACT, not expand its internals.
     assert targets.count(torch.ops.aten.logsumexp.default) == 2 - expected
-    ep.validate()
+    _validate_exported(ep)
     torch.testing.assert_close(ep.module()(X), mod(X), rtol=1e-5, atol=1e-6)
 
 
@@ -1427,6 +1442,200 @@ def test_default_lowering_declines_unstable_log_softmax(cpu_lse_handle):
     _assert_transaction_unchanged(ep, before)
     explicit = NO.apply(ep, experimental_log_softmax=True, verify_with=(mod, (X,)))
     assert explicit.verified and len(explicit.fusions) == 1
+
+
+class _PreservedChild(torch.nn.Module):
+    def __init__(self, keepdim):
+        super().__init__()
+        self.keepdim = keepdim
+        self.weight = torch.nn.Parameter(torch.ones(32))
+        self.register_buffer("offset", torch.tensor(0.25))
+
+    def forward(self, x):
+        return torch.logsumexp(x * self.weight + self.offset, -1, keepdim=self.keepdim)
+
+
+class _PreservedParent(torch.nn.Module):
+    def __init__(self, keepdim, final=True):
+        super().__init__()
+        self.child = _PreservedChild(keepdim)
+        self.final = final
+        self.tail = torch.nn.Identity()
+
+    def forward(self, x):
+        result = self.tail(self.child(x))
+        return {"lse": result if self.final else result.sin() * 2, "aux": x > 0}
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("final", [False, True])
+def test_apply_preserved_child_signature_before_first_validation(cpu_lse_handle, keepdim, final):
+    mod = _PreservedParent(keepdim, final).eval()
+    ep = torch.export.export(mod, (X,), preserve_module_call_signature=("child", "tail"))
+    before = _transaction_snapshot(ep)
+    input_specs = before["signature_value"].input_specs
+    call_spec = ep.call_spec
+    child_before = next(entry for entry in before["calls_value"] if entry.fqn == "child")
+    old_root = child_before.signature.outputs[0].name
+    with patch.object(ep, "_update", side_effect=AssertionError("private update must not be used")):
+        report = NO.apply(ep, verify_with=(mod, (X,)))
+    assert len(report.fusions) == len(cpu_lse_handle) == 1, report.summary()
+    assert report.verified and report.graph_changed
+    assert ep.graph_signature.input_specs == input_specs
+    assert ep.call_spec == call_spec and ep.example_inputs == ((X,), {})
+    assert ep.module_call_graph is not before["calls"]
+    assert before["calls"] == before["calls_value"], "original call metadata must stay independent"
+    child = next(entry for entry in ep.module_call_graph if entry.fqn == "child")
+    tail = next(entry for entry in ep.module_call_graph if entry.fqn == "tail")
+    assert child.signature.in_spec == child_before.signature.in_spec
+    assert child.signature.out_spec == child_before.signature.out_spec
+    assert child.signature.outputs[0].name != old_root
+    assert tail.signature.inputs[0].name == child.signature.outputs[0].name
+    names = {node.name for node in ep.graph.nodes}
+    assert old_root not in names
+    for entry in ep.module_call_graph:
+        if entry.signature is not None:
+            assert all(arg.name in names for arg in (*entry.signature.inputs, *entry.signature.outputs)
+                       if hasattr(arg, "name"))
+    for key, (tensor, pointer, value) in before["tensors"].items():
+        assert ep.state_dict[key] is tensor and tensor.data_ptr() == pointer
+        torch.testing.assert_close(tensor, value, rtol=0, atol=0)
+    _validate_exported(ep)
+    torch.testing.assert_close(ep.module()(X), mod(X))
+
+
+class _IndependentPreservedRegions(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.left = _PreservedChild(False)
+        self.right = _PreservedChild(True)
+
+    def forward(self, x):
+        return {"left": self.left(x), "right": self.right(x.sin())}
+
+
+def test_apply_two_independent_outputs_preserve_module_call_graph(cpu_lse_handle):
+    mod = _IndependentPreservedRegions().eval()
+    ep = torch.export.export(mod, (X,), preserve_module_call_signature=("left", "right"))
+    before = _transaction_snapshot(ep)
+    report = NO.apply(ep, verify_with=(mod, (X,)))
+    assert report.verified and len(report.fusions) == len(cpu_lse_handle) == 2, report.summary()
+    assert before["calls"] == before["calls_value"]
+    output_names = [spec.arg.name for spec in ep.graph_signature.output_specs]
+    for index, fqn in enumerate(("left", "right")):
+        entry = next(entry for entry in ep.module_call_graph if entry.fqn == fqn)
+        assert entry.signature.outputs[0].name == output_names[index]
+    _validate_exported(ep)
+    torch.testing.assert_close(ep.module()(X), mod(X))
+
+
+def test_apply_generation_error_does_not_change_preserved_metadata(cpu_lse_handle):
+    import neptune_codegen as CG
+
+    mod = _IndependentPreservedRegions().eval()
+    ep = torch.export.export(mod, (X,), preserve_module_call_signature=("left", "right"))
+    ep.graph_module.meta["neptune_replaced_roots"] = {}
+    mapping = ep.graph_module.meta["neptune_replaced_roots"]
+    before = _transaction_snapshot(ep)
+    handle = CG.op_handle
+
+    def fail_second(*args, **kwargs):
+        if cpu_lse_handle:
+            raise RuntimeError("preserved metadata generation failure")
+        return handle(*args, **kwargs)
+
+    with patch.object(CG, "op_handle", side_effect=fail_second):
+        report = NO.apply(ep)
+    assert len(cpu_lse_handle) == 1
+    assert not report.fusions and "preserved metadata generation failure" in report.summary()
+    assert ep.graph_module.meta["neptune_replaced_roots"] is mapping and mapping == {}
+    _assert_transaction_unchanged(ep, before)
+
+
+@pytest.mark.parametrize("stale_target", [None, "input", "missing", "cycle"])
+def test_candidate_program_resolves_transitive_internal_root_mapping(cpu_lse_handle, stale_target):
+    mod = _PreservedParent(True, False).eval()
+    ep = torch.export.export(mod, (X,), preserve_module_call_signature=("child", "tail"))
+    trial = NO._graph_trial(ep.graph_module)
+    report = NO._rewrite_regions(trial, None, lower=True)
+    assert len(report.fusions) == 1
+    entry = next(entry for entry in ep.module_call_graph if entry.fqn == "child")
+    old_root = entry.signature.outputs[0].name
+    mapping = trial.meta["neptune_replaced_roots"]
+    target = mapping[old_root]
+    mapping[old_root] = "intermediate_replaced_root"
+    mapping["intermediate_replaced_root"] = target
+    # Even conflicting historical metadata cannot rename surviving user inputs.
+    input_name = ep.graph_signature.user_inputs[0]
+    mapping[input_name] = target
+    if stale_target == "input":
+        mapping[target] = input_name
+    elif stale_target == "missing":
+        mapping[target] = "removed_historical_node"
+    elif stale_target == "cycle":
+        mapping[target] = old_root
+    candidate = NO._candidate_program(ep, trial)
+    assert candidate.graph_signature.input_specs == ep.graph_signature.input_specs
+    child = next(entry for entry in candidate.module_call_graph if entry.fqn == "child")
+    assert child.signature.inputs[0].name == input_name
+    assert child.signature.outputs[0].name == target
+    assert entry.signature.outputs[0].name == old_root
+    _validate_exported(candidate)
+
+
+def test_apply_preserves_literal_call_arguments_and_unknown_metadata(cpu_lse_handle):
+    class Child(torch.nn.Module):
+        def forward(self, x, flag):
+            return torch.logsumexp(x, -1), flag
+
+    class Parent(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.child = Child()
+
+        def forward(self, x):
+            result, flag = self.child(x, True)
+            return {"lse": result, "flag": flag}
+
+    mod = Parent().eval()
+    ep = torch.export.export(mod, (X,), preserve_module_call_signature=("child",))
+    ep.graph_module.meta["unknown_foo"] = {"marker": "keep"}
+    verifiers = _export_verifiers(ep)
+    constants, constraints = ep.constants, dict(ep.range_constraints)
+    report = NO.apply(ep, verify_with=(mod, (X,)))
+    assert report.verified and len(report.fusions) == 1, report.summary()
+    assert ep.graph_module.meta["unknown_foo"] == {"marker": "keep"}
+    assert _export_verifiers(ep) == verifiers and ep.constants is constants
+    assert ep.range_constraints == constraints
+    child = next(entry for entry in ep.module_call_graph if entry.fqn == "child")
+    assert child.signature.inputs[1].value is True
+    assert child.signature.outputs[1].value is True
+    _validate_exported(ep)
+    torch.testing.assert_close(ep.module()(X), mod(X))
+
+
+def test_apply_refuses_deleted_preserved_intermediate(cpu_lse_handle):
+    class Maximum(torch.nn.Module):
+        def forward(self, x):
+            return x.amax(-1, keepdim=True)
+
+    class Parent(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.child = Maximum()
+
+        def forward(self, x):
+            maximum = self.child(x)
+            return maximum + (x - maximum).exp().sum(-1, keepdim=True).log()
+
+    mod = Parent().eval()
+    ep = torch.export.export(mod, (X,), preserve_module_call_signature=("child",))
+    before = _transaction_snapshot(ep)
+    report = NO.apply(ep, lower=False)
+    assert len(cpu_lse_handle) == 1, report.summary()
+    assert not report.fusions and not report.graph_changed
+    assert "removed intermediate" in report.summary()
+    _assert_transaction_unchanged(ep, before)
 
 
 def test_verify_direct_read_only_reference_does_not_mutate_original_parameters():

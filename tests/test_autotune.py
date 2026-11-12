@@ -443,12 +443,15 @@ def test_row_last_runtime_shapes_strides_copies_and_zero_rows():
     validate = T._validate_row_last
     # All CPU tensors still run real validation for rank/layout/dtype/width; only device
     # execution is substituted, and the recorder checks every argument of the real launch.
+    # These bridge APIs are absent in older Torch: install CPU recorder substitutes
+    # explicitly rather than skip any layout/stride assertions.
     with mock.patch.object(T, "compile_skeleton", return_value=recorder), mock.patch.object(
         TO, "compile_skeleton", return_value=recorder
     ), mock.patch.object(T, "_validate_row_last", side_effect=lambda x, **kw: validate(x, metadata=True)), mock.patch.object(
         TO, "_validate_row_last", side_effect=lambda x, **kw: validate(x, metadata=True)
-    ), mock.patch.object(torch.library, "triton_op", side_effect=lambda *a, **kw: lambda fn: fn), mock.patch.object(
-        torch.library, "wrap_triton", side_effect=lambda kernel: kernel
+    ), mock.patch.object(torch.library, "triton_op", side_effect=lambda *a, **kw: lambda fn: fn,
+                         create=True), mock.patch.object(
+        torch.library, "wrap_triton", side_effect=lambda kernel: kernel, create=True
     ), mock.patch.dict(TO._TRITON_OPS, {}, clear=True):
         base = torch.randn(4, 6, 8)
         inputs = [torch.randn(8), torch.randn(3, 8), torch.randn(2, 3, 8),

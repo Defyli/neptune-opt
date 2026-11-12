@@ -95,6 +95,12 @@ def rewrite_match(gm, match, *, lib="neptune", plan="serial"):
     with graph.inserting_before(root):
         call = graph.call_function(op, args=(match.input_node,))
         call.meta = copy.copy(root.meta)
+    # Own the mapping: GraphModule metadata may be shallow-copied by FX callers.
+    # Keep internal roots too, since preserved module signatures can refer to
+    # values that are not final graph outputs. Consumers resolve chains later.
+    replacements = copy.deepcopy(gm.meta.get("neptune_replaced_roots", {}))
+    replacements[root.name] = call.name
+    gm.meta["neptune_replaced_roots"] = replacements
     root.replace_all_uses_with(call)
     graph.erase_node(root)
     # Only remove nodes from this complete region, and never remove side effects or

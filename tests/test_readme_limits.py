@@ -53,6 +53,14 @@ from neptune_recognize.lowering import lower_if_it_helps  # noqa: E402
 X = torch.randn(8, 32)
 
 
+def _validate_exported(program):
+    # Torch 2.4 predates validate(), but must still run its complete EP verifier.
+    if hasattr(program, "validate"):
+        program.validate()
+    else:
+        program.verifier().check(program)
+
+
 class M(nn.Module):
     """A module wrapper: `torch.export` needs a module, and lambdas are not one."""
 
@@ -76,7 +84,8 @@ def _verdict(fn, decompose: bool = True):
     return (match.skeleton if match else None), str(why)
 
 
-@torch.library.custom_op("neptune_readme_test::lse", mutates_args=())
+@torch.library.custom_op("neptune_readme_test::lse", mutates_args=(),
+                         schema="(Tensor t) -> Tensor")
 def _cpu_lse(t: torch.Tensor) -> torch.Tensor:
     return torch.logsumexp(t, dim=-1)
 
@@ -107,7 +116,7 @@ def check_region_is_the_operator():
     mod = M(lambda t: torch.logsumexp(t, dim=-1) * 2.0)
     report = _stub_kernel(lambda: NO.apply(ep, verify_with=(mod, (X,))))
     assert len(report.fusions) == 1 and report.verified, report.summary()
-    ep.validate()
+    _validate_exported(ep)
     torch.testing.assert_close(ep.module()(X), mod(X))
     ops = [str(n.target) for n in ep.graph_module.graph.nodes if n.op == "call_function"]
     assert any("mul" in o for o in ops), (
@@ -135,7 +144,7 @@ def check_one_operator_per_graph():
     assert targets.count(_cpu_lse._opoverload) == 1
     # The unused compound must remain unexpanded, not merely remain numerically correct.
     assert targets.count(torch.ops.aten.logsumexp.default) == 1
-    ep.validate()
+    _validate_exported(ep)
     torch.testing.assert_close(ep.module()(X), two(X))
 
 
@@ -198,7 +207,7 @@ def check_needs_decomposition():
     assert any(reason == "no-fusion" and detail for reason, detail in report.skipped), report.summary()
     assert ep.graph_module is before[0] and ep.graph_module.graph is before[1]
     assert ep.graph_module.code == before[2] and ep.graph_signature is before[3]
-    ep.validate()
+    _validate_exported(ep)
 
 
 def check_prod_ratio_needs_a_count():
@@ -269,7 +278,7 @@ def test_default_apply_selectively_lowers_multiple_regions_without_core_decompos
     targets = [n.target for n in ep.graph_module.graph.nodes if n.op == "call_function"]
     assert targets.count(_cpu_lse._opoverload) == 2
     assert torch.ops.aten.logsumexp.default not in targets
-    ep.validate()
+    _validate_exported(ep)
     torch.testing.assert_close(ep.module()(X), two(X))
 
 

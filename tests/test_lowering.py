@@ -464,12 +464,12 @@ def test_parameters_multiple_placeholders_and_opaque_ops_preserved():
     ep = torch.export.export(model, args).run_decompositions({})
     gm = ep.graph_module
     opaque = [(n.name, n.target, str(n.args)) for n in gm.graph.nodes
-              if "matmul" in str(n.target) or "scaled_dot_product_attention" in str(n.target)]
+              if NR._op(n) in ("matmul", "mm") or "scaled_dot_product" in str(n.target)]
     placeholders = [(n.name, n.target) for n in gm.graph.nodes if n.op == "placeholder"]
     assert len(opaque) == 2
     assert lower_if_it_helps(gm) == 1
     assert [(n.name, n.target, str(n.args)) for n in gm.graph.nodes
-            if "matmul" in str(n.target) or "scaled_dot_product_attention" in str(n.target)] == opaque
+            if NR._op(n) in ("matmul", "mm") or "scaled_dot_product" in str(n.target)] == opaque
     assert [(n.name, n.target) for n in gm.graph.nodes if n.op == "placeholder"] == placeholders
     for actual, want in zip(gm(model.weight, *args), model(*args)):
         torch.testing.assert_close(actual, want)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import inspect
 import math
 import sys
 import warnings
@@ -177,7 +178,11 @@ def _trace(module, args):
 
 def _graph_trial(gm):
     # Share potentially huge state tensors, copying only functional graph structure.
-    return torch.fx.GraphModule(gm, copy.deepcopy(gm.graph))
+    trial = torch.fx.GraphModule(gm, copy.deepcopy(gm.graph))
+    trial.meta = copy.copy(gm.meta)
+    if "neptune_replaced_roots" in trial.meta:
+        trial.meta["neptune_replaced_roots"] = copy.deepcopy(trial.meta["neptune_replaced_roots"])
+    return trial
 
 
 def _rewrite_regions(gm, values, *, plan="serial", max_regions=None, lower=False,
@@ -214,9 +219,24 @@ def _rewrite_regions(gm, values, *, plan="serial", max_regions=None, lower=False
                 call, refusal = rewrite_match(tentative, chosen, plan=plan)
                 if call is None:
                     raise RuntimeError(refusal)
+                # The lowering API commits only graph structure. Track its output
+                # separately, including squeeze/cast outputs outside the fused root.
+                replacements = copy.deepcopy(gm.meta.get("neptune_replaced_roots", {}))
+                replacements.update(tentative.meta.get("neptune_replaced_roots", {}))
+                old_users = {user.name for user in node.users}
+                for user in tentative.graph.nodes:
+                    if user.name in old_users:
+                        old_user = next(original for original in gm.graph.nodes
+                                        if original.name == user.name)
+                        old_leaves, _ = torch.utils._pytree.tree_flatten((old_user.args, old_user.kwargs))
+                        new_leaves, _ = torch.utils._pytree.tree_flatten((user.args, user.kwargs))
+                        for old_leaf, new_leaf in zip(old_leaves, new_leaves):
+                            if old_leaf is node and isinstance(new_leaf, torch.fx.Node):
+                                replacements[node.name] = new_leaf.name
                 # Lowering and fusion of this marked region are one transaction. An
                 # existing region cannot consume its budget and leave it expanded.
                 _commit(gm, tentative)
+                gm.meta["neptune_replaced_roots"] = replacements
                 report.fusions.append(fusion)
                 break
             else:
@@ -251,32 +271,71 @@ def _rewrite_graph(gm, values=None, *, plan="serial", max_regions=None):
 
 
 def _candidate_program(exported, trial):
-    """Rebind output arguments without changing input/parameter/dynamic contracts."""
+    """Prepare all contracts before the public constructor's first validation."""
+    from torch.export.graph_signature import ConstantArgument
     from torch.utils._pytree import tree_flatten
 
     signature = copy.deepcopy(exported.graph_signature)
+    calls = copy.deepcopy(exported.module_call_graph)
+    nodes = {node.name: node for node in trial.graph.nodes}
+    replacements = copy.deepcopy(trial.meta.get("neptune_replaced_roots", {}))
+
+    def resolve(name):
+        # A surviving value has not been replaced; stale mappings from earlier
+        # transactions must never rename graph/user inputs or live intermediates.
+        if name in nodes:
+            return name
+        seen = set()
+        while name not in nodes:
+            if name in seen:
+                raise RuntimeError("cyclic rewritten root mapping")
+            seen.add(name)
+            if name not in replacements:
+                raise RuntimeError(f"module signature references removed intermediate {name}")
+            name = replacements[name]
+        return name
+
+    renamed = {name: resolve(name) for name in replacements if name not in nodes}
     output = next(node for node in trial.graph.nodes if node.op == "output")
     leaves, _ = tree_flatten(output.args[0])
     if len(leaves) != len(signature.output_specs):
         raise RuntimeError("rewrite changed exported output arity")
-    renamed = {}
     for index, (spec, leaf) in enumerate(zip(signature.output_specs, leaves)):
-        if hasattr(spec.arg, "name"):
+        if isinstance(spec.arg, ConstantArgument):
+            if isinstance(leaf, torch.fx.Node) or type(leaf) is not type(spec.arg.value) or leaf != spec.arg.value:
+                raise RuntimeError("rewrite changed a constant graph output")
+        elif hasattr(spec.arg, "name"):
             if not isinstance(leaf, torch.fx.Node):
                 raise RuntimeError("rewrite changed a graph output into a constant")
-            renamed[spec.arg.name] = leaf.name
+            if spec.arg.name != leaf.name:
+                if spec.arg.name in nodes or renamed.get(spec.arg.name) != leaf.name:
+                    raise RuntimeError("rewrite changed output without a root replacement")
             signature.output_specs[index] = dataclasses.replace(
                 spec, arg=dataclasses.replace(spec.arg, name=leaf.name))
-    candidate = exported._update(trial, signature)
-    for entry in candidate.module_call_graph:
+    # Graph inputs (including user argument names) are never renamed. Module
+    # inputs may reference an internal root, unlike root graph input_specs.
+    for spec in signature.input_specs:
+        if hasattr(spec.arg, "name") and spec.arg.name not in nodes:
+            raise RuntimeError("rewrite removed an exported graph input")
+    for entry in calls:
         if entry.signature is None:
             continue
         for field in ("inputs", "outputs"):
             arguments = getattr(entry.signature, field)
-            setattr(entry.signature, field, [dataclasses.replace(arg, name=renamed[arg.name])
-                    if hasattr(arg, "name") and arg.name in renamed else arg for arg in arguments])
-    candidate.validate()
-    return candidate
+            setattr(entry.signature, field, [dataclasses.replace(arg, name=resolve(arg.name))
+                    if hasattr(arg, "name") and not isinstance(arg, ConstantArgument)
+                    else arg for arg in arguments])
+    kwargs = dict(root=trial, graph=trial.graph, graph_signature=signature,
+                  state_dict=exported.state_dict,
+                  range_constraints=copy.deepcopy(exported.range_constraints),
+                  module_call_graph=calls, example_inputs=exported.example_inputs,
+                  constants=exported.constants)
+    parameters = inspect.signature(torch.export.ExportedProgram).parameters
+    if "verifiers" in parameters:
+        kwargs["verifiers"] = list(exported.verifiers)
+    elif "verifier" in parameters:
+        kwargs["verifier"] = exported.verifier
+    return torch.export.ExportedProgram(**kwargs)
 
 
 def apply(exported_program, values: dict | None = None, verify_with: tuple | None = None,

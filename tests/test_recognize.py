@@ -253,6 +253,20 @@ def test_regions_after_opaque_gemm_sdpa_preserve_guard(raw_lse):
             torch.randn(1, 1, 3, 4), torch.randn(1, 1, 3, 4), torch.randn(1, 1, 3, 4))
     model = Model().eval()
     gm = export(model, args).run_decompositions({}).graph_module
+    guard_target = torch.ops.aten._assert_tensor_metadata.default
+    # Older upstream export consumes this assertion before Neptune sees the graph.
+    # Seed an actual ATen guard when absent so both lowering and rewriting must
+    # preserve it on every tested version, rather than silently weaken the check.
+    if not any(node.target == guard_target for node in gm.graph.nodes):
+        boundary = next(node for node in gm.graph.nodes if NR._op(node) in ("mm", "matmul"))
+        value = boundary.meta["val"]
+        with gm.graph.inserting_after(boundary):
+            guard = gm.graph.call_function(guard_target, (boundary,),
+                    {"size": tuple(value.shape), "stride": tuple(value.stride()), "dtype": value.dtype})
+        guard.meta["val"] = None
+        gm.graph.lint()
+        gm.recompile()
+    assert sum(node.target == guard_target for node in gm.graph.nodes) == 1
     if raw_lse:
         assert lower_if_it_helps(gm) == 1
     before = str(gm.graph)

@@ -38,8 +38,11 @@ jobs:
           # Install the TEST EXTRA rather than a hand-written list, so an undeclared test
           # dependency fails here instead of on a user's machine (numpy was exactly that).
           python -m pip install -e ".[test]"
+          python -m pip check
+          python -c "import sys, torch; print('Python:', sys.version); \
+                     print('PyTorch:', torch.__version__); print('CUDA build:', torch.version.cuda)"
       - name: Recognition and the safety gates
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -q -ra
       - name: The generator still covers what it claims
         run: python tools/coverage_codegen.py --check
       - name: Every script in the repository compiles

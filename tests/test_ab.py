@@ -140,6 +140,69 @@ def test_fake_compile_real_export_restores_cuda_detection_even_after_failure():
     assert ab.tempfile.mkdtemp is real_mkdtemp
 
 
+def _package_config_entry(key, default=False):
+    """Build a fresh native entry without copying overrides or unset sentinels."""
+    import inspect
+    from torch.utils import _config_module
+
+    entry_type = getattr(_config_module, "_ConfigEntry", None)
+    if entry_type is None:
+        return default  # Torch 2.4 stores raw values in the config table.
+    # Recent Torch gives each entry a ContextVar, which cannot be deep-copied.
+    # A shallow copy would share that override with the donor configuration.
+    kwargs = {"name": key} if "name" in inspect.signature(entry_type).parameters else {}
+    return entry_type(_config_module.Config(default=default), **kwargs)
+
+
+@pytest.mark.parametrize("previous", (None, True, False))
+@pytest.mark.parametrize("raise_inside", (False, True))
+def test_package_config_entries_are_independent_and_restore(monkeypatch, previous, raise_inside):
+    from torch._inductor import config
+
+    keys = ("triton.unique_user_kernel_names", "triton.autotune_at_compile_time")
+    originals = {key: config._config[key] for key in keys if key in config._config}
+    original_values = {key: getattr(config.triton, key.split(".")[1]) for key in originals}
+    donor = config._config["triton.unique_kernel_names"]
+    donor_value = config.triton.unique_kernel_names
+    failure = RuntimeError("nested config failure")
+    expected = pytest.raises(RuntimeError) if raise_inside else contextlib.nullcontext()
+    with monkeypatch.context() as scoped:
+        # Exercise creation even on versions that already provide both keys.
+        for key in keys:
+            entry = _package_config_entry(key)
+            assert type(entry) is type(donor)
+            scoped.setitem(config._config, key, entry)
+        with expected as caught:
+            with config.patch({"triton.unique_kernel_names": True}):
+                assert config.triton.unique_user_kernel_names is False
+                assert config.triton.autotune_at_compile_time is False
+                with config.patch({keys[0]: previous}):
+                    assert config.triton.unique_user_kernel_names is previous
+                    assert config.triton.autotune_at_compile_time is False
+                    with config.patch({keys[1]: True}):
+                        assert config.triton.unique_user_kernel_names is previous
+                        assert config.triton.autotune_at_compile_time is True
+                        assert config.triton.unique_kernel_names is True
+                        if raise_inside:
+                            raise failure
+                    assert config.triton.autotune_at_compile_time is False
+                assert config.triton.unique_user_kernel_names is False
+                assert config.triton.autotune_at_compile_time is False
+                assert config.triton.unique_kernel_names is True
+        if raise_inside:
+            assert caught.value is failure
+        assert config.triton.unique_user_kernel_names is False
+        assert config.triton.autotune_at_compile_time is False
+        assert config.triton.unique_kernel_names is donor_value
+    for key in keys:
+        assert (key in config._config) is (key in originals)
+        if key in originals:
+            assert config._config[key] is originals[key]
+            assert getattr(config.triton, key.split(".")[1]) is original_values[key]
+    assert config._config["triton.unique_kernel_names"] is donor
+    assert config.triton.unique_kernel_names is donor_value
+
+
 def test_package_without_unique_user_kernel_names_checks_feature_gate(monkeypatch, tmp_path):
     from unittest.mock import Mock, patch
 
@@ -197,9 +260,7 @@ def test_package_uses_scoped_unique_user_kernel_names(monkeypatch, tmp_path, pre
     with monkeypatch.context() as scoped:
         for key in keys:
             if key not in config._config:
-                # Copy stock metadata, not a plain bool on _ConfigEntry-based Torch.
-                scoped.setitem(config._config, key,
-                               ab.copy.deepcopy(config._config["triton.unique_kernel_names"]))
+                scoped.setitem(config._config, key, _package_config_entry(key))
         original = (config.triton.unique_user_kernel_names, config.triton.autotune_at_compile_time)
         with config.patch(dict.fromkeys(keys, previous)):
             for result in (None, object()):
@@ -240,8 +301,7 @@ def test_package_restores_unique_user_kernel_names_after_exception(monkeypatch, 
     with monkeypatch.context() as scoped:
         for key in keys:
             if key not in config._config:
-                scoped.setitem(config._config, key,
-                               ab.copy.deepcopy(config._config["triton.unique_kernel_names"]))
+                scoped.setitem(config._config, key, _package_config_entry(key))
         original = (config.triton.unique_user_kernel_names, config.triton.autotune_at_compile_time)
         with config.patch(dict.fromkeys(keys, previous)):
             calls = []
@@ -279,12 +339,13 @@ def test_package_missing_config_keys_restore_after_monkeypatch_context(
     from torch._inductor import config
 
     keys = ("triton.unique_user_kernel_names", "triton.autotune_at_compile_time")
-    originals = {key: ab.copy.deepcopy(config._config[key]) for key in keys if key in config._config}
+    # Keep the entries themselves: monkeypatch restores these exact objects,
+    # including thread-local ContextVars that cannot be deep-copied.
+    originals = {key: config._config[key] for key in keys if key in config._config}
     original_values = {key: getattr(config.triton, key.split(".")[1]) for key in originals}
     with monkeypatch.context() as scoped:
         if autotune_exists and keys[1] not in config._config:
-            scoped.setitem(config._config, keys[1],
-                           ab.copy.deepcopy(config._config["triton.unique_kernel_names"]))
+            scoped.setitem(config._config, keys[1], _package_config_entry(keys[1]))
         scoped.delitem(config._config, keys[0], raising=False)
         if not autotune_exists:
             scoped.delitem(config._config, keys[1], raising=False)
@@ -331,7 +392,7 @@ def test_package_missing_config_keys_restore_after_monkeypatch_context(
     for key in keys:
         assert (key in config._config) is (key in originals)
         if key in originals:
-            assert type(config._config[key]) is type(originals[key])
+            assert config._config[key] is originals[key]
             assert getattr(config.triton, key.split(".")[1]) is original_values[key]
 
 
@@ -347,8 +408,7 @@ def test_package_without_autotune_key_keeps_unique_user_kernel_names(monkeypatch
     original_autotune = config.triton.autotune_at_compile_time if supported else None
     with monkeypatch.context() as scoped:
         if unique not in config._config:
-            scoped.setitem(config._config, unique,
-                           ab.copy.deepcopy(config._config["triton.unique_kernel_names"]))
+            scoped.setitem(config._config, unique, _package_config_entry(unique))
         scoped.delitem(config._config, autotune, raising=False)
         config_patch = Mock(wraps=config.patch)
         failure = RuntimeError("legacy package failure")

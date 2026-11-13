@@ -8,9 +8,12 @@ asserted here rather than maintained by hand.
 """
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import re
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,6 +21,7 @@ import neptune_opt as NO  # noqa: E402
 
 _DOC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "docs", "api.md")
+_README = Path(__file__).resolve().parents[1] / "README.md"
 
 
 def _prefixed() -> set:
@@ -83,3 +87,64 @@ def test_the_explicit_op_library_covers_every_supported_skeleton():
 def test_documented_entry_points_are_callable():
     for name in ("apply", "export", "preview", "op_parameters", "optimize", "backend"):
         assert callable(getattr(NO, name)), name
+
+
+def test_readme_names_resolve_to_real_package_attributes():
+    import neptune_codegen as CG
+
+    text = _README.read_text(encoding="utf-8")
+    modules = {"neptune_opt": NO, "neptune_codegen": CG}
+    for package, name in re.findall(r"\b(neptune_opt|neptune_codegen)\.([A-Za-z_]\w*)", text):
+        assert hasattr(modules[package], name), f"README promises missing {package}.{name}"
+
+
+def test_readme_operator_tables_match_both_registries():
+    import neptune_codegen as CG
+
+    text = _README.read_text(encoding="utf-8")
+    section = text.split("## What it fuses\n", 1)[1].split("\n## ", 1)[0]
+    scalar, structured = section.split("### Structured specifications\n", 1)
+    scalar_names = re.findall(r"^\|\s*`([A-Za-z_]\w*)`\s*\|", scalar, re.M)
+    assert len(scalar_names) == len(set(scalar_names)), "duplicate README scalar row"
+    assert set(scalar_names) == set(CG.supported())
+    rows = re.findall(r"^\|\s*`([A-Za-z_]\w*)`\s*\|\s*`([A-Za-z_]\w*)`\s*\|",
+                      structured, re.M)
+    assert len(rows) == len(dict(rows)), "duplicate README structured row"
+    assert dict(rows) == {name: spec.operation for name, spec in CG.STATE_REDUCTIONS.items()}
+
+
+def test_readme_python_examples_compile_and_use_current_signatures():
+    import neptune_codegen as CG
+
+    text = _README.read_text(encoding="utf-8")
+    examples = re.findall(r"^```python\n(.*?)^```$", text, re.M | re.S)
+    assert examples, "README has no Python examples"
+    modules = {"neptune_opt": NO, "neptune_codegen": CG}
+    for index, source in enumerate(examples):
+        tree = ast.parse(source, filename=f"README example {index}")
+        compile(tree, f"README example {index}", "exec")  # Syntax only; no GPU execution.
+        for node in ast.walk(tree):
+            if (not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute)
+                    or not isinstance(node.func.value, ast.Name)
+                    or node.func.value.id not in modules):
+                continue
+            function = getattr(modules[node.func.value.id], node.func.attr)
+            assert callable(function), f"README calls non-callable {node.func.attr}"
+            # Validate argument names / required parameters without evaluating tensors.
+            assert all(keyword.arg is not None for keyword in node.keywords)
+            inspect.signature(function).bind(
+                *[None for _ in node.args],
+                **{keyword.arg: None for keyword in node.keywords})
+
+
+def test_readme_repository_links_have_existing_targets():
+    text = _README.read_text(encoding="utf-8")
+    links = re.findall(r"\]\(\s*([^\s)]+)\s*\)", text)
+    local = [link.split("#", 1)[0] for link in links
+             if not link.startswith(("https://", "http://", "#", "mailto:"))]
+    assert local, "README has no repository links"
+    root = _README.parent
+    for link in local:
+        target = (root / link).resolve()
+        assert target.is_relative_to(root), f"README link leaves repository: {link}"
+        assert target.exists(), f"README has a broken repository link: {link}"

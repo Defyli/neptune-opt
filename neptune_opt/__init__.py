@@ -12,6 +12,7 @@ import inspect
 import math
 import sys
 import warnings
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import torch
@@ -19,7 +20,8 @@ import torch
 import neptune_codegen as CG
 from neptune_recognize import recognize_regions as _recognize_regions
 from neptune_recognize.rewrite import region_contract, rewrite_match
-from neptune_opt.ab import Choice, choose_faster as choose_faster, compile_best
+from neptune_opt.ab import (Choice, FatalCudaError, _raise_if_fatal_cuda,
+                            choose_faster as choose_faster, compile_best)
 
 __all__ = ["apply", "export", "optimize", "backend", "preview", "Report", "Fusion",
            "LAST_REPORT", "op_parameters", "compile_best", "Choice"]
@@ -34,11 +36,17 @@ class Fusion:
     plan: str = "serial"
     proof_kind: str = ""
     domain_assumptions: tuple = ()
+    input_names: tuple = ()
+    kind: str = "scalar"
+    operation: str = ""
+    numeric_contract: tuple = ()
 
     def __str__(self) -> str:
         if not self.params:
             return self.skeleton
-        return f"{self.skeleton}({', '.join(f'{k}={v:g}' for k, v in sorted(self.params.items()))})"
+        params = ', '.join(f'{key}={value!r}' if value is None or isinstance(value, bool)
+                           else f'{key}={value:g}' for key, value in sorted(self.params.items()))
+        return f"{self.skeleton}({params})"
 
 
 @dataclasses.dataclass
@@ -58,6 +66,8 @@ class Report:
         if self.fusions:
             lines.append("  verified: fused output matches the supplied inputs" if self.verified
                          else "  unverified: real-algebra match; numerical verification not executed")
+        if self.verified and any(fusion.kind == "structured" for fusion in self.fusions):
+            lines.append("  scope   : supplied-case values and read-only inputs/state; output aliasing not proved")
         return "\n".join(lines) or "  (nothing to do)"
 
 
@@ -100,13 +110,18 @@ def _compare_trees(a, b, *, rtol=1e-3, atol=1e-4, max_ulps=None):
             try:
                 torch.testing.assert_close(x, y, rtol=rtol, atol=atol, equal_nan=True)
             except AssertionError as error:
+                _raise_if_fatal_cuda(error)
                 if max_ulps is None or x.dtype not in (torch.float16, torch.bfloat16):
                     return False, f"output {index}: {error}"
                 finite = torch.isfinite(x) & torch.isfinite(y)
-                up = torch.nextafter(x, torch.full_like(x, float("inf")))
-                down = torch.nextafter(x, torch.full_like(x, -float("inf")))
-                bound = torch.maximum((up.float() - x.float()).abs(), (x.float() - down.float()).abs())
-                if not ((x.float() - y.float()).abs()[finite] <= max_ulps * bound[finite]).all():
+                # Count representable finite values, not spacing to an infinite
+                # neighbour at finfo.max. ±0 share a key; this is not a bitwise test.
+                def ordered_bits(value):
+                    bits = value.contiguous().view(torch.int16).to(torch.int32) & 0xffff
+                    magnitude = bits & 0x7fff
+                    return torch.where((bits & 0x8000) != 0, 0x8000 - magnitude, 0x8000 + magnitude)
+                distance = (ordered_bits(x) - ordered_bits(y)).abs()
+                if not (distance[finite] <= max_ulps).all():
                     return False, f"output {index}: exceeds explicit {max_ulps}-ULP bound"
         elif not torch.equal(x, y):
             return False, f"output {index} integer/bool values differ"
@@ -141,8 +156,13 @@ def _restore_state(snapshot):
 def _verify(module: torch.nn.Module, candidate: torch.nn.Module, args: tuple,
             *, rtol=1e-3, atol=1e-4, max_ulps=None) -> tuple[bool, str]:
     """Differential execution with read-only state; invoke serially on exclusive modules."""
-    state = _snapshot_state([value for mod in (module, candidate)
-                             for value in (*mod.parameters(), *mod.buffers())])
+    try:
+        state = _snapshot_state([value for mod in (module, candidate)
+                                 for value in (*mod.parameters(), *mod.buffers())])
+    except Exception as error:  # noqa: BLE001
+        _raise_if_fatal_cuda(error)
+        raise
+    context_usable = True
     try:
         with torch.no_grad():
             left, right = _clone_inputs(args), _clone_inputs(args)
@@ -158,10 +178,20 @@ def _verify(module: torch.nn.Module, candidate: torch.nn.Module, args: tuple,
                 if not ok:
                     return False, f"inputs mutated: {detail}"
             return _compare_trees(a, b, rtol=rtol, atol=atol, max_ulps=max_ulps)
-    except Exception as error:  # noqa: BLE001 -- numerical execution is a refusal
+    except Exception as error:  # noqa: BLE001 -- ordinary numerical execution is a refusal
+        try:
+            _raise_if_fatal_cuda(error)
+        except FatalCudaError:
+            context_usable = False
+            raise
         return False, f"{type(error).__name__}: {error}"
     finally:
-        _restore_state(state)
+        if context_usable:
+            try:
+                _restore_state(state)
+            except Exception as error:  # noqa: BLE001
+                _raise_if_fatal_cuda(error)
+                raise
 
 
 def _trace(module, args):
@@ -185,12 +215,67 @@ def _graph_trial(gm):
     return trial
 
 
+def _normalize_capabilities(capabilities: Iterable[str]) -> tuple:
+    """Consume at most three entries; accept only distinct, explicit capability names."""
+    if isinstance(capabilities, (str, bytes)):
+        raise ValueError("capabilities must be an iterable of distinct capability names")
+    try:
+        iterator = iter(capabilities)
+    except TypeError as error:
+        raise ValueError("capabilities must be an iterable of capability names") from error
+    names = []
+    for _ in range(3):
+        try:
+            name = next(iterator)
+        except StopIteration:
+            return tuple(names)
+        if type(name) is not str or name not in ("rms_norm", "segment_pool") or name in names:
+            raise ValueError("capabilities must contain only distinct rms_norm/segment_pool names")
+        names.append(name)
+    raise ValueError("at most two capabilities are supported")
+
+
+def _discover_regions(gm, values, capabilities):
+    if not capabilities:
+        return _recognize_regions(gm, values)
+    from neptune_recognize import recognize_structured_regions
+
+    structured, structured_reason = recognize_structured_regions(gm, capabilities=capabilities)
+    scalar, scalar_reason = _recognize_regions(gm, values)
+    order = {node: index for index, node in enumerate(gm.graph.nodes)}
+    # Prefer complete structured regions over scalar fragments, then the largest
+    # candidate for a shared root. Keep independent roots in stable graph order.
+    matches = sorted([*structured, *scalar], key=lambda match: (
+        getattr(match, "kind", "scalar") != "structured",
+        -len(match.region_nodes), order[match.region_root]))
+    selected = {}
+    for match in matches:
+        if region_contract(match)[1] is None:
+            selected.setdefault(match.region_root, match)
+    eligible = sorted(selected.values(), key=lambda match: (
+        getattr(match, "kind", "scalar") != "structured", order[match.region_root]))
+    refused = [match for match in matches if region_contract(match)[1] is not None]
+    return [*eligible, *refused], structured_reason or scalar_reason
+
+
+def _fusion_from_match(match, plan):
+    inputs = getattr(match, "input_nodes", ()) or (match.input_node,)
+    metadata = getattr(match, "metadata", {})
+    numeric_contract = metadata.get("numeric_contract", ())
+    if not numeric_contract and metadata.get("numerical_stages"):
+        numeric_contract = (metadata["numerical_stages"],)
+    return Fusion(match.skeleton, dict(match.params), match.input_node.name,
+                  match.region_root.name, plan, match.proof_kind, match.domain_assumptions,
+                  tuple(node.name for node in inputs), getattr(match, "kind", "scalar"),
+                  getattr(match, "operation", ""), tuple(numeric_contract))
+
+
 def _rewrite_regions(gm, values, *, plan="serial", max_regions=None, lower=False,
-                     experimental_log_softmax=False):
+                     experimental_log_softmax=False, capabilities=()):
     report = Report()
     limit = len(list(gm.graph.nodes)) if max_regions is None else max_regions
     for _ in range(limit):
-        matches, reason = _recognize_regions(gm, values)
+        matches, reason = _discover_regions(gm, values, capabilities)
         eligible = []
         for match in matches:
             _, refusal = region_contract(match)
@@ -214,8 +299,7 @@ def _rewrite_regions(gm, values, *, plan="serial", max_regions=None, lower=False
                                and region_contract(match)[1] is None), None)
                 if chosen is None:
                     continue
-                fusion = Fusion(chosen.skeleton, dict(chosen.params), chosen.input_node.name,
-                                chosen.region_root.name, plan, chosen.proof_kind, chosen.domain_assumptions)
+                fusion = _fusion_from_match(chosen, plan)
                 call, refusal = rewrite_match(tentative, chosen, plan=plan)
                 if call is None:
                     raise RuntimeError(refusal)
@@ -249,8 +333,7 @@ def _rewrite_regions(gm, values, *, plan="serial", max_regions=None, lower=False
                 report.skipped.append(("no-fusion", reason))
             break
         match = eligible[0]
-        fusion = Fusion(match.skeleton, dict(match.params), match.input_node.name,
-                        match.region_root.name, plan, match.proof_kind, match.domain_assumptions)
+        fusion = _fusion_from_match(match, plan)
         call, refusal = rewrite_match(gm, match, plan=plan)
         if call is None:
             raise RuntimeError(refusal)
@@ -267,6 +350,7 @@ def _rewrite_graph(gm, values=None, *, plan="serial", max_regions=None):
         report = _rewrite_regions(trial, values, plan=plan, max_regions=max_regions)
         return (trial if report.fusions else gm), report
     except Exception as error:  # noqa: BLE001
+        _raise_if_fatal_cuda(error)
         return gm, Report(skipped=[("rewrite-failed", f"{type(error).__name__}: {error}")])
 
 
@@ -341,7 +425,8 @@ def _candidate_program(exported, trial):
 def apply(exported_program, values: dict | None = None, verify_with: tuple | None = None,
           lower: bool = True, *, plan="serial", max_regions=None,
           verification_inputs=None, rtol=1e-3, atol=1e-4,
-          experimental_log_softmax=False, max_ulps=None) -> Report:
+          experimental_log_softmax=False, max_ulps=None,
+          capabilities: Iterable[str] = ()) -> Report:
     """Transactionally fuse local regions in an existing ExportedProgram.
 
     Unknown operations, casts and other inputs are preserved boundaries. Optional
@@ -361,18 +446,25 @@ def apply(exported_program, values: dict | None = None, verify_with: tuple | Non
     report = Report()
     try:
         validate_plan(plan)
+        capabilities = _normalize_capabilities(capabilities)
         if max_regions is not None and (type(max_regions) is not int or max_regions <= 0):
             raise ValueError("max_regions must be a positive integer or None")
         if any(not math.isfinite(tolerance) or tolerance < 0 for tolerance in (rtol, atol)):
             raise ValueError("verification tolerances must be finite and nonnegative")
         if max_ulps is not None and (type(max_ulps) is not int or max_ulps < 0):
             raise ValueError("max_ulps must be a nonnegative integer or None")
+        if verification_inputs is not None:
+            if not isinstance(verification_inputs, Sequence):
+                raise ValueError("verification_inputs must be a sequence of argument tuples")
+            if any(not isinstance(case, tuple) for case in verification_inputs):
+                raise ValueError("each verification_inputs sample must be an argument tuple")
         signature = exported_program.graph_signature
         if signature.buffers_to_mutate or signature.user_inputs_to_mutate:
             raise ValueError("state/input mutation is outside inference reduction fusion")
         trial = _graph_trial(exported_program.graph_module)
         report = _rewrite_regions(trial, values, plan=plan, max_regions=max_regions, lower=lower,
-                                  experimental_log_softmax=experimental_log_softmax)
+                                  experimental_log_softmax=experimental_log_softmax,
+                                  capabilities=capabilities)
         if not report.fusions:
             LAST_REPORT = report
             return report
@@ -386,7 +478,9 @@ def apply(exported_program, values: dict | None = None, verify_with: tuple | Non
             for index, case in enumerate(cases):
                 # A user reference can capture original state in a Python closure rather
                 # than register it as a submodule. Protect the EP's tensors too.
-                state = _snapshot_state(exported_program.state_dict.values())
+                state = _snapshot_state([*exported_program.state_dict.values(),
+                                         *exported_program.constants.values()])
+                context_usable = True
                 try:
                     if rtol == 1e-3 and atol == 1e-4 and max_ulps is None:
                         ok, detail = _verify(module, executable, case)
@@ -395,8 +489,16 @@ def apply(exported_program, values: dict | None = None, verify_with: tuple | Non
                                              max_ulps=max_ulps)
                     if _state_mutated(state):
                         ok, detail = False, "verification mutated original exported state"
+                except Exception as error:  # noqa: BLE001
+                    try:
+                        _raise_if_fatal_cuda(error)
+                    except FatalCudaError:
+                        context_usable = False
+                        raise
+                    raise
                 finally:
-                    _restore_state(state)
+                    if context_usable:
+                        _restore_state(state)
                 if not ok:
                     report = Report(skipped=[("verify-failed", f"case {index}: {detail}")],
                                     verification_cases=index + 1)
@@ -410,6 +512,7 @@ def apply(exported_program, values: dict | None = None, verify_with: tuple | Non
         exported_program._module_call_graph = candidate.module_call_graph
         report.graph_changed = True
     except Exception as error:  # noqa: BLE001 -- optional optimization fails closed
+        _raise_if_fatal_cuda(error)
         reason = "triton-missing" if isinstance(error, ModuleNotFoundError) and "triton" in str(error) else "rewrite-failed"
         report = Report(skipped=[(reason, f"{type(error).__name__}: {error}")])
     LAST_REPORT = report
@@ -417,10 +520,11 @@ def apply(exported_program, values: dict | None = None, verify_with: tuple | Non
 
 
 def preview(exported_program, values: dict | None = None, *, lower=True,
-            experimental_log_softmax=False):
+            experimental_log_softmax=False, capabilities: Iterable[str] = ()):
     """Analyze apply's local regions/targeted lowering without generating kernels."""
     from neptune_recognize.lowering import _is_compound, lower_compound, _commit
 
+    capabilities = _normalize_capabilities(capabilities)
     trial = _graph_trial(exported_program.graph_module)
     if lower:
         for node in list(trial.graph.nodes):
@@ -433,19 +537,20 @@ def preview(exported_program, values: dict | None = None, *, lower=True,
             if any(match.region_root.meta.get("neptune_lowering") == node.name
                    and region_contract(match)[1] is None for match in candidates):
                 _commit(trial, tentative)
-    matches, reason = _recognize_regions(trial, values)
+    matches, reason = _discover_regions(trial, values, capabilities)
     eligible = [match for match in matches if region_contract(match)[1] is None]
     if matches and not eligible:
         reason = region_contract(matches[0])[1]
     return eligible, reason
 
 
-def export(module, example_inputs, decompose=True, **export_kwargs):
+def export(module, example_inputs, decompose=True, *, capabilities: Iterable[str] = (),
+           **export_kwargs):
     """Export then apply; core decomposition is explicit and is not an integration hook."""
     ep = torch.export.export(module, tuple(example_inputs), **export_kwargs)
     if decompose:
         ep = ep.run_decompositions()
-    apply(ep, verify_with=(module, tuple(example_inputs)))
+    apply(ep, verify_with=(module, tuple(example_inputs)), capabilities=capabilities)
     return ep
 
 

@@ -125,6 +125,10 @@ class Match:
     region_nodes: tuple = ()
     proof_kind: str = "legacy-symbolic-or-numeric-filter"
     domain_assumptions: tuple = ()
+    input_nodes: tuple = ()
+    kind: str = "scalar"
+    operation: str = ""
+    metadata: dict = dataclasses.field(default_factory=dict)
 
     def __repr__(self) -> str:
         extra = f" params={self.params}" + (f" (inferred: {', '.join(self.inferred)})"
@@ -346,6 +350,252 @@ def recognize_regions(gm, values=None):
         detail += "; compound operations require targeted lowering: " + ", ".join(compounds)
     return [], (f"no certified local region: analyzed {len(anchors)} row-data boundaries, "
                 f"{pair_count} dependent pair(s); {detail}")
+
+
+def _aten_arguments(node, target):
+    """Bind an exact overload's schema, including defaults (never infer by name)."""
+    if getattr(node, "op", None) != "call_function" or node.target != target:
+        return None
+    arguments = target._schema.arguments
+    if len(node.args) > len(arguments):
+        return None
+    bound = {argument.name: value for argument, value in zip(arguments, node.args)}
+    for name, value in node.kwargs.items():
+        if name in bound or name not in {argument.name for argument in arguments}:
+            return None
+        bound[name] = value
+    for argument in arguments:
+        if argument.name not in bound:
+            if not argument.has_default_value():
+                return None
+            bound[argument.name] = argument.default_value
+    return bound
+
+
+def _structured_cast(node, dtype):
+    """Only a dtype conversion; device/layout changes are not normalization stages."""
+    import torch
+    from neptune_recognize.interp import _same_shape
+
+    bound = _aten_arguments(node, torch.ops.aten._to_copy.default)
+    if bound is None:
+        bound = _aten_arguments(node, torch.ops.aten.to.dtype)
+        if bound is not None:
+            bound = {"device": None, "layout": None, "pin_memory": None, **bound}
+    if bound is None or bound["dtype"] != dtype:
+        return None
+    source, output = _tensor_value(bound["self"]), _tensor_value(node)
+    if source is None or output is None:
+        return None
+    if (source.device != output.device or source.layout != output.layout
+            or not _same_shape(source.shape, output.shape)
+            or bound["device"] not in (None, source.device)
+            or bound["layout"] not in (None, source.layout)
+            or bound["pin_memory"] not in (None, False)
+            or bound["memory_format"] not in (None, torch.preserve_format)):
+        return None
+    return bound["self"]
+
+
+def _rms_structured_candidate(root):
+    """Certify the ordered fp32 stages, not an identity ignoring tensor rounding."""
+    import math
+    import torch
+    from neptune_recognize.interp import _same_shape
+
+    aten = torch.ops.aten
+    final = _aten_arguments(root, aten.mul.Tensor)
+    if final is None:
+        return None
+    for normalized, gamma in ((final["self"], final["other"]),
+                              (final["other"], final["self"])):
+        output, weight = _tensor_value(root), _tensor_value(gamma)
+        if output is None or weight is None or output.dtype not in (
+                torch.float32, torch.float16, torch.bfloat16):
+            continue
+        dtype = output.dtype
+        product = normalized
+        cast_product = _structured_cast(normalized, dtype)
+        if cast_product is not None:
+            product = cast_product
+        elif dtype != torch.float32:
+            continue
+        multiply = _aten_arguments(product, aten.mul.Tensor)
+        if multiply is None:
+            continue
+        for z, inverse in ((multiply["self"], multiply["other"]),
+                           (multiply["other"], multiply["self"])):
+            inv = _aten_arguments(inverse, aten.rsqrt.default)
+            if inv is None:
+                continue
+            add = _aten_arguments(inv["self"], aten.add.Tensor)
+            if add is None or add["alpha"] != 1:
+                continue
+            # Tensor overloads accept Python scalar eps in exported ATen graphs.
+            mean, eps = add["self"], add["other"]
+            if type(eps) not in (float, int) or not math.isfinite(eps) or eps <= 0:
+                continue
+            reduction = _aten_arguments(mean, aten.mean.dim)
+            if reduction is None or reduction["keepdim"] is not True:
+                continue
+            zv = _tensor_value(z)
+            if zv is None or zv.dtype != torch.float32 or len(zv.shape) < 1:
+                continue
+            dims = reduction["dim"]
+            if not isinstance(dims, (tuple, list)) or len(dims) != 1:
+                continue
+            if dims[0] not in (-1, len(zv.shape) - 1):
+                continue
+            if reduction["dtype"] not in (None, torch.float32):
+                continue
+            square = reduction["self"]
+            power = _aten_arguments(square, aten.pow.Tensor_Scalar)
+            squared = _aten_arguments(square, aten.mul.Tensor)
+            unary_square = _aten_arguments(square, aten.square.default)
+            if not ((unary_square is not None and unary_square["self"] is z)
+                    or (power is not None and power["self"] is z
+                     and type(power["exponent"]) in (int, float) and power["exponent"] == 2)
+                    or (squared is not None and squared["self"] is z
+                        and squared["other"] is z)):
+                continue
+            cast_source = _structured_cast(z, torch.float32)
+            if dtype == torch.float32:
+                # Do not relabel a promoted low-precision source as a new fp32 RMS:
+                # that would accept gamma fused before the mandatory input rounding.
+                if cast_source is not None and _tensor_value(cast_source).dtype != torch.float32:
+                    continue
+                x = cast_source if cast_source is not None else z
+            else:
+                x = cast_source
+            xv = _tensor_value(x)
+            if xv is None or xv.dtype != dtype or not _same_shape(xv.shape, zv.shape):
+                continue
+            if (weight.dtype != dtype or weight.device != xv.device
+                    or len(weight.shape) != 1
+                    or not _same_shape(weight.shape, xv.shape[-1:])
+                    or not _same_shape(output.shape, xv.shape)):
+                continue
+            stages = (square, mean, inv["self"], inverse, product)
+            if any(_tensor_value(node) is None or _tensor_value(node).dtype != torch.float32
+                   or _tensor_value(node).device != xv.device for node in stages):
+                continue
+            if not _same_shape(_tensor_value(square).shape, xv.shape):
+                continue
+            if not all(_same_shape(_tensor_value(node).shape, xv.shape[:-1] + (1,))
+                       for node in (mean, inv["self"], inverse)):
+                continue
+            if not _same_shape(_tensor_value(product).shape, xv.shape):
+                continue
+            # Explicit boundaries prevent GEMM, clamps and gamma conversions being erased.
+            owned = {root, product, inverse, inv["self"], mean, square, z, normalized}
+            owned.difference_update((x, gamma))
+            return Match(x, "rms_norm", {"eps": float(eps)}, ("eps",),
+                         consumer_node=mean, region_root=root, region_nodes=tuple(owned),
+                         proof_kind="exact-structured-real-algebra-with-explicit-rounding",
+                         domain_assumptions=("finite real inputs and finite reachable fp32 arithmetic",
+                                             "finite positive eps and nonempty last dimension",
+                                             "fp32 square/mean/add/rsqrt/product; input-dtype rounding before gamma multiplication",
+                                             "gamma is a readonly same-device input-dtype vector"),
+                         input_nodes=(x, gamma), kind="structured", operation="rms_norm",
+                         metadata={"numerical_stages": "fp32_then_input_round_then_gamma"})
+    return None
+
+
+def _structured_boundary_value(gm, node):
+    value = _tensor_value(node)
+    if value is not None or getattr(node, "op", None) != "get_attr":
+        return value
+    try:
+        value = gm
+        for part in node.target.split("."):
+            value = getattr(value, part)
+    except AttributeError:
+        return None
+    import torch
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def _segment_structured_candidate(root):
+    import math
+    import torch
+
+    bound = _aten_arguments(root, torch.ops.aten.segment_reduce.default)
+    if bound is None or bound["reduce"] not in ("sum", "mean") or bound["axis"] != 0:
+        return None
+    if bound["indices"] is not None or ((bound["lengths"] is None) == (bound["offsets"] is None)):
+        return None
+    initial = bound["initial"]
+    if initial is not None and (type(initial) not in (float, int) or not math.isfinite(initial)):
+        return None
+    if type(bound["unsafe"]) is not bool:
+        return None
+    descriptor = bound["offsets"] if bound["offsets"] is not None else bound["lengths"]
+    return Match(bound["data"], "segment_" + bound["reduce"],
+                 {"initial": None if initial is None else float(initial),
+                  "offsets": bound["offsets"] is not None, "unsafe": bound["unsafe"]},
+                 region_root=root, region_nodes=(root,),
+                 proof_kind="exact-structured-real-algebra-with-explicit-rounding",
+                 domain_assumptions=("finite real data and finite reachable accumulation",
+                                     "readonly legal descriptors: nonnegative lengths with checked coverage unless unsafe, or monotone offsets within data bounds",
+                                     "initial is None or a finite scalar; mean empty segment with initial=None returns NaN",
+                                     "source unsafe is reused, not a proof of valid descriptors"),
+                 input_nodes=(bound["data"], descriptor), kind="structured", operation="segment_pool",
+                 metadata={"numerical_stages": "input_round"})
+
+
+def recognize_structured_regions(gm, capabilities=("rms_norm", "segment_pool")):
+    """Opt-in structured recognition; existing scalar discovery remains unchanged.
+
+    This first version recognizes exact ATen forms only. It neither decomposes the
+    whole graph nor uses numeric sampling to certify a candidate.
+    """
+    from neptune_recognize.rewrite import region_contract
+
+    if isinstance(capabilities, str):
+        capabilities = (capabilities,)
+    capabilities = frozenset(capabilities)
+    unknown = capabilities - {"rms_norm", "segment_pool"}
+    if unknown:
+        return [], "unsupported structured capabilities: " + ", ".join(sorted(unknown))
+    if any(getattr(getattr(node.target, "_schema", None), "is_mutable", False)
+           for node in gm.graph.nodes):
+        return [], "structured recognition requires a functionalized graph"
+    matches, reasons = [], []
+    order = {node: index for index, node in enumerate(gm.graph.nodes)}
+    for root in gm.graph.nodes:
+        candidate = None
+        if "rms_norm" in capabilities:
+            candidate = _rms_structured_candidate(root)
+        if candidate is None and "segment_pool" in capabilities:
+            candidate = _segment_structured_candidate(root)
+        if candidate is None:
+            continue
+        # Older make_fx omits metadata on lifted readonly get_attr tensors. Resolve
+        # their shape/dtype/device locally; never publish metadata into the source.
+        candidate.metadata["boundary_values"] = tuple(_structured_boundary_value(gm, node)
+                                                       for node in candidate.input_nodes)
+        _, refusal = region_contract(candidate)
+        if refusal is not None:
+            reasons.append(refusal)
+            continue
+        spec = CG.STATE_REDUCTIONS.get(candidate.skeleton)
+        from neptune_codegen.skeleton import state_reduction_spec
+        if spec is None or spec != state_reduction_spec(candidate.skeleton) or spec.operation != candidate.operation:
+            reasons.append("structured operation is not registered with the same access contract")
+            continue
+        try:
+            certificate = CG.derive_state_certificate(spec)
+        except (NotImplementedError, ValueError, TypeError) as error:
+            reasons.append(str(error))
+            continue
+        candidate.domain_assumptions += certificate.assumptions
+        candidate.metadata["numeric_contract"] = spec.numeric.stages
+        candidate.metadata["state_fields"] = certificate.state_fields
+        candidate.region_nodes = tuple(sorted(candidate.region_nodes, key=order.__getitem__))
+        matches.append(candidate)
+    if matches:
+        return matches, f"matched {len(matches)} structured region(s)"
+    return [], "no certified structured region" + (": " + reasons[-1] if reasons else "")
 
 
 def recognize(gm, values=None):

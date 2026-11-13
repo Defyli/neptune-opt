@@ -1170,6 +1170,200 @@ def _assert_transaction_unchanged(ep, before):
     _validate_exported(ep)
 
 
+@pytest.mark.parametrize("chain", ["raw", "cause", "context", "marker"])
+@pytest.mark.parametrize("failing_side", ["reference", "candidate"])
+def test_verify_fatal_cuda_skips_restore_and_propagates(chain, failing_side):
+    error = (NO.FatalCudaError("injected fatal marker") if chain == "marker"
+             else RuntimeError("CUDA error: device-side assert triggered"))
+    if chain in ("cause", "context"):
+        wrapper = RuntimeError("execution wrapper")
+        setattr(wrapper, "__cause__" if chain == "cause" else "__context__", error)
+        error = wrapper
+
+    def fail(x):
+        raise error
+
+    reference = M(fail if failing_side == "reference" else lambda x: x + 1)
+    candidate = M(fail if failing_side == "candidate" else lambda x: x + 1)
+    with patch.object(NO, "_restore_state", side_effect=AssertionError("poisoned restore")) as restore, \
+            patch.object(candidate, "forward", wraps=candidate.forward) as execute:
+        with pytest.raises(NO.FatalCudaError) as caught:
+            NO._verify(reference, candidate, (X,))
+    restore.assert_not_called()
+    assert execute.call_count == (failing_side == "candidate")
+    if chain == "marker":
+        assert caught.value is error
+    else:
+        assert "device-side assert triggered" in str(caught.value)
+        assert caught.value.__cause__ is error
+
+
+@pytest.mark.parametrize("chain", ["cause", "context"])
+@pytest.mark.parametrize("max_ulps", [None, 1])
+def test_compare_fatal_cuda_assertion_chain_is_not_a_numerical_refusal(chain, max_ulps):
+    original = RuntimeError("CUDA error: device-side assert triggered")
+    failure = AssertionError("numerical comparison wrapper")
+    setattr(failure, "__cause__" if chain == "cause" else "__context__", original)
+    with patch.object(torch.testing, "assert_close", side_effect=failure):
+        with pytest.raises(NO.FatalCudaError) as caught:
+            NO._compare_trees(X.to(torch.bfloat16), X.to(torch.bfloat16), max_ulps=max_ulps)
+    assert caught.value.__cause__ is failure
+    assert "device-side assert triggered" in str(caught.value)
+
+
+def test_verify_fatal_cuda_comparison_assertion_skips_state_restore():
+    original = RuntimeError("cudaErrorIllegalAddress")
+    failure = AssertionError("comparison wrapper")
+    failure.__cause__ = original
+    with patch.object(torch.testing, "assert_close", side_effect=failure), \
+            patch.object(NO, "_restore_state", side_effect=AssertionError("unsafe restore")) as restore:
+        with pytest.raises(NO.FatalCudaError, match="cudaErrorIllegalAddress"):
+            NO._verify(M(lambda x: x + 1), M(lambda x: x + 1), (X,))
+    restore.assert_not_called()
+
+
+def test_verify_fatal_cuda_snapshot_is_normalized_without_restore():
+    with patch.object(NO, "_snapshot_state", side_effect=RuntimeError("cudaErrorIllegalAddress")), \
+            patch.object(NO, "_restore_state") as restore:
+        with pytest.raises(NO.FatalCudaError, match="cudaErrorIllegalAddress"):
+            NO._verify(M(lambda x: x), M(lambda x: x), (X,))
+    restore.assert_not_called()
+
+
+@pytest.mark.parametrize("execution_fails", [False, True])
+def test_verify_fatal_cuda_restore_error_is_normalized(execution_fails):
+    def reference(x):
+        if execution_fails:
+            raise RuntimeError("ordinary execution failure")
+        return x + 1
+
+    with patch.object(NO, "_restore_state", side_effect=RuntimeError("cudaErrorLaunchFailure")) as restore:
+        with pytest.raises(NO.FatalCudaError, match="cudaErrorLaunchFailure"):
+            NO._verify(M(reference), M(lambda x: x + 1), (X,))
+    restore.assert_called_once()
+
+
+def test_verify_fatal_cuda_normal_runtime_error_still_refuses_and_restores():
+    mod = _TransactionModel().eval()
+    saved = mod.weight.detach().clone()
+
+    def fail(x):
+        mod.weight.add_(1)
+        raise RuntimeError("ordinary execution failure")
+
+    with patch.object(mod, "forward", side_effect=fail), \
+            patch.object(NO, "_restore_state", wraps=NO._restore_state) as restore:
+        assert NO._verify(mod, M(lambda x: x), (X,)) == (
+            False, "RuntimeError: ordinary execution failure")
+    restore.assert_called_once()
+    torch.testing.assert_close(mod.weight, saved, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("chain", ["raw", "cause", "marker"])
+@pytest.mark.parametrize("rtol", [1e-3, 1e-2])
+def test_apply_fatal_cuda_verify_never_restores_checks_state_or_publishes(
+        cpu_lse_handle, monkeypatch, chain, rtol):
+    mod = _TransactionModel().eval()
+    ep = torch.export.export(mod, (X,))
+    original = (ep.graph_module, ep.graph_signature, ep.module_call_graph, ep.state_dict, ep.constants)
+    state = {key: value for key, value in ep.state_dict.items()}
+    previous_report = NO.Report(skipped=[("previous", "unchanged")])
+    monkeypatch.setattr(NO, "LAST_REPORT", previous_report)
+    error = (NO.FatalCudaError("injected fatal marker") if chain == "marker"
+             else RuntimeError("CUDA error: illegal memory access"))
+    if chain == "cause":
+        wrapper = RuntimeError("verification wrapper")
+        wrapper.__cause__ = error
+        error = wrapper
+    with patch.object(NO, "_verify", side_effect=error) as verify, \
+            patch.object(NO, "_state_mutated", side_effect=AssertionError("poisoned state check")) as mutated, \
+            patch.object(NO, "_restore_state", side_effect=AssertionError("poisoned restore")) as restore:
+        with pytest.raises(NO.FatalCudaError):
+            NO.apply(ep, verify_with=(mod, (X,)), verification_inputs=[(X,)], rtol=rtol)
+    assert cpu_lse_handle
+    verify.assert_called_once()
+    mutated.assert_not_called()
+    restore.assert_not_called()
+    assert NO.LAST_REPORT is previous_report
+    assert all(current is before for current, before in zip(
+        (ep.graph_module, ep.graph_signature, ep.module_call_graph, ep.state_dict, ep.constants), original))
+    assert all(ep.state_dict[key] is value for key, value in state.items())
+
+
+@pytest.mark.parametrize("stage", ["snapshot", "state_check", "restore"])
+def test_apply_fatal_cuda_state_errors_never_publish(cpu_lse_handle, monkeypatch, stage):
+    mod = _TransactionModel().eval()
+    ep = torch.export.export(mod, (X,))
+    original = (ep.graph_module, ep.graph_signature, ep.module_call_graph)
+    previous_report = NO.Report()
+    monkeypatch.setattr(NO, "LAST_REPORT", previous_report)
+    target = {"snapshot": "_snapshot_state", "state_check": "_state_mutated",
+              "restore": "_restore_state"}[stage]
+    with patch.object(NO, "_verify", return_value=(True, "")), \
+            patch.object(NO, target, side_effect=RuntimeError("cudaErrorAssert")), \
+            patch.object(NO, "_restore_state", wraps=NO._restore_state) as restore:
+        with pytest.raises(NO.FatalCudaError, match="cudaErrorAssert"):
+            NO.apply(ep, verify_with=(mod, (X,)))
+    assert restore.call_count == (stage == "restore")
+    assert NO.LAST_REPORT is previous_report
+    assert all(current is before for current, before in zip(
+        (ep.graph_module, ep.graph_signature, ep.module_call_graph), original))
+
+
+@pytest.mark.parametrize("route", ["apply", "rewrite_graph", "backend"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_rewrite_fatal_cuda_never_reports_or_falls_back(monkeypatch, route, wrapped):
+    mod = _TransactionModel().eval()
+    ep = torch.export.export(mod, (X,))
+    original = (ep.graph_module, ep.graph_signature, ep.module_call_graph, ep.state_dict)
+    previous_report = NO.Report()
+    monkeypatch.setattr(NO, "LAST_REPORT", previous_report)
+    error = RuntimeError("CUDA error: device-side assert triggered")
+    if wrapped:
+        wrapper = RuntimeError("generation wrapper")
+        wrapper.__cause__ = error
+        error = wrapper
+
+    def fail(trial, *args, **kwargs):
+        trial.graph.output(())  # A partially changed trial must never be published.
+        raise error
+
+    with patch.object(NO, "_rewrite_regions", side_effect=fail), \
+            patch.object(torch._inductor, "compile") as compile_candidate:
+        with pytest.raises(NO.FatalCudaError, match="device-side assert triggered"):
+            if route == "apply":
+                NO.apply(ep)
+            elif route == "rewrite_graph":
+                NO._rewrite_graph(ep.graph_module)
+            else:
+                NO.backend(ep.graph_module, [X], experimental=True)
+    compile_candidate.assert_not_called()
+    assert NO.LAST_REPORT is previous_report
+    assert all(current is before for current, before in zip(
+        (ep.graph_module, ep.graph_signature, ep.module_call_graph, ep.state_dict), original))
+    assert len([node for node in ep.graph.nodes if node.op == "output"]) == 1
+
+
+def test_apply_fatal_cuda_normal_verify_exception_still_restores_and_reports(cpu_lse_handle):
+    mod = _TransactionModel().eval()
+    ep = torch.export.export(mod, (X,))
+    before = _transaction_snapshot(ep)
+
+    def fail(*args, **kwargs):
+        with torch.no_grad():
+            mod.weight.add_(1)
+        raise RuntimeError("ordinary mocked verification failure")
+
+    with patch.object(NO, "_verify", side_effect=fail), \
+            patch.object(NO, "_restore_state", wraps=NO._restore_state) as restore:
+        report = NO.apply(ep, verify_with=(mod, (X,)))
+    restore.assert_called_once()
+    assert not report.fusions and not report.verified and not report.graph_changed
+    assert report.skipped == [("rewrite-failed", "RuntimeError: ordinary mocked verification failure")]
+    assert NO.LAST_REPORT is report
+    _assert_transaction_unchanged(ep, before)
+
+
 def test_apply_transaction_generation_exception_rolls_back_after_first_region(cpu_lse_handle):
     import neptune_codegen as CG
 
@@ -1648,3 +1842,535 @@ def test_verify_direct_read_only_reference_does_not_mutate_original_parameters()
         pointer, pristine = before[key]
         assert value.data_ptr() == pointer
         torch.testing.assert_close(value, pristine, rtol=0, atol=0)
+
+
+# Keep dispatcher registrations alive; each fixture owns a fresh namespace and
+# parameter-specialized two-input overloads (no future-annotation schema inference).
+_structured_cpu_libraries = []
+
+
+def _full_rms(x, gamma, eps=1e-6):
+    source = x.float()
+    normalized = source * torch.rsqrt((source * source).mean(-1, keepdim=True) + eps)
+    return normalized.to(x.dtype) * gamma
+
+
+@pytest.fixture
+def cpu_structured_handle(monkeypatch):
+    import uuid
+    import neptune_codegen as CG
+
+    namespace = "neptune_structured_" + uuid.uuid4().hex
+    library = torch.library.Library(namespace, "DEF")
+    _structured_cpu_libraries.append(library)
+    requests, cache = [], {}
+
+    def handle(name, *, params, plan="serial", **kwargs):
+        requests.append((name, dict(params), plan))
+        if plan == "split" and name.startswith("segment_"):
+            raise NotImplementedError("segment split is unsupported")
+        key = name, tuple(sorted(params.items())), plan
+        if key not in cache:
+            op_name = "op_" + str(len(cache))
+            library.define(f"{op_name}(Tensor data, Tensor auxiliary) -> Tensor")
+            encoded = dict(params)
+
+            def reference(data, auxiliary):
+                if name == "rms_norm":
+                    return _full_rms(data, auxiliary, encoded["eps"])
+                contour = {"offsets" if encoded["offsets"] else "lengths": auxiliary}
+                return torch.segment_reduce(data, name.removeprefix("segment_"), axis=0,
+                                            initial=encoded["initial"], unsafe=encoded["unsafe"],
+                                            **contour)
+
+            def fake(data, auxiliary):
+                shape = data.shape if name == "rms_norm" else (
+                    auxiliary.shape[0] - int(encoded["offsets"]), *data.shape[1:])
+                return data.new_empty(shape)
+
+            library.impl(op_name, reference, "CPU")
+            torch.library.register_fake(f"{namespace}::{op_name}", fake)
+            cache[key] = getattr(getattr(torch.ops, namespace), op_name).default
+        return cache[key]
+
+    monkeypatch.setattr(CG, "state_op_handle", handle, raising=False)
+    return requests
+
+
+class _StructuredChild(torch.nn.Module):
+    def __init__(self, dtype=torch.float32):
+        super().__init__()
+        self.gamma = torch.nn.Parameter(torch.linspace(0.5, 1.5, 32).to(dtype))
+        self.register_buffer("offset", torch.tensor(0.25, dtype=dtype))
+
+    def forward(self, x):
+        return _full_rms(x + self.offset, self.gamma)
+
+
+class _StructuredParent(torch.nn.Module):
+    def __init__(self, dtype=torch.float32, mixed=False):
+        super().__init__()
+        self.child = _StructuredChild(dtype)
+        self.mixed = mixed
+
+    def forward(self, x, segments):
+        first = self.child(x)
+        second = _full_rms(x.sin(), self.child.gamma, 1e-5)
+        pooled = torch.segment_reduce(first, "sum", lengths=segments, axis=0)
+        if self.mixed:
+            return first, second, pooled, torch.logsumexp(x.float().cos(), -1)
+        return {"rms": (first, second), "pool": pooled, "aux": (x > 0, True)}
+
+
+@pytest.mark.parametrize("capabilities", [None, "rms_norm", b"rms_norm", ("unknown",),
+    ("rms_norm", "rms_norm"), ("segment_pool", "segment_pool"), ([],), (True,)])
+def test_structured_invalid_capabilities_fail_closed_and_preview_raises(capabilities):
+    mod = M(_full_rms).eval()
+    args = X, torch.ones(32)
+    ep = torch.export.export(mod, args)
+    before = _transaction_snapshot(ep)
+    with pytest.raises(ValueError, match="capabilities"):
+        NO.preview(ep, capabilities=capabilities)
+    report = NO.apply(ep, capabilities=capabilities)
+    assert not report.fusions and "ValueError" in report.summary()
+    _assert_transaction_unchanged(ep, before)
+
+
+def test_structured_capabilities_consumption_is_bounded():
+    consumed = []
+
+    def infinite():
+        while True:
+            consumed.append(1)
+            yield "rms_norm"
+
+    with pytest.raises(ValueError):
+        NO._normalize_capabilities(infinite())
+    assert len(consumed) <= 3
+    assert NO._normalize_capabilities(iter(("segment_pool", "rms_norm"))) == (
+        "segment_pool", "rms_norm")
+
+
+def test_structured_default_no_optin_no_changes_or_verification(cpu_structured_handle):
+    mod = M(_full_rms).eval()
+    args = X, torch.ones(32)
+    ep = torch.export.export(mod, args)
+    before = _transaction_snapshot(ep)
+    with patch.object(NO, "_verify", side_effect=AssertionError("must not verify")) as verify:
+        assert not NO.preview(ep)[0]
+        report = NO.apply(ep, verify_with=(mod, args))
+    verify.assert_not_called()
+    assert not report.fusions and not cpu_structured_handle
+    _assert_transaction_unchanged(ep, before)
+
+
+def test_structured_preview_is_metadata_only(cpu_structured_handle, monkeypatch):
+    import builtins
+
+    original = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        assert not name.startswith("triton"), "preview must not import GPU code"
+        return original(name, *args, **kwargs)
+
+    mod = M(_full_rms).eval()
+    ep = torch.export.export(mod, (X, torch.ones(32)))
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    matches, why = NO.preview(ep, capabilities=("rms_norm",))
+    assert len(matches) == 1, why
+    assert matches[0].kind == "structured" and len(matches[0].input_nodes) == 2
+    assert not cpu_structured_handle
+
+
+@pytest.mark.parametrize("limit,expected", [(None, 4), (1, 1), (2, 2), (3, 3)])
+def test_structured_rms_segment_and_scalar_share_budget(cpu_structured_handle, cpu_lse_handle,
+                                                      limit, expected):
+    mod = _StructuredParent(mixed=True).eval()
+    args = X, torch.tensor([3, 0, 5])
+    ep = torch.export.export(mod, args)
+    report = NO.apply(ep, capabilities=("rms_norm", "segment_pool"), max_regions=limit,
+                      verify_with=(mod, args))
+    assert report.verified and len(report.fusions) == expected, report.summary()
+    assert len(cpu_structured_handle) + len(cpu_lse_handle) == expected
+    assert all(len(fusion.input_names) == 2 and fusion.numeric_contract
+               for fusion in report.fusions if fusion.kind == "structured")
+    assert report.fusions[0].operation == "rms_norm"
+    if limit is None:
+        assert {fusion.skeleton for fusion in report.fusions} == {"rms_norm", "segment_sum", "logsumexp"}
+    _validate_exported(ep)
+    torch.testing.assert_close(ep.module()(*args), mod(*args))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_structured_preserved_child_tuple_outputs_shared_gamma_and_storage(cpu_structured_handle, dtype):
+    mod = _StructuredParent(dtype).eval()
+    args = X.to(dtype), torch.tensor([3, 0, 5])
+    pristine = NO._clone_inputs(args)
+    ep = torch.export.export(mod, args, preserve_module_call_signature=("child",))
+    before = _transaction_snapshot(ep)
+    child_before = next(entry for entry in before["calls_value"] if entry.fqn == "child")
+    report = NO.apply(ep, capabilities=("rms_norm", "segment_pool"), verify_with=(mod, args))
+    assert report.verified and len(report.fusions) == 3, report.summary()
+    assert ep.graph_signature.input_specs == before["signature_value"].input_specs
+    child = next(entry for entry in ep.module_call_graph if entry.fqn == "child")
+    assert child.signature.in_spec == child_before.signature.in_spec
+    assert child.signature.out_spec == child_before.signature.out_spec
+    assert child.signature.outputs[0].name != child_before.signature.outputs[0].name
+    for key, (tensor, pointer, value) in before["tensors"].items():
+        assert ep.state_dict[key] is tensor and tensor.data_ptr() == pointer
+        torch.testing.assert_close(tensor, value, rtol=0, atol=0)
+    assert NO._compare_trees(args, pristine, rtol=0, atol=0)[0]
+    actual = ep.module()(*args)
+    assert actual["rms"][0].dtype == dtype and actual["pool"].dtype == dtype
+    torch.testing.assert_close(actual, mod(*args), rtol=0, atol=0)
+    assert "output aliasing not proved" in report.summary()
+    _validate_exported(ep)
+
+
+@pytest.mark.parametrize("failure", ["second-generation", "verification", "output-arity"])
+def test_structured_transaction_rolls_back_all_regions(cpu_structured_handle, failure):
+    import neptune_codegen as CG
+
+    mod = _StructuredParent().eval()
+    args = X, torch.tensor([3, 0, 5])
+    ep = torch.export.export(mod, args)
+    before = _transaction_snapshot(ep)
+    handle, rewrite = CG.state_op_handle, NO.rewrite_match
+
+    def generation(*args, **kwargs):
+        if cpu_structured_handle:
+            raise RuntimeError("injected structured second generation")
+        return handle(*args, **kwargs)
+
+    def arity(gm, match, **kwargs):
+        result = rewrite(gm, match, **kwargs)
+        output = next(node for node in gm.graph.nodes if node.op == "output")
+        output.args = (output.args[0][:-1],)
+        gm.recompile()
+        return result
+
+    target, replacement = {
+        "second-generation": (CG, generation),
+        "verification": (NO, lambda *args, **kwargs: (False, "injected structured verification")),
+        "output-arity": (NO, arity),
+    }[failure]
+    attribute = {"second-generation": "state_op_handle", "verification": "_verify",
+                 "output-arity": "rewrite_match"}[failure]
+    with patch.object(target, attribute, side_effect=replacement):
+        report = NO.apply(ep, capabilities=("rms_norm", "segment_pool"), verify_with=(mod, args))
+    assert cpu_structured_handle and not report.fusions and not report.graph_changed
+    assert ("verify-failed" if failure == "verification" else "rewrite-failed") == report.skipped[0][0]
+    _assert_transaction_unchanged(ep, before)
+
+
+@pytest.mark.parametrize("reduction,offsets,initial", [("sum", False, None), ("mean", False, 0.5),
+                                                      ("sum", True, -0.25)])
+def test_structured_segment_parameters_and_report_repr(cpu_structured_handle, reduction, offsets, initial):
+    def fn(data, segments):
+        contour = {"offsets" if offsets else "lengths": segments}
+        return torch.segment_reduce(data, reduction, axis=0, initial=initial, unsafe=False, **contour)
+
+    mod = M(fn).eval()
+    args = X, torch.tensor([0, 3, 3, 8] if offsets else [3, 0, 5])
+    ep = torch.export.export(mod, args)
+    report = NO.apply(ep, capabilities=("segment_pool",), verify_with=(mod, args))
+    assert report.verified and len(report.fusions) == 1, report.summary()
+    fusion = report.fusions[0]
+    assert fusion.params == {"offsets": offsets, "initial": initial, "unsafe": False}
+    assert len(fusion.input_names) == 2 and "unsafe=False" in str(fusion)
+    assert "initial=None" in str(fusion) if initial is None else f"initial={initial:g}" in str(fusion)
+    torch.testing.assert_close(ep.module()(*args), mod(*args), equal_nan=True)
+
+
+def test_structured_export_consumes_capabilities_not_export_kwargs(cpu_structured_handle):
+    mod = M(_full_rms).eval()
+    args = X, torch.ones(32)
+    with patch.object(torch.export, "export", wraps=torch.export.export) as exporting:
+        ep = NO.export(mod, args, decompose=False, capabilities=("rms_norm",), strict=True)
+    assert "capabilities" not in exporting.call_args.kwargs
+    assert exporting.call_args.kwargs["strict"] is True
+    assert NO.LAST_REPORT.verified and len(cpu_structured_handle) == 1
+    torch.testing.assert_close(ep.module()(*args), mod(*args))
+    assert "rms_norm" not in NO.__all__ and "segment_pool" not in NO.__all__
+
+
+@pytest.mark.parametrize("invalid", ["gamma-dtype", "gamma-rank", "input-cast"])
+def test_structured_invalid_boundaries_never_generate(cpu_structured_handle, invalid):
+    args = X, torch.ones(32)
+    mod = M(_full_rms).eval()
+    ep = torch.export.export(mod, args)
+    matches, why = NO.preview(ep, capabilities=("rms_norm",))
+    assert matches, why
+    match = matches[0]
+    matched_boundary = match.input_nodes[1] if invalid.startswith("gamma") else match.region_root
+    boundary = next(node for node in ep.graph.nodes if node.name == matched_boundary.name)
+    value = boundary.meta["val"]
+    boundary.meta["val"] = value.double() if invalid != "gamma-rank" else value.unsqueeze(0)
+    before = _transaction_snapshot(ep)
+    report = NO.apply(ep, lower=False, capabilities=("rms_norm",))
+    assert not report.fusions and not cpu_structured_handle
+    _assert_transaction_unchanged(ep, before)
+
+
+def test_structured_verification_protects_gamma_and_exported_constants(cpu_structured_handle):
+    class ConstantRMS(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gamma = torch.ones(32)
+
+        def forward(self, x):
+            return _full_rms(x, self.gamma)
+
+    mod = ConstantRMS().eval()
+    ep = torch.export.export(mod, (X,))
+    assert ep.constants
+    before = _transaction_snapshot(ep)
+    constants = [(tensor, tensor.data_ptr(), tensor.clone()) for tensor in ep.constants.values()]
+
+    def mutating(x):
+        mod.gamma.add_(1)
+        return mod(x)
+
+    report = NO.apply(ep, capabilities=("rms_norm",), verify_with=(M(mutating), (X,)))
+    assert not report.fusions and report.skipped[0][0] == "verify-failed", report.summary()
+    for tensor, pointer, saved in constants:
+        assert tensor.data_ptr() == pointer
+        torch.testing.assert_close(tensor, saved, rtol=0, atol=0)
+    _assert_transaction_unchanged(ep, before)
+
+
+def test_structured_verification_inputs_refuses_unbounded_iterable(cpu_structured_handle):
+    mod = M(_full_rms).eval()
+    args = X, torch.ones(32)
+    ep = torch.export.export(mod, args)
+    before = _transaction_snapshot(ep)
+    report = NO.apply(ep, capabilities=("rms_norm",), verification_inputs=iter((args,)))
+    assert not report.fusions and "sequence" in report.summary() and not cpu_structured_handle
+    _assert_transaction_unchanged(ep, before)
+
+
+def test_structured_discovery_prioritizes_complete_regions_and_deduplicates_roots(monkeypatch):
+    from types import SimpleNamespace
+
+    gm = _traced(lambda x: (x.sin(), x.cos()), X)
+    nodes = tuple(gm.graph.nodes)
+    source, early, late = nodes[:3]
+    scalar = SimpleNamespace(region_root=early, region_nodes=(early,))
+    small = SimpleNamespace(kind="structured", region_root=early, region_nodes=(early,))
+    large = SimpleNamespace(kind="structured", region_root=early, region_nodes=(source, early))
+    other = SimpleNamespace(kind="structured", region_root=late, region_nodes=(late,))
+    monkeypatch.setattr(NR, "recognize_structured_regions", lambda *args, **kwargs: (
+        [other, small, large], "structured"))
+    monkeypatch.setattr(NO, "_recognize_regions", lambda *args: ([scalar], "scalar"))
+    monkeypatch.setattr(NO, "region_contract", lambda match: (False, None))
+    matches, why = NO._discover_regions(gm, None, ("rms_norm",))
+    assert matches == [large, other] and why == "structured"
+    assert NO._discover_regions(gm, None, ())[0] == [scalar]
+
+
+def test_structured_fusion_report_uses_all_boundaries_and_numeric_contract():
+    from types import SimpleNamespace
+
+    x, gamma, root = (SimpleNamespace(name=name) for name in ("x", "gamma", "out"))
+    match = SimpleNamespace(skeleton="rms_norm", params={"eps": 1e-6}, input_node=x,
+                            input_nodes=(x, gamma), region_root=root, kind="structured",
+                            operation="rms_norm", proof_kind="structured-state-contract",
+                            domain_assumptions=("positive eps",),
+                            metadata={"numeric_contract": ("fp32 mean", "cast before gamma")})
+    fusion = NO._fusion_from_match(match, "serial")
+    assert fusion.input_name == "x" and fusion.input_names == ("x", "gamma")
+    assert fusion.kind == "structured" and fusion.operation == "rms_norm"
+    assert fusion.numeric_contract == ("fp32 mean", "cast before gamma")
+    assert str(fusion) == "rms_norm(eps=1e-06)"
+    del match.kind, match.operation, match.input_nodes, match.metadata
+    legacy = NO._fusion_from_match(match, "serial")
+    assert legacy.kind == "scalar" and legacy.input_names == ("x",)
+    assert legacy.numeric_contract == () and legacy.operation == ""
+
+
+def test_structured_split_segment_generation_refusal_rolls_back_rms(cpu_structured_handle):
+    mod = _StructuredParent().eval()
+    args = X, torch.tensor([3, 0, 5])
+    ep = torch.export.export(mod, args)
+    before = _transaction_snapshot(ep)
+    report = NO.apply(ep, capabilities=("rms_norm", "segment_pool"), plan="split")
+    # Unsupported segment plans are rejected by the shared ABI before registering
+    # an operator; the two successful tentative RMS rewrites still must roll back.
+    assert [name for name, _, _ in cpu_structured_handle] == ["rms_norm", "rms_norm"]
+    assert not report.fusions and "segment split" in report.summary()
+    _assert_transaction_unchanged(ep, before)
+
+
+def test_structured_unknown_metadata_is_a_noop(cpu_structured_handle):
+    mod = M(_full_rms).eval()
+    args = X, torch.ones(32)
+    ep = torch.export.export(mod, args)
+    for node in ep.graph.nodes:
+        node.meta.pop("val", None)
+        node.meta.pop("tensor_meta", None)
+    before = _transaction_snapshot(ep)
+    assert not NO.preview(ep, capabilities=("rms_norm",))[0]
+    report = NO.apply(ep, lower=False, capabilities=("rms_norm",))
+    assert not report.fusions and not cpu_structured_handle
+    # Unknown tensor metadata deliberately violates the EP verifier, so only check
+    # graph/signature identity here rather than re-validating the malformed input.
+    assert ep.graph_module is before["module"] and ep.graph_signature is before["signature"]
+    assert ep.graph_module.code == before["code"]
+
+
+def test_structured_multi_input_verification_rejects_gamma_mutation(cpu_structured_handle):
+    args = X.clone(), torch.ones(32)
+    pristine = NO._clone_inputs(args)
+    mod = M(_full_rms).eval()
+    ep = torch.export.export(mod, args)
+    before = _transaction_snapshot(ep)
+
+    def mutating(x, gamma):
+        result = _full_rms(x, gamma)
+        gamma.add_(1)
+        return result
+
+    report = NO.apply(ep, capabilities=("rms_norm",), verify_with=(M(mutating), args))
+    assert not report.fusions and "inputs mutated" in report.summary()
+    assert NO._compare_trees(args, pristine, rtol=0, atol=0)[0]
+    _assert_transaction_unchanged(ep, before)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_structured_strided_shared_input_users_survive(cpu_structured_handle, dtype):
+    def fn(x, gamma):
+        return _full_rms(x, gamma), x.sin(), gamma.cos()
+
+    args = torch.randn(2, 3, 64, dtype=dtype)[..., ::2], torch.ones(64, dtype=dtype)[::2]
+    assert not args[0].is_contiguous() and not args[1].is_contiguous()
+    mod = M(fn).eval()
+    ep = torch.export.export(mod, args)
+    report = NO.apply(ep, capabilities=("rms_norm",), verify_with=(mod, args))
+    assert report.verified and len(report.fusions) == 1, report.summary()
+    assert ep.module()(*args)[0].shape == (2, 3, 32)
+    torch.testing.assert_close(ep.module()(*args), mod(*args), rtol=0, atol=0)
+    _validate_exported(ep)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_ulp_finite_max_cannot_use_infinity_neighbor_as_unbounded_slack(dtype, sign):
+    maximum = torch.tensor([sign * torch.finfo(dtype).max], dtype=dtype)
+    zero = torch.zeros_like(maximum)
+    for rtol, atol in ((0, 0), (1e-3, 1e-4)):
+        for reference, candidate in ((maximum, zero), (zero, maximum)):
+            ok, detail = NO._compare_trees(reference, candidate, max_ulps=1, rtol=rtol, atol=atol)
+            assert ok is False and detail
+    infinity = torch.full_like(maximum, sign * float("inf"))
+    assert not NO._compare_trees(maximum, infinity, max_ulps=1)[0]
+    assert not NO._compare_trees(infinity, maximum, max_ulps=1)[0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("boundary", [0.5, 1.0, 2.0, -0.5, -1.0, -2.0])
+def test_ulp_exact_neighbor_units_across_exponent_boundaries(dtype, boundary):
+    middle = torch.tensor([boundary], dtype=dtype)
+    below = torch.nextafter(middle, torch.full_like(middle, -float("inf")))
+    above = torch.nextafter(middle, torch.full_like(middle, float("inf")))
+    for reference, candidate in ((below, middle), (middle, above), (middle, below), (above, middle)):
+        assert NO._compare_trees(reference, candidate, rtol=0, atol=0, max_ulps=1) == (True, "")
+        assert not NO._compare_trees(reference, candidate, rtol=0, atol=0, max_ulps=0)[0]
+    for reference, candidate in ((below, above), (above, below)):
+        assert not NO._compare_trees(reference, candidate, rtol=0, atol=0, max_ulps=1)[0]
+        assert NO._compare_trees(reference, candidate, rtol=0, atol=0, max_ulps=2) == (True, "")
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_ulp_signed_zero_policy_subnormal_distance_and_nonfinite_signs(dtype):
+    positive_zero = torch.tensor([0.0], dtype=dtype)
+    negative_zero = torch.tensor([-0.0], dtype=dtype)
+    assert torch.signbit(negative_zero).all() and not torch.signbit(positive_zero).any()
+    assert NO._compare_trees(positive_zero, negative_zero, max_ulps=0) == (True, "")
+    tiny = torch.nextafter(positive_zero, torch.ones_like(positive_zero))
+    for zero in (positive_zero, negative_zero):
+        assert NO._compare_trees(zero, tiny, rtol=0, atol=0, max_ulps=1)[0]
+        assert NO._compare_trees(zero, -tiny, rtol=0, atol=0, max_ulps=1)[0]
+    assert not NO._compare_trees(-tiny, tiny, rtol=0, atol=0, max_ulps=1)[0]
+    assert NO._compare_trees(-tiny, tiny, rtol=0, atol=0, max_ulps=2)[0]
+    same = torch.tensor([float("nan"), float("inf"), -float("inf"), -0.0], dtype=dtype)
+    assert NO._compare_trees(same, same.clone(), max_ulps=1) == (True, "")
+    for index, replacement in ((0, 0.0), (0, float("inf")), (1, -float("inf")),
+                               (1, torch.finfo(dtype).max), (2, float("inf"))):
+        wrong = same.clone()
+        wrong[index] = replacement
+        assert not NO._compare_trees(same, wrong, max_ulps=1, rtol=1e30, atol=1e30)[0]
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_rms_backend_large_serial_width_rolls_back_before_handle(cpu_structured_handle, verify):
+    import neptune_codegen as CG
+
+    args = torch.ones(2, 32769), torch.ones(32769)
+    mod = M(_full_rms).eval()
+    ep = torch.export.export(mod, args)
+    _validate_exported(ep)  # Source export is legal independently of backend resources.
+    matches, why = NO.preview(ep, capabilities=("rms_norm",))
+    assert len(matches) == 1, why
+    before = _transaction_snapshot(ep)
+    with patch.object(CG, "state_op_handle", side_effect=AssertionError("resource check must precede handle")) as handle, \
+            patch.object(NO, "_verify", side_effect=AssertionError("invalid backend must not verify")) as checking:
+        report = NO.apply(ep, capabilities=("rms_norm",),
+                          verify_with=(mod, args) if verify else None, rtol=0, atol=0)
+    handle.assert_not_called()
+    checking.assert_not_called()
+    assert not cpu_structured_handle and not report.fusions and not report.graph_changed
+    assert not report.verified and report.verification_cases == 0
+    assert report.skipped[0][0] == "rewrite-failed" and "32768" in report.summary()
+    _assert_transaction_unchanged(ep, before)
+    torch.testing.assert_close(ep.module()(*args), mod(*args), rtol=0, atol=0)
+
+
+def test_rms_backend_noncanonical_source_output_is_rejected_readonly(cpu_structured_handle):
+    from torch.fx.passes.shape_prop import _extract_tensor_metadata
+
+    args = torch.randn(512, 2).t(), torch.ones(512)
+    assert args[0].shape == (2, 512) and args[0].stride() == (1, 2)
+    mod = M(_full_rms).eval()
+    actual = mod(*args)
+    assert actual.stride() == (1, 2), "source must establish a genuinely noncanonical dense output"
+    ep = torch.export.export(mod, args)
+    root = next(node for node in ep.graph.nodes if node.op == "output").args[0][0]
+    assert root.meta["val"].stride() == actual.stride()
+    root.meta["tensor_meta"] = _extract_tensor_metadata(root.meta["val"])
+    values = {node.name: (node.meta.get("val"), node.meta.get("tensor_meta")) for node in ep.graph.nodes}
+    before = _transaction_snapshot(ep)
+    report = NO.apply(ep, capabilities=("rms_norm",), verify_with=(mod, args), rtol=0, atol=0)
+    assert not cpu_structured_handle and not report.fusions and not report.graph_changed
+    assert "canonical contiguous" in report.summary()
+    _assert_transaction_unchanged(ep, before)
+    for node in ep.graph.nodes:
+        val, tensor_meta = values[node.name]
+        assert node.meta.get("val") is val and node.meta.get("tensor_meta") is tensor_meta
+    output = ep.module()(*args)
+    assert output.stride() == actual.stride()
+    torch.testing.assert_close(output, actual, rtol=0, atol=0)
+
+
+def test_rms_backend_rewrite_fresh_canonical_output_metadata_preserves_old_metadata(cpu_structured_handle):
+    from torch.fx.passes.shape_prop import _extract_tensor_metadata
+
+    args = torch.randn(2, 3, 32), torch.ones(32)
+    mod = M(_full_rms).eval()
+    ep = torch.export.export(mod, args)
+    root = next(node for node in ep.graph.nodes if node.op == "output").args[0][0]
+    old_value = root.meta["val"]
+    root.meta["example_value"] = old_value
+    old_tensor_meta = _extract_tensor_metadata(old_value)
+    root.meta["tensor_meta"] = old_tensor_meta
+    report = NO.apply(ep, capabilities=("rms_norm",), verify_with=(mod, args), rtol=0, atol=0)
+    assert report.verified and len(report.fusions) == len(cpu_structured_handle) == 1, report.summary()
+    new_root = next(node for node in ep.graph.nodes if node.op == "output").args[0][0]
+    value = new_root.meta["val"]
+    assert value is not old_value and value.shape == old_value.shape
+    assert value.dtype == old_value.dtype and value.device == old_value.device and value.is_contiguous()
+    assert value._base is None and new_root.meta["example_value"] is value
+    assert new_root.meta["tensor_meta"] == _extract_tensor_metadata(value)
+    assert root.meta["val"] is old_value and root.meta["example_value"] is old_value
+    assert root.meta["tensor_meta"] is old_tensor_meta
+    _validate_exported(ep)
+    torch.testing.assert_close(ep.module()(*args), mod(*args), rtol=0, atol=0)

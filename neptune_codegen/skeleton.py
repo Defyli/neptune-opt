@@ -4,6 +4,7 @@ The skeleton spec and its registry.
 from __future__ import annotations
 
 import dataclasses
+from types import MappingProxyType
 
 import sympy as sp
 
@@ -145,6 +146,109 @@ def unsupported_reason(name: str) -> str:
         return ""
     except NotImplementedError as e:
         return str(e)
+
+
+# Structured reductions are separate from scalar repair skeletons: a vector
+# output and multiple tensor boundaries must never enter the old scalar ABI.
+@dataclasses.dataclass(frozen=True)
+class StateField:
+    name: str
+    symbol: sp.Symbol
+    term: sp.Expr
+    dtype: str = "float32"
+    extent: str = "scalar"  # "scalar" or one independent state per output channel
+    identity: sp.Expr = sp.Integer(0)
+
+
+@dataclasses.dataclass(frozen=True)
+class NumericalContract:
+    accumulation_dtype: str
+    reduction_order: str
+    stages: tuple[str, ...]
+    empty_policy: str
+    nonfinite_policy: str = "source_ieee"
+    bitwise_reassociation: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class StateReduction:
+    """A typed, mergeable sufficient statistic plus a separate output readout.
+
+    The first backend implements additive fields. Explicit merge expressions may
+    be certified independently; they are not executable callbacks or a promise
+    that this backend implements arbitrary monoids. ``readout`` is a real formula;
+    ``numeric`` separately fixes observable storage conversions and empty cases.
+    """
+
+    name: str
+    operation: str
+    inputs: tuple[sp.Symbol, ...]
+    fields: tuple[StateField, ...]
+    readout: sp.Expr
+    domain: str
+    output_kind: str  # "map" needs the original element, "reduced" needs only state
+    params: tuple = ()
+    numeric: NumericalContract = NumericalContract("float32", "tree", (), "reject")
+    merge: tuple = ()  # empty means componentwise addition
+
+    @property
+    def left(self) -> tuple:
+        return tuple(sp.Symbol("left_" + field.name, real=True) for field in self.fields)
+
+    @property
+    def right(self) -> tuple:
+        return tuple(sp.Symbol("right_" + field.name, real=True) for field in self.fields)
+
+    @property
+    def merge_expressions(self) -> tuple:
+        return self.merge or tuple(a + b for a, b in zip(self.left, self.right))
+
+
+_STATE_TOTAL = sp.Symbol("state_total", real=True)
+_STATE_COUNT = sp.Symbol("state_count", integer=True, nonnegative=True)
+_STATE_DATA = sp.Symbol("state_data", real=True)
+_STATE_GAMMA = sp.Symbol("state_gamma", real=True)
+_STATE_INITIAL = sp.Symbol("state_initial", real=True)
+_STATE_EPS = sp.Symbol("state_eps", positive=True)
+_RMS_NUMERIC = NumericalContract(
+    "float32", "tree_or_serial",
+    ("promote_input_fp32", "square_fp32", "mean_fp32", "add_eps_fp32", "rsqrt_fp32",
+     "normalize_fp32", "round_input_dtype", "multiply_gamma", "round_output_dtype"),
+    "reject_empty_width")
+_SEGMENT_NUMERIC = NumericalContract(
+    "input", "ordered",
+    ("convert_initial_input_dtype", "ordered_add_round_input_dtype", "divide_count_input_dtype",
+     "round_output_dtype"), "source_initial_or_nan")
+
+_BUILTIN_STATE_REDUCTIONS = MappingProxyType({
+    "rms_norm": StateReduction(
+        "rms_norm", "rms_norm", (_STATE_DATA, _STATE_GAMMA),
+        (StateField("total", _STATE_TOTAL, _STATE_DATA ** 2),
+         StateField("count", _STATE_COUNT, sp.Integer(1), "int64")),
+        _STATE_DATA * _STATE_GAMMA / sp.sqrt(_STATE_TOTAL / _STATE_COUNT + _STATE_EPS),
+        "row_last", "map", ((_STATE_EPS, "eps"),), _RMS_NUMERIC),
+    "segment_sum": StateReduction(
+        "segment_sum", "segment_pool", (_STATE_DATA,),
+        (StateField("total", _STATE_TOTAL, _STATE_DATA, extent="channel"),
+         StateField("count", _STATE_COUNT, sp.Integer(1), "int64")),
+        _STATE_TOTAL + _STATE_INITIAL, "segments", "reduced",
+        ((_STATE_INITIAL, "initial"),), _SEGMENT_NUMERIC),
+    "segment_mean": StateReduction(
+        "segment_mean", "segment_pool", (_STATE_DATA,),
+        (StateField("total", _STATE_TOTAL, _STATE_DATA, extent="channel"),
+         StateField("count", _STATE_COUNT, sp.Integer(1), "int64")),
+        (_STATE_TOTAL + _STATE_INITIAL) / _STATE_COUNT, "segments", "reduced",
+        ((_STATE_INITIAL, "initial"),), _SEGMENT_NUMERIC),
+})
+STATE_REDUCTIONS = _BUILTIN_STATE_REDUCTIONS
+
+
+def state_reduction_spec(name: str) -> StateReduction:
+    """Return the immutable backend authorization root, not a mutable registry entry."""
+    spec = _BUILTIN_STATE_REDUCTIONS[name]
+    if STATE_REDUCTIONS.get(name) != spec:
+        raise NotImplementedError("structured registry differs from the immutable built-in specification")
+    return spec
 
 
 # ---------------------------------------------------------------- references

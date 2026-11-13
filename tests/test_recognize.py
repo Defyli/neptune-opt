@@ -590,6 +590,355 @@ def test_guard_floor_and_exact_safe_contours(boundary):
         assert matches == []
 
 
+# ---------------------------------------------------------------- opt-in structured regions
+
+def _structured_rms(x, gamma, eps=1e-6):
+    z = x.float()
+    return (z * (z.square().mean(-1, keepdim=True) + eps).rsqrt()).to(x.dtype) * gamma.to(x.dtype)
+
+
+_STRUCTURED_TEST_LIBRARIES = []
+
+
+@pytest.fixture(scope="module")
+def structured_cpu_library():
+    # Keep dispatcher schemas alive across parametrized tests and cached OpOverloads.
+    library = torch.library.Library("neptune_structured_recognize_tests", "FRAGMENT")
+    library.define("rms(Tensor x, Tensor gamma, float eps) -> Tensor")
+    library.define("segment(Tensor data, Tensor descriptor, str reduce, float? initial, bool offsets, bool unsafe) -> Tensor")
+    library.impl("rms", _structured_rms, "CPU")
+
+    def segment(data, descriptor, reduce, initial, offsets, unsafe):
+        kwargs = {"offsets" if offsets else "lengths": descriptor}
+        return torch.segment_reduce(data, reduce, initial=initial, unsafe=unsafe, **kwargs)
+
+    library.impl("segment", segment, "CPU")
+    library.impl("rms", lambda x, gamma, eps: x.new_empty(x.shape), "Meta")
+
+    def segment_meta(data, descriptor, reduce, initial, offsets, unsafe):
+        return data.new_empty((descriptor.shape[0] - int(offsets), *data.shape[1:]))
+
+    library.impl("segment", segment_meta, "Meta")
+    from itertools import count
+    # Cached FX/dispatcher overloads may outlive module fixture teardown. Keep the
+    # schema owner for the full process, as required by torch.library.Library.
+    _STRUCTURED_TEST_LIBRARIES.append(library)
+    yield library, count()
+
+
+@pytest.fixture
+def structured_cpu_handle(monkeypatch, structured_cpu_library):
+    """Real dispatcher overloads with explicit schemas, also valid on Torch 2.4."""
+    import neptune_codegen as CG
+
+    library, sequence = structured_cpu_library
+    # Bind parameters in a schema-defined two-input wrapper; no global annotation inference.
+    handles = []
+
+    def handle(name, params, plan="serial", lib="neptune"):
+        operation = f"bound_{next(sequence)}"
+        library.define(f"{operation}(Tensor x, Tensor auxiliary) -> Tensor")
+        if name == "rms_norm":
+            def implementation(x, auxiliary):
+                return torch.ops.neptune_structured_recognize_tests.rms.default(x, auxiliary, params["eps"])
+
+            def meta(x, auxiliary):
+                return x.new_empty(x.shape)
+        else:
+            def implementation(x, auxiliary):
+                return torch.ops.neptune_structured_recognize_tests.segment.default(
+                    x, auxiliary, name.removeprefix("segment_"), params["initial"],
+                    params["offsets"], params["unsafe"])
+
+            def meta(x, auxiliary):
+                return x.new_empty((auxiliary.shape[0] - int(params["offsets"]), *x.shape[1:]))
+        library.impl(operation, implementation, "CPU")
+        library.impl(operation, meta, "Meta")
+        overload = getattr(torch.ops.neptune_structured_recognize_tests, operation).default
+        handles.append((name, dict(params), plan, lib, overload))
+        return overload
+
+    monkeypatch.setattr(CG, "state_op_handle", handle, raising=False)
+    yield handles
+    # The Library owns registrations for the duration of each test.
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(512,), (2, 512), (2, 3, 128), (1, 1), (0, 32)])
+@pytest.mark.parametrize("trace", ["fx", "export", "decompose-empty"])
+def test_structured_rms_dtype_shape_export_matrix(dtype, shape, trace):
+    from neptune_recognize.match import recognize_structured_regions
+
+    x, gamma = torch.randn(shape).to(dtype), torch.randn(shape[-1]).to(dtype)
+
+    class Model(torch.nn.Module):
+        def forward(self, x, gamma):
+            return _structured_rms(x, gamma)
+
+    if trace == "fx":
+        gm = make_fx(lambda x, gamma: _structured_rms(x, gamma))(x, gamma)
+    else:
+        ep = export(Model(), (x, gamma))
+        gm = (ep.run_decompositions({}) if trace == "decompose-empty" else ep).graph_module
+    before = str(gm.graph)
+    matches, reason = recognize_structured_regions(gm, ("rms_norm",))
+    assert len(matches) == 1, reason
+    match = matches[0]
+    assert match.kind == "structured" and match.operation == match.skeleton == "rms_norm"
+    assert match.input_node is match.input_nodes[0]
+    assert match.input_nodes[0].meta["val"].dtype == dtype
+    assert match.params == {"eps": 1e-6}
+    assert match.proof_kind == "exact-structured-real-algebra-with-explicit-rounding"
+    assert NR.region_contract(match) == (False, None)
+    assert not set(match.input_nodes).intersection(match.region_nodes)
+    assert str(gm.graph) == before
+    assert recognize_structured_regions(gm, ("segment_pool",))[0] == []
+    assert recognize_structured_regions(gm, ())[0] == []
+    assert NR.recognize_regions(gm)[0] == [], "scalar default must not gain structured capability"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("square", ["pow", "mul"])
+def test_structured_rms_rewrite_shared_boundary_and_rounding(dtype, square, structured_cpu_handle):
+    from neptune_recognize.match import recognize_structured_regions
+
+    def model(x, weight, gamma, residual):
+        bounded = (x @ weight).clamp(-0.5, 0.75)
+        z = bounded.float()
+        squared = z ** 2 if square == "pow" else z * z
+        mean = squared.mean(-1, keepdim=True, dtype=torch.float32)
+        inv = (mean + 1e-6).rsqrt()
+        normalized = (inv * z).to(dtype)
+        result = gamma.to(dtype) * normalized
+        return result + residual, mean, bounded * 3, normalized
+
+    args = (torch.randn(2, 7).to(dtype), torch.randn(7, 512).to(dtype),
+            torch.randn(512), torch.randn(2, 512).to(dtype))
+    gm = make_fx(model)(*args)
+    before = gm(*args)
+    matches, reason = recognize_structured_regions(gm)
+    assert len(matches) == 1, reason
+    match = matches[0]
+    assert NR._op(match.input_node) == "clamp"
+    if dtype != torch.float32:
+        assert NR._op(match.input_nodes[1]) == "_to_copy", "gamma conversion stays a boundary"
+    mean = match.consumer_node
+    normalized = next(node for node in gm.graph.nodes if node.op == "output").args[0][3]
+    guard_target = torch.ops.aten._assert_tensor_metadata.default
+    with gm.graph.inserting_after(match.input_node):
+        guard = gm.graph.call_function(guard_target, (match.input_node,), {"dtype": dtype})
+    guard.meta["val"] = None
+    old_name = match.region_root.name
+    gm.meta["neptune_replaced_roots"] = {"existing": "untouched"}
+    from neptune_recognize.rewrite import rewrite_match
+    with patch("neptune_recognize.rewrite._launch_config", side_effect=AssertionError("no autotune")):
+        call, refusal = rewrite_match(gm, match, plan="serial", lib="structured_test")
+    assert refusal is None and call.args == match.input_nodes
+    assert isinstance(call.target, torch._ops.OpOverload)
+    assert structured_cpu_handle[0][:4] == ("rms_norm", {"eps": 1e-6}, "serial", "structured_test")
+    assert mean in gm.graph.nodes and normalized in gm.graph.nodes
+    assert guard in gm.graph.nodes and all(node in gm.graph.nodes for node in match.input_nodes)
+    assert gm.meta["neptune_replaced_roots"] == {"existing": "untouched", old_name: call.name}
+    torch.testing.assert_close(gm(*args), before, rtol=0, atol=0)
+    # The registered fake rule must work without executing any backend compiler.
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    with FakeTensorMode() as mode:
+        fake_x, fake_gamma = mode.from_tensor(args[3]), mode.from_tensor(args[2]).to(dtype)
+        assert call.target(fake_x, fake_gamma).shape == fake_x.shape
+
+
+@pytest.mark.parametrize("variant", ["gamma-before-cast", "eps-after-rsqrt", "no-fp32", "axis0",
+                                     "no-dims", "no-keepdim", "gamma-rank2", "gamma-wide",
+                                     "mean-fp64", "eps-zero", "eps-negative", "eps-infinite"])
+def test_structured_rms_semantic_negatives(variant):
+    from neptune_recognize.match import recognize_structured_regions
+
+    dtype = torch.float16
+    x = torch.randn(8, 8).to(dtype)
+    gamma = torch.randn((1, 8) if variant == "gamma-rank2" else (8,)).to(dtype)
+
+    def model(x, gamma):
+        z = x if variant == "no-fp32" else x.float()
+        squared = z * z
+        if variant == "no-dims":
+            mean = squared.mean()
+        else:
+            mean = squared.mean(0 if variant == "axis0" else -1,
+                                keepdim=variant != "no-keepdim",
+                                dtype=torch.float64 if variant == "mean-fp64" else None)
+        eps = {"eps-zero": 0., "eps-negative": -1., "eps-infinite": float("inf")}.get(variant, 1e-6)
+        inv = mean.rsqrt() + eps if variant == "eps-after-rsqrt" else (mean + eps).rsqrt()
+        if variant == "gamma-before-cast":
+            return (z * inv * gamma.float()).to(dtype)
+        weight = gamma.expand(8, 8) if variant == "gamma-wide" else gamma
+        return (z * inv).to(dtype) * weight
+
+    gm = make_fx(model)(x, gamma)
+    before = str(gm.graph)
+    assert recognize_structured_regions(gm)[0] == []
+    assert str(gm.graph) == before
+
+
+@pytest.mark.parametrize("defect", ["output-shape", "output-dtype", "gamma-dtype", "gamma-shape",
+                                    "gamma-device", "layout", "unknown-meta"])
+def test_structured_contract_refuses_metadata_before_handle(defect, monkeypatch):
+    import neptune_codegen as CG
+    from neptune_recognize.match import recognize_structured_regions
+    from neptune_recognize.rewrite import rewrite_match
+
+    gm = make_fx(lambda x, gamma: _structured_rms(x, gamma))(torch.randn(2, 512), torch.randn(512))
+    matches, reason = recognize_structured_regions(gm)
+    assert len(matches) == 1, reason
+    match = matches[0]
+    gamma = match.input_nodes[1]
+    if defect == "output-shape":
+        match.region_root.meta["val"] = torch.empty(2, 1, 512)
+    elif defect == "output-dtype":
+        match.region_root.meta["val"] = torch.empty(2, 512, dtype=torch.float64)
+    elif defect == "gamma-dtype":
+        gamma.meta["val"] = torch.empty(512, dtype=torch.float16)
+    elif defect == "gamma-shape":
+        gamma.meta["val"] = torch.empty(1, 512)
+    elif defect == "gamma-device":
+        gamma.meta["val"] = torch.empty(512, device="meta")
+    elif defect == "layout":
+        gamma.meta["val"] = torch.empty(512).to_sparse()
+    else:
+        gamma.meta.clear()
+    monkeypatch.setattr(CG, "state_op_handle", lambda *a, **k: pytest.fail("must not compile"), raising=False)
+    before = str(gm.graph)
+    assert NR.region_contract(match)[0] is None
+    assert rewrite_match(gm, match)[0] is None
+    assert recognize_structured_regions(gm)[0] == []
+    assert str(gm.graph) == before
+
+
+@pytest.mark.parametrize("reduce", ["sum", "mean"])
+@pytest.mark.parametrize("offsets", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(5,), (5, 7), (5, 2, 3)])
+@pytest.mark.parametrize("initial", [None, 0.0, -2.5])
+def test_structured_segment_cpu_matrix(reduce, offsets, dtype, shape, initial, structured_cpu_handle):
+    from neptune_recognize.match import recognize_structured_regions
+    from neptune_recognize.rewrite import rewrite_match
+
+    data = torch.randn(shape).to(dtype)
+    descriptor = torch.tensor([0, 2, 2, 5] if offsets else [2, 0, 3], dtype=torch.int64)
+
+    def model(data, descriptor):
+        kwargs = {"offsets" if offsets else "lengths": descriptor}
+        pooled = torch.segment_reduce(data, reduce, initial=initial, unsafe=True, **kwargs)
+        return pooled + 0.5, data * 2
+
+    gm = make_fx(model)(data, descriptor)
+    expected = gm(data, descriptor)
+    matches, reason = recognize_structured_regions(gm, ("segment_pool",))
+    assert len(matches) == 1, reason
+    match = matches[0]
+    assert match.skeleton == "segment_" + reduce
+    assert match.operation == "segment_pool" and match.kind == "structured"
+    assert match.params == {"initial": initial, "offsets": offsets, "unsafe": True}
+    assert len(match.region_nodes) == 1 and NR.region_contract(match) == (False, None)
+    call, refusal = rewrite_match(gm, match)
+    assert refusal is None and call.args == match.input_nodes
+    torch.testing.assert_close(gm(data, descriptor), expected, rtol=0, atol=0, equal_nan=True)
+    if reduce == "mean" and initial is None:
+        assert torch.isnan(gm(data, descriptor)[0][1]).all()
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    with FakeTensorMode() as mode:
+        result = call.target(mode.from_tensor(data), mode.from_tensor(descriptor))
+        assert tuple(result.shape) == (3, *shape[1:]) and result.dtype == dtype
+
+
+@pytest.mark.parametrize("trace", ["export", "decompose-empty", "fx-buffer"])
+@pytest.mark.parametrize("descriptor_dtype", [torch.int32, torch.int64])
+def test_structured_segment_exports_and_buffers(trace, descriptor_dtype):
+    from neptune_recognize.match import recognize_structured_regions
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("lengths", torch.tensor([2, 0, 3], dtype=descriptor_dtype))
+
+        def forward(self, data):
+            return torch.segment_reduce(data, "mean", lengths=self.lengths)
+
+    data, model = torch.randn(5, 512), Model()
+    if trace == "fx-buffer":
+        gm = make_fx(model)(data)
+    else:
+        ep = export(model, (data,))
+        gm = (ep.run_decompositions({}) if trace == "decompose-empty" else ep).graph_module
+    metadata_before = {node.name: dict(node.meta) for node in gm.graph.nodes}
+    matches, reason = recognize_structured_regions(gm)
+    assert len(matches) == 1, reason
+    assert matches[0].params == {"initial": None, "offsets": False, "unsafe": False}
+    from neptune_recognize.match import _structured_boundary_value
+    assert _structured_boundary_value(gm, matches[0].input_nodes[1]).dtype == descriptor_dtype
+    assert all(node.meta == metadata_before[node.name] for node in gm.graph.nodes), "recognition mutated source metadata"
+
+
+@pytest.mark.parametrize("variant", ["axis", "indices", "both", "neither", "reduce", "data-dtype",
+                                     "descriptor-dtype", "descriptor-rank", "output-shape", "initial-inf"])
+def test_structured_segment_negatives(variant):
+    from neptune_recognize.match import recognize_structured_regions
+
+    data, lengths = torch.randn(5, 7), torch.tensor([2, 3])
+    gm = make_fx(lambda x, lengths: torch.segment_reduce(x, "sum", lengths=lengths))(data, lengths)
+    node = next(node for node in gm.graph.nodes if node.target == torch.ops.aten.segment_reduce.default)
+    kwargs = dict(node.kwargs)
+    if variant == "axis":
+        kwargs["axis"] = 1
+    elif variant == "indices":
+        kwargs["indices"] = kwargs.pop("lengths")
+    elif variant == "both":
+        kwargs["offsets"] = kwargs["lengths"]
+    elif variant == "neither":
+        kwargs.pop("lengths")
+    elif variant == "reduce":
+        node.args = (node.args[0], "max")
+    elif variant == "data-dtype":
+        node.args[0].meta["val"] = torch.empty(5, 7, dtype=torch.float64)
+    elif variant == "descriptor-dtype":
+        kwargs["lengths"].meta["val"] = torch.empty(2, dtype=torch.float32)
+    elif variant == "descriptor-rank":
+        kwargs["lengths"].meta["val"] = torch.empty(1, 2, dtype=torch.int64)
+    elif variant == "output-shape":
+        node.meta["val"] = torch.empty(2, 1, 7)
+    else:
+        kwargs["initial"] = float("inf")
+    node.kwargs = kwargs
+    before = str(gm.graph)
+    assert recognize_structured_regions(gm)[0] == []
+    assert str(gm.graph) == before
+
+
+def test_structured_multiple_regions_and_mutation_refusal():
+    from neptune_recognize.match import Match, recognize_structured_regions
+
+    def model(x, y, gamma):
+        return _structured_rms(x, gamma), _structured_rms(y, gamma)
+
+    args = (torch.randn(2, 512), torch.randn(3, 512), torch.randn(512))
+    gm = make_fx(model)(*args)
+    matches, reason = recognize_structured_regions(gm)
+    assert len(matches) == 2, reason
+    assert matches[0].input_node is not matches[1].input_node
+    assert matches[0].input_nodes[1] is matches[1].input_nodes[1]
+    assert Match(None, "legacy", {}).input_nodes == ()
+    assert Match(None, "legacy", {}).kind == "scalar"
+    assert "unsupported" in recognize_structured_regions(gm, ("unknown",))[1]
+
+    def mutable(x, gamma):
+        result = _structured_rms(x, gamma)
+        gamma.add_(1)
+        return result
+
+    gm = make_fx(mutable)(args[0], args[2].clone())
+    assert "functionalized" in recognize_structured_regions(gm)[1]
+    assert recognize_structured_regions(gm)[0] == []
+
+
 def main() -> None:
     print("=" * 100)
     print("RECOGNITION FROM THE ALGEBRA -- no per-operator pattern rows")

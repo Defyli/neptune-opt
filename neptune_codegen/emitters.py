@@ -532,6 +532,101 @@ def state_finalize_source(sk: Skeleton, values: dict | None = None) -> str:
             f'tl.where(seen != 0, {finite_result}, -float("inf"))))')
 
 
+def emit_additive_state_helpers(spec) -> str:
+    """Render a typed tuple merge from its certified expressions, not a callback."""
+    from neptune_codegen.algebra import derive_state_certificate
+
+    certificate = derive_state_certificate(spec)
+    if spec.merge:
+        raise NotImplementedError("the first state backend implements componentwise additive fields")
+    names = {symbol: "a_" + field.name for symbol, field in zip(spec.left, spec.fields)}
+    names.update({symbol: "b_" + field.name for symbol, field in zip(spec.right, spec.fields)})
+    arguments = ", ".join(names.values())
+    merged = ", ".join(to_triton(expression, names) for expression in certificate.merge)
+    return f"@triton.jit\ndef {spec.name}_state_merge({arguments}):\n    return {merged}\n\n"
+
+
+def emit_rms_state_source(spec, params=None, *, plan="serial") -> str:
+    """One row-resident map, or explicit partial statistics plus a map kernel.
+
+    Numeric stages preserve FP32 normalization then input-dtype rounding BEFORE
+    gamma. The source is generated from additive lift/merge; no scalar repair ABI
+    or hand-written mean operator is inserted into the graph.
+    """
+    import math
+    from neptune_codegen.skeleton import state_reduction_spec
+
+    if spec != state_reduction_spec("rms_norm") or spec.name != "rms_norm":
+        raise NotImplementedError("RMS backend requires the registered sum/count and rounding spec")
+    if plan not in ("serial", "split"):
+        raise ValueError("RMS plan must be serial or split")
+    params = dict(params or {})
+    if params.keys() != {"eps"}:
+        raise ValueError("RMSNorm requires only the explicit eps parameter")
+    eps = params["eps"]
+    if type(eps) not in (int, float) or not math.isfinite(eps) or eps <= 0:
+        raise ValueError("RMSNorm eps must be finite and positive")
+    helpers = emit_additive_state_helpers(spec)
+    field = spec.fields[0]
+    term = to_triton(field.term, {spec.inputs[0]: "value"})
+    header = ("# AUTO-GENERATED typed sum/count; exact-real algebra, not IEEE associativity.\n"
+              "# Preserve FP32 stages and input rounding before gamma; fresh output.\n"
+              "import triton\nimport triton.language as tl\n"
+              "from triton.language.extra.cuda import libdevice\n\n")
+    output_map = '''        normalized = value * scale
+        normalized = normalized.to(out_ptr.dtype.element_ty, fp_downcast_rounding="rtne").to(tl.float32)
+        gamma = tl.load(gamma_ptr + column * stride_gamma, mask=column < ncols, other=0).to(tl.float32)
+        result = normalized * gamma
+        tl.store(out_ptr + row * ncols + column, result, mask=column < ncols)
+'''
+    if plan == "serial":
+        return header + helpers + f'''@triton.jit
+def rms_norm(x_ptr, gamma_ptr, out_ptr, rows, ncols, stride_row, stride_col,
+             stride_gamma, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    if row < rows:
+        column = tl.arange(0, BLOCK)
+        value = tl.load(x_ptr + row * stride_row + column * stride_col,
+                        mask=column < ncols, other=0).to(tl.float32)
+        total = tl.sum({term}, 0)
+        count = tl.sum((column < ncols).to(tl.int64), 0)
+        mean = tl.div_rn(total, count.to(tl.float32))
+        scale = libdevice.rsqrt_rn(mean + {repr(float(eps))})
+{output_map}'''
+    return header + helpers + f'''@triton.jit
+def rms_norm_partial(x_ptr, total_ptr, count_ptr, rows, ncols, stride_row, stride_col,
+                     nparts, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    part = tl.program_id(1)
+    if row < rows:
+        column = part * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(x_ptr + row * stride_row + column * stride_col,
+                        mask=column < ncols, other=0).to(tl.float32)
+        total = tl.sum({term}, 0)
+        count = tl.sum((column < ncols).to(tl.int64), 0)
+        tl.store(total_ptr + row * nparts + part, total)
+        tl.store(count_ptr + row * nparts + part, count)
+
+
+@triton.jit
+def rms_norm_map(x_ptr, gamma_ptr, total_ptr, count_ptr, out_ptr, rows, ncols,
+                 stride_row, stride_col, stride_gamma, nparts,
+                 BLOCK: tl.constexpr, MERGE_BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    if row < rows:
+        part = tl.arange(0, MERGE_BLOCK)
+        total = tl.load(total_ptr + row * nparts + part, mask=part < nparts, other=0)
+        count = tl.load(count_ptr + row * nparts + part, mask=part < nparts, other=0)
+        total, count = tl.reduce((total, count), 0, rms_norm_state_merge)
+        mean = tl.div_rn(total, count.to(tl.float32))
+        scale = libdevice.rsqrt_rn(mean + {repr(float(eps))})
+        column = tile * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(x_ptr + row * stride_row + column * stride_col,
+                        mask=column < ncols, other=0).to(tl.float32)
+{output_map}'''
+
+
 # ---------------------------------------------------------------- two-pass plan
 def consumer_fold_no_repair(sk: Skeleton, values: dict | None = None) -> str:
     """Pass 2's accumulator update, with the producer held constant.

@@ -137,3 +137,330 @@ def op_handle(name: str, params: dict | None = None, lib: str = "neptune",
 def triton_op_name(name: str, lib: str = "neptune") -> str:
     """The OpOverload the compiler pass should call, e.g. 'neptune.stable_l2'."""
     return f"{lib}.{name}"
+
+
+_STATE_OPS: dict[tuple, object] = {}
+
+
+def as_state_op(name, params=None, plan="serial", lib="neptune"):
+    """Explicit two-input structured bridge, separate from the scalar registry."""
+    import torch
+    from neptune_codegen.algebra import derive_state_certificate
+    from neptune_codegen.skeleton import state_reduction_spec
+    from neptune_codegen.template import compile_state_reduction, validate_rms_inputs, launch_rms_norm
+
+    spec = state_reduction_spec(name)
+    derive_state_certificate(spec)
+    if name in ("segment_sum", "segment_mean"):
+        return as_segment_op(name, params=params, plan=plan, lib=lib)
+    validate_plan(plan)
+    params = dict(params or {})
+    # Metadata-independent checks before registration, even when the op is cached.
+    from neptune_codegen.emitters import emit_rms_state_source
+    emit_rms_state_source(spec, params, plan=plan)
+    key = (lib, spec, autotune.parameter_identity(params), plan)
+    if key in _STATE_OPS:
+        return _STATE_OPS[key]
+    from torch.library import triton_op, wrap_triton
+    globals().setdefault("torch", torch)
+    tag = autotune.parameter_tag(params)
+    impl_name = f"state_{name}{tag}_plan_{plan}"
+
+    @triton_op(f"{lib}::{impl_name}", mutates_args={}, schema="(Tensor x, Tensor gamma) -> Tensor")
+    def _impl(x: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+        shape = validate_rms_inputs(x, gamma, params, plan=plan)
+        out = torch.empty(shape, dtype=x.dtype, device=x.device)
+        rows = 1
+        for size in x.shape[:-1]:
+            rows *= size
+        if isinstance(rows, int) and rows == 0:
+            return out
+        kernel = compile_state_reduction(name, params, plan=plan)
+        launch_rms_norm(kernel, x, gamma, out, plan=plan, wrapper=wrap_triton)
+        return out
+
+    def _fake(x, gamma):
+        shape = validate_rms_inputs(x, gamma, params, plan=plan, metadata=True)
+        return torch.empty(shape, dtype=x.dtype, device=x.device)
+
+    if hasattr(_impl, "register_fake"):
+        _impl.register_fake(_fake)
+    _impl.__name__ = f"{lib}_{impl_name}"
+    _STATE_OPS[key] = _impl
+    return _impl
+
+
+def state_op_handle(name, params=None, plan="serial", lib="neptune"):
+    import torch
+
+    impl = as_state_op(name, params=params, plan=plan, lib=lib)
+    packet = getattr(getattr(torch.ops, lib), impl.__name__[len(lib) + 1:])
+    return getattr(packet, "default", packet)
+
+
+# Segment state is additive (sum, count) over exact reals, NOT an IEEE monoid.
+# The numerical contract is an ordered storage-dtype fold; split/tree is refused.
+_SEGMENT_KERNELS: dict[tuple, object] = {}
+_SEGMENT_OPS: dict[tuple, object] = {}
+_SEGMENT_NAMES: dict[str, tuple] = {}
+
+
+def _segment_params(name, params=None, plan="serial"):
+    import math
+
+    if name not in ("segment_sum", "segment_mean"):
+        raise KeyError(f"unknown segment reduction {name!r}")
+    from neptune_codegen.skeleton import state_reduction_spec
+    state_reduction_spec(name)  # Validate authorization before kernel/operator cache hits.
+    validate_plan(plan)
+    if plan != "serial":
+        raise NotImplementedError("segment split cannot preserve ordered storage-dtype rounding; use serial")
+    params = dict(params or {})
+    unknown = params.keys() - {"initial", "offsets", "unsafe"}
+    if unknown:
+        raise ValueError(f"unknown segment parameters: {sorted(unknown)}")
+    initial = params.get("initial")
+    if initial is not None:
+        if isinstance(initial, bool) or not isinstance(initial, (int, float)):
+            raise TypeError("segment initial must be a finite Python scalar or None")
+        initial = float(initial)
+        if not math.isfinite(initial):
+            raise ValueError("segment initial must be finite")
+    offsets, unsafe = params.get("offsets", False), params.get("unsafe", False)
+    if type(offsets) is not bool or type(unsafe) is not bool:
+        raise TypeError("segment offsets and unsafe must be bool")
+    return {"initial": initial, "offsets": offsets, "unsafe": unsafe}
+
+
+def _segment_identity(name, params, plan):
+    numeric = {k: v for k, v in params.items() if v is not None}
+    return (name, params["initial"] is None, autotune.parameter_identity(numeric), plan, 64, 4)
+
+
+def _segment_module_name(identity):
+    import hashlib
+
+    stem = f"neptune_gen_{identity[0]}_serial_h" + hashlib.sha256(repr(identity).encode()).hexdigest()[-10:]
+    candidate = stem
+    collision = 0
+    # A short digest is only a name, never the cache identity. Resolve even hash collisions.
+    while candidate in _SEGMENT_NAMES and _SEGMENT_NAMES[candidate] != identity:
+        collision += 1
+        candidate = f"{stem}_{collision}"
+    _SEGMENT_NAMES[candidate] = identity
+    return candidate
+
+
+def emit_segment_source(name, *, initial=None, offsets=False, plan="serial"):
+    """Emit named sum/mean from additive state with strict serial numeric semantics."""
+    import struct
+
+    from neptune_codegen.skeleton import state_reduction_spec
+    from neptune_codegen.algebra import derive_state_certificate
+
+    spec = state_reduction_spec(name)
+    derive_state_certificate(spec)
+    params = _segment_params(name, {"initial": initial, "offsets": offsets}, plan)
+    initial = params["initial"]
+    # Native CUDA scalar conversion uses fp32 before narrowing to storage dtype.
+    value = 0.0 if initial is None else initial
+    try:
+        value = struct.unpack("f", struct.pack("f", value))[0]
+    except OverflowError:
+        value = float("-inf") if value < 0 else float("inf")
+    # Decimal -0.0 constants can be canonicalised by Triton; an IEEE bitcast keeps its sign.
+    initial_bits = struct.unpack("I", struct.pack("f", value))[0]
+    readout = "result = acc"
+    if name == "segment_mean":
+        empty = 'float("nan")' if initial is None else "acc"
+        readout = ("denominator = (end - start).to(storage_dtype).to(tl.float32)\n"
+                   "        result = tl.div_rn(acc, denominator)\n"
+                   f"        result = tl.where(end == start, {empty}, result)")
+    return f'''# AUTO-GENERATED segment state=(sum,count); exact-real additive certificate only.
+# Numeric contract: ordered per-token storage-dtype RTNE; no IEEE reassociation.
+# name={name!r}, offsets={offsets!r}, plan={plan!r}; no custom merges assumed.
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def {name}(data_ptr, spans_ptr, out_ptr, nrows, channels, nsegments,
+           stride_row, stride_channel, stride_span, BLOCK: tl.constexpr):
+    segment = tl.program_id(0)
+    channel = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    storage_dtype: tl.constexpr = out_ptr.dtype.element_ty
+    if segment < nsegments:
+        start = tl.load(spans_ptr + segment * stride_span).to(tl.int64)
+        end = tl.load(spans_ptr + (segment + 1) * stride_span).to(tl.int64)
+        valid = (start >= 0) & (end >= start) & (end <= nrows)
+        acc = tl.full((BLOCK,), {initial_bits}, tl.uint32).to(tl.float32, bitcast=True).to(storage_dtype).to(tl.float32)
+        # Defense in depth: malformed spans never issue data loads, even under unsafe.
+        if valid:
+            for token in range(start, end):
+                v = tl.load(data_ptr + token * stride_row + channel * stride_channel,
+                            mask=channel < channels, other=0).to(tl.float32)
+                acc = (acc + v).to(storage_dtype, fp_downcast_rounding="rtne").to(tl.float32)
+        {readout}
+        result = tl.where(valid, result, float("nan"))
+        tl.store(out_ptr + segment * channels + channel, result, mask=channel < channels)
+'''
+
+
+def compile_segment_reduction(name, params=None, plan="serial"):
+    """Keep real generated module files under template's existing temporary owner."""
+    import importlib.util
+    import os
+    import sys
+    from neptune_codegen import template
+
+    params = _segment_params(name, params, plan)
+    if template._GEN_RELEASED:
+        raise RuntimeError("generated source directory has been released")
+    identity = _segment_identity(name, params, plan)
+    if identity in _SEGMENT_KERNELS:
+        return _SEGMENT_KERNELS[identity]
+    source = emit_segment_source(name, initial=params["initial"], offsets=params["offsets"], plan=plan)
+    module_name = _segment_module_name(identity)
+    path = os.path.join(template._GEN_DIR, module_name + ".py")
+    with open(path, "w") as file:
+        file.write(source)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        kernel = getattr(module, name)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    _SEGMENT_KERNELS[identity] = kernel
+    return kernel
+
+
+def validate_segment_inputs(data, segments, *, metadata=False, offsets=False,
+                            initial=None, unsafe=False, reduce="sum", plan="serial"):
+    """Metadata-only contract; returns output shape, without reading segment contents.
+
+    Main's state contract can call this on CPU/Fake tensors with metadata=True.
+    Runtime value assertions are traceable ATen ops in _segment_spans, not host reads.
+    """
+    import torch
+
+    _segment_params("segment_" + reduce, {"initial": initial, "offsets": offsets, "unsafe": unsafe}, plan)
+    if data.layout != torch.strided or segments.layout != torch.strided:
+        raise TypeError("segment requires strided data and segments")
+    if data.ndim < 1 or segments.ndim != 1:
+        raise ValueError("segment data rank must be >= 1 and segments rank must be 1")
+    if data.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("segment data dtype must be float16/bfloat16/float32")
+    if initial is not None and abs(initial) > torch.finfo(data.dtype).max:
+        raise RuntimeError("segment initial cannot be converted to input dtype without overflow")
+    if segments.dtype not in (torch.int32, torch.int64):
+        raise TypeError("segment index dtype must be int32/int64")
+    if data.device != segments.device:
+        raise ValueError("segment tensors must be on the same device")
+    if not metadata and data.device.type != "cuda":
+        raise ValueError("segment execution requires CUDA device")
+    if offsets:
+        torch._check(segments.shape[0] >= 1, lambda: "segment offsets needs at least one boundary")
+    count = segments.shape[0] - 1 if offsets else segments.shape[0]
+    return (count,) + data.shape[1:]
+
+
+def _segment_spans(data, segments, *, offsets, unsafe):
+    import torch
+
+    nrows = data.shape[0]
+    if offsets:
+        spans = segments
+    else:
+        # Native lengths need exact coverage unless unsafe. Range checks remain mandatory.
+        torch._assert_async(torch.all((segments >= 0) & (segments <= nrows)),
+                            "segment lengths must be nonnegative and within data bounds")
+        spans = torch.cat((segments.new_zeros((1,), dtype=torch.int64),
+                           torch.cumsum(segments, dim=0, dtype=torch.int64)))
+        if not unsafe:
+            torch._assert_async(spans[-1] == nrows, "segment lengths must sum to data axis0 size")
+    torch._assert_async(torch.all((spans >= 0) & (spans <= nrows)),
+                        "segment boundaries out of data bounds")
+    torch._assert_async(torch.all(spans[1:] >= spans[:-1]), "segment boundaries must be monotonic")
+    return spans
+
+
+def _launch_segment(name, data, segments, params, plan, *, wrapper=None):
+    import torch
+
+    shape = validate_segment_inputs(data, segments, reduce=name.removeprefix("segment_"),
+                                    plan=plan, **params)
+    spans = _segment_spans(data, segments, offsets=params["offsets"], unsafe=params["unsafe"])
+    channels = 1
+    for size in data.shape[1:]:
+        channels = channels * size
+    out = torch.empty(shape, dtype=data.dtype, device=data.device)
+    if (type(shape[0]) is int and shape[0] == 0) or (type(channels) is int and channels == 0):
+        return out
+    flat = data.reshape(data.shape[0], channels)
+    kernel = compile_segment_reduction(name, params, plan)
+    if wrapper is not None:
+        kernel = wrapper(kernel)
+    kernel[(shape[0], (channels + 63) // 64)](
+        flat, spans, out, data.shape[0], channels, shape[0],
+        flat.stride(0), flat.stride(1), spans.stride(0), BLOCK=64, num_warps=4,
+        enable_fp_fusion=False)
+    return out
+
+
+def run_segment_pool(data, segments, *, reduce="sum", offsets=False, initial=None,
+                     unsafe=False, plan="serial"):
+    """Direct launch bridge; Fake/meta calls allocate metadata only, without Triton."""
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    name = "segment_" + reduce
+    params = _segment_params(name, {"initial": initial, "offsets": offsets, "unsafe": unsafe}, plan)
+    if data.device.type == "meta" or isinstance(data, FakeTensor):
+        shape = validate_segment_inputs(data, segments, metadata=True, reduce=reduce, plan=plan, **params)
+        return torch.empty(shape, dtype=data.dtype, device=data.device)
+    return _launch_segment(name, data, segments, params, plan)
+
+
+def as_segment_op(name, params=None, plan="serial", lib="neptune"):
+    """Return CustomOpDef for two Tensor inputs; constants live in exact op identity.
+
+    Registration/Fake do not compile or import Triton. Execution exposes ATen prefix,
+    assertions, reshape and wrap_triton to functional decomposition on supported Torch.
+    """
+    import torch
+
+    params = _segment_params(name, params, plan)
+    identity = (lib, _segment_identity(name, params, plan))
+    if identity in _SEGMENT_OPS:
+        return _SEGMENT_OPS[identity]
+    from torch.library import triton_op, wrap_triton
+
+    globals().setdefault("torch", torch)
+    impl_name = _segment_module_name(identity[1]).removeprefix("neptune_gen_")
+
+    @triton_op(f"{lib}::{impl_name}", mutates_args={}, schema="(Tensor data, Tensor segments) -> Tensor")
+    def _impl(data: torch.Tensor, segments: torch.Tensor) -> torch.Tensor:
+        return _launch_segment(name, data, segments, params, plan, wrapper=wrap_triton)
+
+    def _fake(data, segments):
+        shape = validate_segment_inputs(data, segments, metadata=True,
+                                        reduce=name.removeprefix("segment_"), plan=plan, **params)
+        return torch.empty(shape, dtype=data.dtype, device=data.device)
+
+    if hasattr(_impl, "register_fake"):
+        _impl.register_fake(_fake)
+    _impl.__name__ = f"{lib}_{impl_name}"
+    _SEGMENT_OPS[identity] = _impl
+    return _impl
+
+
+def segment_op_handle(name, params=None, plan="serial", lib="neptune"):
+    """Return the OpOverload for main's CG.state_op_handle dispatch."""
+    import torch
+
+    impl = as_segment_op(name, params=params, plan=plan, lib=lib)
+    packet = getattr(getattr(torch.ops, lib), impl.__name__[len(lib) + 1:])
+    return getattr(packet, "default", packet)

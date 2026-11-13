@@ -403,6 +403,103 @@ def derive_merge_certificate(sk: Skeleton, values: dict | None = None) -> MergeC
     return MergeCertificate(rho, beta, domain, floor, tuple(assumptions))
 
 
+@dataclasses.dataclass(frozen=True)
+class StateCertificate:
+    """Exact tuple-state algebra; IEEE order and access safety remain separate."""
+
+    state_fields: tuple[str, ...]
+    merge: tuple
+    assumptions: tuple[str, ...]
+    proof_kind: str = "exact-structured-real-algebra"
+    ieee_associative: bool = False
+
+
+@functools.lru_cache(maxsize=None)
+def derive_state_certificate(spec) -> StateCertificate:
+    """Prove real tuple identity/associativity and declared integer-field closure.
+
+    No sampling or user callback enters this path. Division/readout domains,
+    finite arithmetic and explicit rounding remain declared execution contracts.
+    The initial supported generators additionally require their exact registered
+    spec, so proving another monoid does not accidentally authorize these kernels.
+    """
+    from neptune_codegen.skeleton import StateReduction
+
+    if not isinstance(spec, StateReduction) or not spec.fields:
+        raise NotImplementedError("structured state requires nonempty typed fields")
+    names = tuple(field.name for field in spec.fields)
+    symbols = tuple(field.symbol for field in spec.fields)
+    if len(set(names)) != len(names) or len(set(symbols)) != len(symbols):
+        raise NotImplementedError("structured state field names and symbols must be unique")
+    if any(field.dtype not in ("float32", "int64") or field.extent not in ("scalar", "channel")
+           for field in spec.fields):
+        raise NotImplementedError("unsupported structured field type or extent")
+    if spec.domain not in ("row_last", "segments") or spec.output_kind not in ("map", "reduced"):
+        raise NotImplementedError("unsupported structured access or output domain")
+    allowed_terms = set(spec.inputs) | {symbol for symbol, _ in spec.params}
+    if any(sp.sympify(field.term).free_symbols - allowed_terms for field in spec.fields):
+        raise NotImplementedError("state lift depends on unbound data or a previous state")
+    if any(sp.sympify(field.identity).free_symbols for field in spec.fields):
+        raise NotImplementedError("state identity must be a constant")
+    for field in spec.fields:
+        if field.dtype == "int64":
+            if sp.sympify(field.term).is_integer is not True or sp.sympify(field.identity).is_integer is not True:
+                raise NotImplementedError("int64 state lift and identity require an integer domain proof")
+            if field.symbol.is_integer is not True:
+                raise NotImplementedError("int64 state symbol must declare the integer domain")
+            if field.symbol.is_nonnegative is True and (
+                    sp.sympify(field.term).is_nonnegative is not True
+                    or sp.sympify(field.identity).is_nonnegative is not True):
+                raise NotImplementedError("nonnegative int64 state requires nonnegative lift/identity")
+    allowed_readout = set(symbols) | {symbol for symbol, _ in spec.params}
+    if spec.output_kind == "map":
+        allowed_readout.update(spec.inputs)
+    if sp.sympify(spec.readout).free_symbols - allowed_readout:
+        raise NotImplementedError("structured readout has an unbound input")
+    left, right = spec.left, spec.right
+    expressions = tuple(map(sp.sympify, spec.merge_expressions))
+    if len(expressions) != len(spec.fields):
+        raise NotImplementedError("state merge changes tuple arity")
+    if any(expression.free_symbols - set(left + right) for expression in expressions):
+        raise NotImplementedError("state merge must be shape-free and data-free")
+    typed = {}
+    for a, b, field in zip(left, right, spec.fields):
+        if field.dtype == "int64":
+            assumptions = {"integer": True}
+            if field.symbol.is_nonnegative is True:
+                assumptions["nonnegative"] = True
+            typed[a], typed[b] = (sp.Symbol("integer_left_" + field.name, **assumptions),
+                                 sp.Symbol("integer_right_" + field.name, **assumptions))
+    for expression, field in zip(expressions, spec.fields):
+        if field.dtype == "int64":
+            result = expression.xreplace(typed)
+            if result.is_integer is not True:
+                raise NotImplementedError("int64 state merge lacks an integer closure proof")
+            if field.symbol.is_nonnegative is True and result.is_nonnegative is not True:
+                raise NotImplementedError("int64 state merge lacks a nonnegative closure proof")
+    identity = tuple(sp.sympify(field.identity) for field in spec.fields)
+    first = tuple(sp.Symbol("state_a_" + name, real=True) for name in names)
+    second = tuple(sp.Symbol("state_b_" + name, real=True) for name in names)
+    third = tuple(sp.Symbol("state_c_" + name, real=True) for name in names)
+
+    def merge(a, b):
+        bindings = dict(zip(left + right, a + b))
+        return tuple(expression.xreplace(bindings) for expression in expressions)
+
+    obligations = (*[x - y for x, y in zip(merge(identity, first), first)],
+                   *[x - y for x, y in zip(merge(first, identity), first)],
+                   *[x - y for x, y in zip(merge(merge(first, second), third),
+                                         merge(first, merge(second, third)))])
+    if any(_simplify(expression) != 0 for expression in obligations):
+        raise NotImplementedError("structured merge identity/associativity lacks exact proof")
+    assumptions = ("finite real inputs and finite reachable arithmetic",
+                   "logical domain partitions contain every participating element exactly once",
+                   "identity represents an empty partition; initial applied once per output",
+                   "explicit dtype conversions and reduction order are not erased by real algebra",
+                   "reachable integer states fit their declared storage type; readout domain checked separately")
+    return StateCertificate(names, expressions, assumptions)
+
+
 def _as_quotient_power(expr: sp.Expr) -> sp.Expr:
     """Re-express num**k / den**k as a marked quotient power.
 

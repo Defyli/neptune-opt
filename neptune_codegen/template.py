@@ -225,6 +225,116 @@ def compile_skeleton(name: str, values: dict | None = None, force: bool = False,
     return kernel
 
 
+_STATE_CACHE: dict[tuple, Callable | tuple] = {}
+
+
+def compile_state_reduction(name: str, params=None, *, plan="serial"):
+    """Compile a certified structured backend under the existing source owner."""
+    from neptune_codegen.skeleton import state_reduction_spec
+    from neptune_codegen.algebra import derive_state_certificate
+    from neptune_codegen.emitters import emit_rms_state_source
+
+    if _GEN_RELEASED:
+        raise RuntimeError("generated source directory has been released")
+    validate_plan(plan)
+    if name != "rms_norm":
+        raise NotImplementedError("this structured compiler implements RMSNorm; segments use the serial backend")
+    params = dict(params or {})
+    spec = state_reduction_spec(name)
+    derive_state_certificate(spec)
+    # Validate even a cache hit, including misspelled parameters.
+    source = emit_rms_state_source(spec, params, plan=plan)
+    key = (spec, parameter_identity(params), plan)
+    if key in _STATE_CACHE:
+        return _STATE_CACHE[key]
+    module_name = f"neptune_state_{name}{parameter_tag(params)}_plan_{plan}"
+    path = os.path.join(_GEN_DIR, module_name + ".py")
+    with open(path, "w") as file:
+        file.write(source)
+    module_spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_name] = module
+    try:
+        module_spec.loader.exec_module(module)
+        kernel = module.rms_norm if plan == "serial" else (module.rms_norm_partial, module.rms_norm_map)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    _STATE_CACHE[key] = kernel
+    return kernel
+
+
+def validate_rms_inputs(x, gamma, params=None, *, plan="serial", metadata=False):
+    """Full-vector RMSNorm ABI; symbolic batch survives unchanged."""
+    import math
+    import torch
+
+    validate_plan(plan)
+    _validate_row_last(x, metadata=metadata)
+    params = dict(params or {})
+    eps = params.get("eps")
+    if params.keys() != {"eps"} or type(eps) not in (int, float) or not math.isfinite(eps) or eps <= 0:
+        raise ValueError("RMSNorm requires an explicit finite positive eps")
+    if gamma.layout != torch.strided or gamma.ndim != 1:
+        raise ValueError("RMSNorm gamma must be a strided 1D tensor")
+    if gamma.dtype != x.dtype or gamma.device != x.device:
+        raise ValueError("RMSNorm gamma dtype/device must match input")
+    torch._check(gamma.shape[0] == x.shape[-1], lambda: "RMSNorm gamma width must match input")
+    # Resident input storage has a real resource bound. Never specialize a hinted
+    # dynamic width: an explicit split/another backend is required instead.
+    if type(x.shape[-1]) is not int:
+        raise NotImplementedError("RMSNorm first backend requires a static feature width")
+    if plan == "serial" and x.shape[-1] > 32768:
+        raise NotImplementedError("resident RMSNorm width exceeds 32768; request split explicitly")
+    if plan == "split":
+        split_launch_shape(x.shape[-1], 1024)
+    return x.shape
+
+
+def launch_rms_norm(kernel, x, gamma, out, *, plan="serial", wrapper=None):
+    """Shared direct/AOTI launch path; required copies and scratch are included."""
+    import torch
+
+    if wrapper is None:
+        def wrapper(function):
+            return function
+    flat, rows, width = _row_last_layout(x)
+    if isinstance(rows, int) and rows == 0:
+        return
+    if plan == "serial":
+        block = 1 << (width - 1).bit_length()
+        warps = 4 if block <= 4096 else 8
+        wrapper(kernel)[(rows,)](flat, gamma, out, rows, width, flat.stride(0), flat.stride(1),
+                                gamma.stride(0), BLOCK=block, num_warps=warps, enable_fp_fusion=False)
+        return
+    parts, merge_block = split_launch_shape(width, 1024)
+    totals = torch.empty((rows, parts), device=x.device, dtype=torch.float32)
+    counts = torch.empty((rows, parts), device=x.device, dtype=torch.int64)
+    partial, output_map = kernel
+    wrapper(partial)[(rows, parts)](flat, totals, counts, rows, width, flat.stride(0), flat.stride(1),
+                                    parts, BLOCK=1024, num_warps=4, enable_fp_fusion=False)
+    wrapper(output_map)[(rows, parts)](flat, gamma, totals, counts, out, rows, width,
+                                     flat.stride(0), flat.stride(1), gamma.stride(0), parts,
+                                     BLOCK=1024, MERGE_BLOCK=merge_block, num_warps=4,
+                                     enable_fp_fusion=False)
+
+
+def run_rms_norm(x, gamma, *, eps: float = 1e-6, plan="serial"):
+    """Direct structured execution; CPU analysis remains available through Fake/meta."""
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    params = {"eps": eps}
+    metadata = isinstance(x, FakeTensor) or x.device.type == "meta"
+    shape = validate_rms_inputs(x, gamma, params, plan=plan, metadata=metadata)
+    out = torch.empty(shape, device=x.device, dtype=x.dtype)
+    if metadata or x.numel() == 0:
+        return out
+    kernel = compile_state_reduction("rms_norm", params, plan=plan)
+    launch_rms_norm(kernel, x, gamma, out, plan=plan)
+    return out
+
+
 def _validate_row_last(x, *, metadata: bool = False):
     """Check the supported runtime contract without concretising dynamic dimensions."""
     import torch

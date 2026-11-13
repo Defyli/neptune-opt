@@ -38,6 +38,13 @@ from neptune_recognize.params import _respects, _infer_numerically, _solve_for  
 from neptune_recognize.match import _producer_pattern, _solve_params, _find_region_root, Match, _match_candidate, recognize, recognize_regions, region_root  # noqa: F401
 from neptune_recognize.rewrite import _wants_keepdim, rewrite, rewrite_match, region_contract, would_rewrite  # noqa: F401
 
+
+def recognize_structured_regions(gm, *, capabilities=()):
+    from neptune_recognize.match import recognize_structured_regions as recognize_structured
+
+    return recognize_structured(gm, capabilities=capabilities)
+
+
 __all__ = [
     "Candidate",
     "Match",
@@ -62,6 +69,7 @@ __all__ = [
     "interpret",
     "recognize",
     "recognize_regions",
+    "recognize_structured_regions",
     "region_contract",
     "rewrite_match",
     "region_root",

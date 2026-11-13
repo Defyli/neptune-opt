@@ -20,6 +20,30 @@ from collections.abc import Iterable, Sequence
 MARGIN = 0.03
 
 
+class FatalCudaError(RuntimeError):
+    """The current CUDA context is unusable; no in-process fallback is safe."""
+
+
+def _raise_if_fatal_cuda(error):
+    """Propagate context-corrupting failures without probing or touching the GPU."""
+    pending, seen = [error], set()
+    tokens = ("device-side assert triggered", "cudaerrorassert", "illegal memory access",
+              "cudaerrorillegaladdress", "cuda error: unspecified launch failure",
+              "cuda context is destroyed", "context is destroyed", "cudaerrorlaunchfailure")
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, FatalCudaError):
+            raise current
+        if any(token in str(current).lower() for token in tokens):
+            raise FatalCudaError(
+                "CUDA context failure: stop this process; baseline files may exist but "
+                "in-process execution/fallback is unsafe. Original error: " + str(current)) from error
+        pending.extend((current.__cause__, current.__context__))
+
+
 @dataclasses.dataclass
 class Choice:
     """What the A/B measured, and which package to ship."""
@@ -68,15 +92,20 @@ def choose_faster(baseline_ms: float, fused_ms: float, margin: float = MARGIN) -
 
 
 # ---------------------------------------------------------------- the pieces, injectable for tests
-def _export_pair(module, args, export_kwargs, plan=None, *, baseline=None):
+def _export_pair(module, args, export_kwargs, plan=None, *, baseline=None, capabilities=(),
+                 verification_inputs=None, rtol=1e-3, atol=1e-4, max_ulps=None):
     """Clone the original baseline per plan; failed copies re-export, never globally decompose."""
     import torch
 
     import neptune_opt
 
     # Baseline export errors deliberately propagate. Never decompose this side unconditionally.
-    ep_base = baseline if baseline is not None else torch.export.export(
-        module, tuple(args), **export_kwargs)
+    try:
+        ep_base = baseline if baseline is not None else torch.export.export(
+            module, tuple(args), **export_kwargs)
+    except Exception as error:  # noqa: BLE001 -- preserve ordinary baseline errors
+        _raise_if_fatal_cuda(error)
+        raise
     try:
         try:
             ep_fused = copy.deepcopy(ep_base)
@@ -88,14 +117,26 @@ def _export_pair(module, args, export_kwargs, plan=None, *, baseline=None):
                 if value is cloned or (isinstance(value, torch.Tensor) and value.numel()
                                        and value.data_ptr() == cloned.data_ptr()):
                     raise RuntimeError("candidate copy shares baseline weights")
-        except Exception:  # noqa: BLE001 -- ExportedProgram deepcopy is version dependent
+        except Exception as error:  # noqa: BLE001 -- ExportedProgram deepcopy is version dependent
+            _raise_if_fatal_cuda(error)
             # A fresh export of the original module would still share its parameter storage.
             # Copy the module too; if that fails, refuse the candidate rather than share weights.
             ep_fused = torch.export.export(copy.deepcopy(module), tuple(args), **export_kwargs)
         # apply owns targeted lowering; global decomposition would bias the comparison.
         kwargs = {} if plan is None else {"plan": plan}
+        if capabilities:
+            kwargs["capabilities"] = capabilities
+        if verification_inputs is not None:
+            kwargs["verification_inputs"] = verification_inputs
+        if rtol != 1e-3:
+            kwargs["rtol"] = rtol
+        if atol != 1e-4:
+            kwargs["atol"] = atol
+        if max_ulps is not None:
+            kwargs["max_ulps"] = max_ulps
         report = neptune_opt.apply(ep_fused, verify_with=(module, tuple(args)), **kwargs)
     except Exception as e:  # noqa: BLE001 -- the optional candidate must not break the baseline
+        _raise_if_fatal_cuda(e)
         ep_fused = None
         report = neptune_opt.Report(skipped=[("candidate-failed", f"{type(e).__name__}: {e}")])
     return ep_base, ep_fused, report
@@ -105,7 +146,29 @@ def _package(ep, directory: str, name: str) -> str:
     import torch
 
     path = os.path.join(directory, f"{name}.pt2")
-    torch._inductor.aoti_compile_and_package(ep, package_path=path)
+    from torch._inductor import config
+
+    # AOTI embeds user cubins with per-wrapper host symbols. Unique entry names
+    # prevent several specializations of one JIT kernel sharing/overwriting an
+    # embedded object. This is a scoped standard option, not a linker workaround.
+    supported = hasattr(config.triton, "unique_user_kernel_names")
+    structured = any(str(node.target).startswith(("neptune.state_rms_norm", "neptune.segment_"))
+                     for node in ep.graph.nodes) if hasattr(ep, "graph") else False
+    if structured and not supported:
+        raise NotImplementedError("structured AOTI packaging requires unique_user_kernel_names support")
+    options = {"triton.unique_user_kernel_names": True} if supported else {}
+    # AOTI's compile-time per-kernel execution fabricates integer intermediates
+    # (e.g. zero prefix sums), violating data-dependent assertion contracts.
+    # Use the standard whole-wrapper pass with actual export inputs instead.
+    # This may still execute/tune with those real inputs during packaging.
+    if hasattr(config.triton, "autotune_at_compile_time"):
+        options["triton.autotune_at_compile_time"] = False
+    try:
+        with config.patch(options):
+            torch._inductor.aoti_compile_and_package(ep, package_path=path)
+    except Exception as error:  # noqa: BLE001 -- baseline and candidate share this boundary
+        _raise_if_fatal_cuda(error)
+        raise
     return path
 
 
@@ -115,13 +178,19 @@ def _load(path: str):
     return torch._inductor.aoti_load_package(path)
 
 
-def _same_numbers(fa, fb, args, *, rtol: float = 1e-3, atol: float = 1e-4) -> tuple:
-    """Compare tensor pytrees without casting integers, doubles or complex outputs to float32."""
+def _same_numbers(fa, fb, args, *, rtol: float = 1e-3, atol: float = 1e-4,
+                  max_ulps: int | None = None) -> tuple:
+    """Require finite tensor-only outputs; explicit FP16/BF16 ULP slack follows apply's rule.
+
+    Integers/bools remain exact, and even matching None/NaN/Inf outputs are refused.
+    """
     import torch
     from torch.utils._pytree import tree_flatten
 
     _validate_nonnegative("rtol", rtol)
     _validate_nonnegative("atol", atol)
+    if max_ulps is not None and (type(max_ulps) is not int or max_ulps < 0):
+        raise ValueError("max_ulps must be a nonnegative integer or None")
     try:
         with torch.no_grad():
             a, spec_a = tree_flatten(fa(*args))
@@ -136,10 +205,19 @@ def _same_numbers(fa, fb, args, *, rtol: float = 1e-3, atol: float = 1e-4) -> tu
                 if x.is_floating_point() or x.is_complex():
                     if not (torch.isfinite(x).all().item() and torch.isfinite(y).all().item()):
                         return False, f"output {i} contains nonfinite values"
-                    torch.testing.assert_close(x, y, rtol=rtol, atol=atol, equal_nan=False)
+                    if max_ulps is None:
+                        torch.testing.assert_close(x, y, rtol=rtol, atol=atol, equal_nan=False)
+                    else:
+                        # Import locally: the package root imports this module at load time.
+                        from neptune_opt import _compare_trees
+
+                        ok, detail = _compare_trees(x, y, rtol=rtol, atol=atol, max_ulps=max_ulps)
+                        if not ok:
+                            return False, f"output {i}: {detail}"
                 elif not torch.equal(x, y):
                     return False, f"output {i} integer/bool values differ"
     except Exception as e:  # noqa: BLE001 -- execution and comparison are both verification failures
+        _raise_if_fatal_cuda(e)
         return False, f"{type(e).__name__}: {e}"
     return True, ""
 
@@ -194,6 +272,7 @@ def compile_best(module, args, *, package_dir: str | None = None, margin: float 
                  verbose: bool = True, verification_inputs: Sequence[tuple] | None = None,
                  rtol: float = 1e-3, atol: float = 1e-4,
                  regression_margin: float = MARGIN, plans: Iterable[str] = ("serial",),
+                 capabilities: Iterable[str] = (), max_ulps: int | None = None,
                  **export_kwargs) -> Choice:
     """Compile and select on `args` plus every explicitly supplied verification sample.
 
@@ -205,9 +284,36 @@ def compile_best(module, args, *, package_dir: str | None = None, margin: float 
     `plans` opts into serial/split candidates; the original baseline is compiled once. The fastest
     eligible mean candidate latency wins (ties retain plan order), using its paired baseline timings.
     Baseline export/compile errors raise; optional candidate and measurement failures fall back.
+    `capabilities` explicitly enables rms_norm/segment_pool without changing default paths.
+    segment_pool additionally rejects EVERY supplied case with a critical latency regression,
+    even when its metadata key matches a faster case (ragged lengths are not inspected).
+    `max_ulps` opts into apply's FP16/BF16 slack; package outputs must still be finite tensors.
     """
     import torch
 
+    # Keep validation bounded and before any baseline work, including on CPU-only machines.
+    # This matches the root API's canonical capability names without an import-time dependency.
+    if isinstance(capabilities, (str, bytes)):
+        raise ValueError("capabilities must be a finite iterable of rms_norm/segment_pool names")
+    try:
+        iterator = iter(capabilities)
+        enabled = []
+        for _ in range(3):
+            try:
+                capability = next(iterator)
+            except StopIteration:
+                break
+            if (not isinstance(capability, str) or capability not in ("rms_norm", "segment_pool")
+                    or capability in enabled):
+                raise ValueError("capabilities must contain distinct rms_norm/segment_pool names")
+            enabled.append(capability)
+        else:
+            raise ValueError("capabilities must contain at most two distinct names")
+        capabilities = tuple(enabled)
+    except TypeError as e:
+        raise ValueError("capabilities must be a finite iterable of rms_norm/segment_pool names") from e
+    if max_ulps is not None and (type(max_ulps) is not int or max_ulps < 0):
+        raise ValueError("max_ulps must be a nonnegative integer or None")
     for name, value in (("margin", margin), ("regression_margin", regression_margin),
                         ("rtol", rtol), ("atol", atol)):
         _validate_nonnegative(name, value)
@@ -252,10 +358,20 @@ def compile_best(module, args, *, package_dir: str | None = None, margin: float 
     os.makedirs(directory, exist_ok=True)
     default_plan = plans == ("serial",)
     # Preserve old three-argument injectable exports in the default path.
-    if default_plan:
-        ep_base, ep_fused, report = _export_pair(module, args, export_kwargs)
-    else:
-        ep_base, ep_fused, report = _export_pair(module, args, export_kwargs, plan=plans[0])
+    candidate_kwargs = {}
+    if capabilities:
+        candidate_kwargs["capabilities"] = capabilities
+    if verification_inputs is not None:
+        candidate_kwargs["verification_inputs"] = verification_inputs
+    if rtol != 1e-3:
+        candidate_kwargs["rtol"] = rtol
+    if atol != 1e-4:
+        candidate_kwargs["atol"] = atol
+    if max_ulps is not None:
+        candidate_kwargs["max_ulps"] = max_ulps
+    if not default_plan:
+        candidate_kwargs["plan"] = plans[0]
+    ep_base, ep_fused, report = _export_pair(module, args, export_kwargs, **candidate_kwargs)
     # Deliberately outside candidate error handling: a broken baseline is a build error.
     base_path = _package(ep_base, directory, "baseline")
     fused_path = None
@@ -263,6 +379,8 @@ def compile_best(module, args, *, package_dir: str | None = None, margin: float 
                 "baseline_ms": None, "fused_ms": None, "reason": "not evaluated"}
                for i, case in enumerate(cases)]
     scope = f"coverage: {len(cases)} supplied case(s) only, not all dynamic inputs"
+    if capabilities:
+        scope += f"; capabilities: {', '.join(capabilities)}"
     candidate_metrics = []
     active_plan = None
     evaluating = False
@@ -278,9 +396,12 @@ def compile_best(module, args, *, package_dir: str | None = None, margin: float 
 
     def same_numbers(fa, fb, case):
         # Existing three-argument monkeypatches remain valid with the backward-compatible defaults.
-        if rtol == 1e-3 and atol == 1e-4:
+        if rtol == 1e-3 and atol == 1e-4 and max_ulps is None:
             return _same_numbers(fa, fb, case)
-        return _same_numbers(fa, fb, case, rtol=rtol, atol=atol)
+        kwargs = {"rtol": rtol, "atol": atol}
+        if max_ulps is not None:
+            kwargs["max_ulps"] = max_ulps
+        return _same_numbers(fa, fb, case, **kwargs)
 
     try:
         baseline = _load(base_path)
@@ -296,6 +417,7 @@ def compile_best(module, args, *, package_dir: str | None = None, margin: float 
                 return finish(f"baseline package numbers verification failed ({'; '.join(failures)}), "
                               "keeping the baseline without a fusion claim")
     except Exception as e:  # noqa: BLE001
+        _raise_if_fatal_cuda(e)
         return finish(f"baseline loading/verification failed ({type(e).__name__}: {e}), keeping baseline")
 
     def evaluate(candidate):
@@ -310,6 +432,7 @@ def compile_best(module, args, *, package_dir: str | None = None, margin: float 
             name = "fused" if default_plan else f"fused_{active_plan}"
             fused_path = _package(candidate, directory, name)
         except Exception as e:  # noqa: BLE001
+            _raise_if_fatal_cuda(e)
             return finish(f"the fused package failed to compile ({type(e).__name__}: {e}), "
                           "so the baseline was kept")
         try:
@@ -331,11 +454,20 @@ def compile_best(module, args, *, package_dir: str | None = None, margin: float 
                 _, _, reason = choose_faster(base_ms, fused_ms, margin)
                 metric.update(baseline_ms=base_ms, fused_ms=fused_ms, reason=reason)
         except Exception as e:  # noqa: BLE001
+            _raise_if_fatal_cuda(e)
             return finish(f"candidate loading/verification/timing failed ({type(e).__name__}: {e}), "
                           "so the baseline was kept")
         if any(not all(math.isfinite(m[k]) and m[k] > 0 for k in ("baseline_ms", "fused_ms"))
                for m in metrics):
             return finish("unreliable nonfinite or nonpositive case timing: keeping the baseline")
+        if "segment_pool" in capabilities:
+            for metric in metrics:
+                ratio = metric["fused_ms"] / metric["baseline_ms"]
+                if ratio > 1.0 + regression_margin:
+                    metric["reason"] = (f"critical per-case regression (case {metric['case_index']}): "
+                                        "the fusion is SLOWER on this supplied sample, so it was dropped")
+                    return finish(metric["reason"], metric["baseline_ms"], metric["fused_ms"],
+                                  metric["baseline_ms"] / metric["fused_ms"])
         base_ms = statistics.mean(m["baseline_ms"] for m in metrics)
         fused_ms = statistics.mean(m["fused_ms"] for m in metrics)
         use_fusion, speedup, why = choose_faster(base_ms, fused_ms, margin)
@@ -365,8 +497,10 @@ def compile_best(module, args, *, package_dir: str | None = None, margin: float 
             try:
                 # Reuse the ORIGINAL export, never a rewritten candidate or a replacement baseline.
                 _, ep_fused, report = _export_pair(module, args, export_kwargs,
-                                                  plan=active_plan, baseline=ep_base)
+                                                  **{**candidate_kwargs, "plan": active_plan,
+                                                     "baseline": ep_base})
             except Exception as e:  # noqa: BLE001 -- subsequent exports are optional candidates
+                _raise_if_fatal_cuda(e)
                 import neptune_opt
 
                 ep_fused = None

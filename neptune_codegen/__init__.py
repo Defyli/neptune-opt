@@ -66,6 +66,11 @@ from neptune_codegen.algebra import _BRANCH_CUT, _simplify, repair_factor, repai
 from neptune_codegen.emitters import check_supported, derived_producer_expr, producer_nonneg, producer_init, consumer_init, producer_operand, guard_value, denominator_expr, _bindings, param_bindings, producer_update, consumer_update, scale_source, bias_source, bias_line, term_source, finalize_source, consumer_fold_no_repair  # noqa: F401
 from neptune_codegen.template import _GEN_DIR, _CACHE, _TEMPLATE, emit_kernel_source, generated_path, compile_skeleton, run  # noqa: F401
 from neptune_codegen.algebra import MergeCertificate, derive_merge_certificate, reachable_producer_domain, coordinate_needs_floor
+from neptune_codegen.algebra import StateCertificate, derive_state_certificate
+from neptune_codegen.skeleton import StateField, NumericalContract, StateReduction, STATE_REDUCTIONS
+from neptune_codegen.emitters import emit_additive_state_helpers, emit_rms_state_source
+from neptune_codegen.template import compile_state_reduction, run_rms_norm
+from neptune_codegen.torch_op import state_op_handle, as_state_op, run_segment_pool
 from neptune_codegen.emitters import effective_producer_source, emit_state_helpers, state_finalize_source
 from neptune_codegen.template import split_launch_shape, MAX_SPLIT_PARTS
 from neptune_codegen import autotune  # noqa: F401
@@ -81,6 +86,19 @@ from neptune_codegen import sym_to_triton  # noqa: F401,E402
 from neptune_codegen.sym_to_triton import TranslationError, _Q, to_triton  # noqa: F401
 
 __all__ = [
+    "StateField",
+    "NumericalContract",
+    "StateReduction",
+    "STATE_REDUCTIONS",
+    "StateCertificate",
+    "derive_state_certificate",
+    "emit_additive_state_helpers",
+    "emit_rms_state_source",
+    "compile_state_reduction",
+    "state_op_handle",
+    "as_state_op",
+    "run_rms_norm",
+    "run_segment_pool",
     "MergeCertificate",
     "derive_merge_certificate",
     "reachable_producer_domain",
